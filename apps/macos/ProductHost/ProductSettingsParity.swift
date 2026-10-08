@@ -9,7 +9,9 @@ final class GPUISettingsParity {
     private let presence = PresenceSettingsModel(defaults: E2ERuntime.defaults)
     private let music = MusicAccountsModel(defaults: E2ERuntime.defaults)
     private let marble: MarbleAPIKeySettingsModel
-    private let props: PropGenerationConfigurationStore
+    private let props: RustGenerationConfigurationClient
+    private let propLegacyFile: URL
+    private let propCurrentFile: URL
     private var operations: [String: Task<Void, Never>] = [:]
     private var syncObserver: NSObjectProtocol?
     private var recordMonitor: Any?
@@ -32,7 +34,10 @@ final class GPUISettingsParity {
             .appendingPathComponent("ai.gmgn.radio/secrets", isDirectory: true)
         marble = MarbleAPIKeySettingsModel(provider: MarbleAPIKeyProvider(
             fileURL: secrets.appendingPathComponent("world-labs-api-key")))
-        props = PropGenerationConfigurationStore(fileURL: secrets.appendingPathComponent("prop-generation.json"))
+        let taskRoot = WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: E2ERuntime.applicationSupportBase)
+        props = RustGenerationConfigurationClient(root: taskRoot)
+        propLegacyFile = secrets.appendingPathComponent("prop-generation.json")
+        propCurrentFile = taskRoot.deletingLastPathComponent().appendingPathComponent("secrets/prop-generation.json")
         syncObserver = NotificationCenter.default.addObserver(forName: .musicLibrarySyncDidFinish,
             object: nil, queue: .main) { [weak self] notification in
                 let provider = notification.userInfo?["providerID"] as? String
@@ -221,23 +226,22 @@ final class GPUISettingsParity {
     }
 
     private func saveProps(_ value: [String: Any]) -> Bool {
-        guard let text = value["endpoint"] as? String, let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        guard let text = value["endpoint"] as? String, operations["prop"] == nil else {
             spaceNotice = PropGenerationError.invalidEndpoint.localizedDescription; spaceHasError = true; return false
         }
-        let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            operations["prop"]?.cancel()
-            let previous = replacement.isEmpty ? try props.load() : nil
-            let candidate = try PropGenerationConfiguration(endpoint: url, token: replacement.isEmpty ? previous?.token ?? "" : replacement)
-            guard !replacement.isEmpty || candidate.endpoint == previous?.endpoint else {
-                spaceNotice = "更换服务地址时请同时填写密钥。"; spaceHasError = true; return false
-            }
-            try props.save(candidate)
-            loadPropConfiguration(); spaceNotice = "许愿机配置已保存。"; spaceHasError = false; propSaveRevision &+= 1
+        let replacement = value["apiKey"] as? String ?? ""
+        operation("prop") { [weak self] in
+          guard let self else { return }
+          do {
+            let confirmed = try await props.save(endpoint: text, replacementToken: replacement)
+            propConfigured = confirmed.configured
+            if let origin = confirmed.endpoint { propEndpoint = origin }
+            spaceNotice = "许愿机配置已保存。"; spaceHasError = false; propSaveRevision &+= 1
             NotificationCenter.default.post(name: .propGenerationConfigurationDidChange, object: nil)
-            return true
-        } catch let error as PropGenerationError { spaceNotice = error.localizedDescription; spaceHasError = true; return false }
-        catch { spaceNotice = "许愿机配置无法保存，请检查本机存储权限。"; spaceHasError = true; return false }
+          } catch let error as PropGenerationError { spaceNotice = error.localizedDescription; spaceHasError = true }
+            catch { spaceNotice = "许愿机配置无法保存，请检查服务地址、密钥和本机存储权限。"; spaceHasError = true }
+            }
+        return true
     }
 
     private func installLabel(_ motion: PublishedMotion) -> String {
@@ -260,11 +264,14 @@ final class GPUISettingsParity {
     }
 
     private func loadPropConfiguration() {
+      operation("prop.load") { [weak self] in
+        guard let self else { return }
         do {
-            let saved = try props.load()
-            propConfigured = saved != nil
-            if let saved { propEndpoint = saved.endpoint.absoluteString }
+            let saved = try await props.load(currentFile: propCurrentFile, legacyFile: propLegacyFile)
+            propConfigured = saved.configured
+            if let origin = saved.endpoint { propEndpoint = origin }
         } catch { propConfigured = false; spaceNotice = "许愿机配置读取失败，现有文件已保留。"; spaceHasError = true }
+      }
     }
 
     private func operation(_ key: String, _ body: @escaping @MainActor () async -> Void) {
@@ -284,15 +291,7 @@ final class GPUISettingsParity {
 
     private func checkProps(_ value: [String: Any]) {
         cancelPropCheck()
-        do {
-            guard let saved = try props.load(),
-                  let raw = value["endpoint"] as? String,
-                  let draftURL = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-                  try PropGenerationConfiguration(endpoint: draftURL, token: saved.token).endpoint == saved.endpoint else {
-                spaceNotice = "请先保存服务配置，再检测连接。"
-                spaceHasError = true
-                return
-            }
+            guard let raw = value["endpoint"] as? String else { return }
             let id = UUID()
             propCheckID = id
             propChecking = true
@@ -306,6 +305,9 @@ final class GPUISettingsParity {
                     }
                 }
                 do {
+                    guard let saved = try await props.validatedConfiguration(endpoint: raw) else {
+                        spaceNotice = "请先保存服务配置，再检测连接。"; spaceHasError = true; return
+                    }
                     let health = try await PropGenerationClient(endpoint: saved.endpoint, token: saved.token).health()
                     guard !Task.isCancelled, propCheckID == id else { return }
                     spaceNotice = health.message
@@ -317,10 +319,6 @@ final class GPUISettingsParity {
                     spaceHasError = true
                 }
             }
-        } catch {
-            spaceNotice = "许愿机配置无法读取，请先重新保存服务配置。"
-            spaceHasError = true
-        }
     }
 
     private func installRecordingMonitor() {

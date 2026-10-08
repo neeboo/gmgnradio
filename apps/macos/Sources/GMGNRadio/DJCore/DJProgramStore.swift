@@ -1,291 +1,89 @@
 import Foundation
 import Observation
 
-enum DJProgramStatus: Equatable, Sendable {
-    case idle
-    case planning
-    case ready
-    case failed(String)
-}
-
+enum DJProgramStatus: Equatable, Sendable { case idle, planning, ready, failed(String) }
 struct SavedDJProgram: Codable, Equatable, Sendable {
     let plan: ProgramPlan
     let activeSlotIndex: Int?
     let updatedAt: Date
 }
+enum DJProgramEditMode { case replanUpcoming, insertNext }
 
-enum DJProgramEditMode {
-    case replanUpcoming
-    case insertNext
-}
-
-enum DJProgramEditor {
-    static func revise(
-        current: ProgramPlan,
-        activeSlotIndex: Int,
-        proposal: ProgramPlan,
-        mode: DJProgramEditMode,
-        generatedAt: Date = Date()
-    ) -> ProgramPlan {
-        guard !current.slots.isEmpty else {
-            return ProgramPlan(
-                brief: current.brief,
-                slots: unique(proposal.slots),
-                revision: current.revision + 1,
-                generatedAt: generatedAt,
-                replanAfterTrackCount: proposal.replanAfterTrackCount,
-                title: proposal.title ?? current.title,
-                direction: proposal.direction ?? current.direction
-            )
-        }
-
-        let activeIndex = min(
-            max(activeSlotIndex, 0),
-            current.slots.count - 1
-        )
-        let played = Array(current.slots.prefix(activeIndex + 1))
-        let playedTrackIDs = Set(played.map(\.track.id))
-        let proposalSlots = unique(proposal.slots).filter {
-            !playedTrackIDs.contains($0.track.id)
-        }
-
-        let upcoming: [ProgramSlot]
-        let title: String?
-        let direction: String?
-        let replanAfterTrackCount: Int
-        switch mode {
-        case .replanUpcoming:
-            upcoming = proposalSlots
-            title = proposal.title ?? current.title
-            direction = proposal.direction ?? current.direction
-            replanAfterTrackCount = proposal.replanAfterTrackCount
-        case .insertNext:
-            let inserted = Array(proposalSlots.prefix(1))
-            let insertedTrackIDs = Set(inserted.map(\.track.id))
-            let existingUpcoming = current.slots
-                .dropFirst(activeIndex + 1)
-                .filter {
-                    !insertedTrackIDs.contains($0.track.id)
-                }
-            upcoming = inserted + existingUpcoming
-            title = current.title
-            direction = current.direction
-            replanAfterTrackCount = current.replanAfterTrackCount
-        }
-
-        return ProgramPlan(
-            brief: current.brief,
-            slots: played + upcoming,
-            revision: current.revision + 1,
-            generatedAt: generatedAt,
-            replanAfterTrackCount: replanAfterTrackCount,
-            title: title,
-            direction: direction
-        )
-    }
-
-    private static func unique(
-        _ slots: [ProgramSlot]
-    ) -> [ProgramSlot] {
-        var seenTrackIDs = Set<String>()
-        return slots.filter {
-            seenTrackIDs.insert($0.track.id).inserted
-        }
+@MainActor enum DJProgramEditor {
+    static func revise(current: ProgramPlan, activeSlotIndex: Int, proposal: ProgramPlan,
+                       mode: DJProgramEditMode, generatedAt: Date = Date(),
+                       client: RustMusicProgramClient? = nil) async throws -> ProgramPlan {
+        let view = try await (client ?? RustMusicProgramClient()).command("revise", programID: current.brief.id,
+            index: activeSlotIndex, proposalID: proposal.brief.id,
+            mode: mode == .replanUpcoming ? "replanUpcoming" : "insertNext")
+        guard let plan = view.selectedPlan else { throw PropTaskDaemonError.invalidFrame }
+        return plan
     }
 }
 
-@MainActor
-final class DJProgramArchive {
+/// Legacy import/read compatibility; native code cannot commit candidate plans.
+@MainActor final class DJProgramArchive {
     private let storage: MusicStorageClient
-
-    static func live() -> DJProgramArchive {
-        DJProgramArchive(storage: .shared)
+    static func live() -> DJProgramArchive { DJProgramArchive(storage: .shared) }
+    init(storage: MusicStorageClient) { self.storage = storage }
+    func save(plan: ProgramPlan, activeSlotIndex: Int?, updatedAt: Date = Date(), pending: Bool = false) async throws {
+        throw PropTaskDaemonError.invalidFrame
     }
-
-    init(storage: MusicStorageClient) {
-        self.storage = storage
-    }
-
-    func save(
-        plan: ProgramPlan,
-        activeSlotIndex: Int?,
-        updatedAt: Date = Date(),
-        pending: Bool = false
-    ) async throws {
-        try await storage.save(SavedDJProgram(plan: plan, activeSlotIndex: activeSlotIndex, updatedAt: updatedAt), pending: pending)
-    }
-
-    func latest() async throws -> SavedDJProgram? {
-        try await recent().first
-    }
-
-    func recent() async throws -> [SavedDJProgram] {
-        try await snapshot().programs
-    }
-
+    func latest() async throws -> SavedDJProgram? { try await recent().first }
+    func recent() async throws -> [SavedDJProgram] { try await snapshot().programs }
     func snapshot() async throws -> MusicStorageClient.Programs {
         let snapshot = try await storage.programs()
         return .init(programs: snapshot.programs.sorted { $0.updatedAt > $1.updatedAt }, pendingIDs: snapshot.pendingIDs)
     }
+    func importLegacy() async throws { try await storage.importLegacy() }
 }
 
-@MainActor
-@Observable
-final class DJProgramStore {
+@MainActor @Observable final class DJProgramStore {
     static let shared = DJProgramStore(archive: .live())
-
     private(set) var status: DJProgramStatus = .idle
     private(set) var plan: ProgramPlan?
     private(set) var pendingPlan: ProgramPlan?
     private(set) var activeSlotIndex: Int?
     private(set) var recentPrograms: [SavedDJProgram] = []
-    private let archive: DJProgramArchive?
-    private var persistence: Task<Void, Error>?
     private(set) var isLoaded = false
-    private var pendingIDs = Set<String>()
-
-    init(archive: DJProgramArchive? = nil) {
-        self.archive = archive
+    private let archive: DJProgramArchive?
+    private let client: RustMusicProgramClient
+    private var projectedRevision: UInt64?
+    init(archive: DJProgramArchive? = nil, client: RustMusicProgramClient? = nil) {
+        self.archive = archive; self.client = client ?? RustMusicProgramClient()
     }
-
     var activeSlot: ProgramSlot? {
-        guard
-            let activeSlotIndex,
-            let slots = plan?.slots,
-            slots.indices.contains(activeSlotIndex)
-        else {
-            return nil
-        }
+        guard let activeSlotIndex, let slots = plan?.slots, slots.indices.contains(activeSlotIndex) else { return nil }
         return slots[activeSlotIndex]
     }
-
-    func beginPlanning() {
-        status = .planning
+    func beginPlanning() { status = .planning }
+    func fail(_ message: String) { status = .failed(message) }
+    private func project(_ view: RustMusicProgramClient.View) {
+        guard projectedRevision == nil || view.revision >= projectedRevision! else { return }
+        projectedRevision = view.revision
+        plan = view.plan; pendingPlan = view.pendingPlan; activeSlotIndex = view.activeSlotIndex
+        recentPrograms = view.programs; isLoaded = true; status = .ready
     }
-
-    func publish(_ plan: ProgramPlan) {
-        self.plan = plan
-        if pendingPlan?.brief.id == plan.brief.id {
-            pendingPlan = nil
-        }
-        activeSlotIndex = nil
-        status = .ready
-        persist()
+    private func mutate(_ op: String, programID: String? = nil, index: Int? = nil) async throws -> RustMusicProgramClient.View {
+        do { let view = try await client.command(op, programID: programID, index: index); project(view); return view }
+        catch { fail("节目状态更新失败：\(error.localizedDescription)"); throw error }
     }
-
-    func publishDraft(_ plan: ProgramPlan) {
-        pendingPlan = plan
-        status = .ready
-        let saved = SavedDJProgram(
-            plan: plan,
-            activeSlotIndex: nil,
-            updatedAt: Date()
-        )
-        recentPrograms.removeAll {
-            $0.plan.brief.id == plan.brief.id
-        }
-        recentPrograms.insert(saved, at: 0)
-        enqueue(saved, pending: true)
+    func publish(_ plan: ProgramPlan) async throws { _ = try await mutate("publish", programID: plan.brief.id) }
+    func publishDraft(_ plan: ProgramPlan) async throws { _ = try await mutate("draft", programID: plan.brief.id) }
+    func revise(activeSlotIndex: Int, proposal: ProgramPlan, mode: DJProgramEditMode) async throws -> ProgramPlan {
+        guard let plan else { throw PropTaskDaemonError.invalidFrame }
+        return try await DJProgramEditor.revise(current: plan, activeSlotIndex: activeSlotIndex, proposal: proposal, mode: mode, client: client)
     }
-
-    @discardableResult
-    func takePendingPlan() -> ProgramPlan? {
-        defer { pendingPlan = nil }
-        return pendingPlan
+    @discardableResult func takePendingPlan() async throws -> ProgramPlan? { try await mutate("take_pending").selectedPlan }
+    func activateSlot(at index: Int) async throws { _ = try await mutate("activate_slot", index: index) }
+    @discardableResult func selectProgram(id: String) async throws -> ProgramPlan? { try await mutate("select", programID: id).selectedPlan }
+    func restoreLatest() async throws {
+        try await refreshRecentPrograms()
+        _ = try await mutate("restore_latest")
     }
-
-    func activateSlot(at index: Int) {
-        guard let slots = plan?.slots, slots.indices.contains(index) else {
-            activeSlotIndex = nil
-            persist()
-            return
-        }
-        activeSlotIndex = index
-        persist()
-    }
-
-    @discardableResult
-    func selectProgram(id: String) -> ProgramPlan? {
-        guard let saved = recentPrograms.first(where: {
-            $0.plan.brief.id == id
-        }) else {
-            return nil
-        }
-        plan = saved.plan
-        if pendingPlan?.brief.id == saved.plan.brief.id {
-            pendingPlan = nil
-        }
-        activeSlotIndex = nil
-        status = .ready
-        return saved.plan
-    }
-
-    func restoreLatest() async {
-        do { try await refreshRecentPrograms() }
-        catch { fail("节目存储读取失败：\(error.localizedDescription)"); return }
-        guard let saved = recentPrograms.first(where: { !pendingIDs.contains($0.plan.brief.id) }) else {
-            return
-        }
-        plan = saved.plan
-        if
-            let index = saved.activeSlotIndex,
-            saved.plan.slots.indices.contains(index)
-        {
-            activeSlotIndex = index
-        } else {
-            activeSlotIndex = nil
-        }
-        status = .ready
-    }
-
-    func fail(_ message: String) {
-        status = .failed(message)
-    }
-
-    private func persist() {
-        guard let plan else {
-            return
-        }
-        let saved = SavedDJProgram(
-            plan: plan,
-            activeSlotIndex: activeSlotIndex,
-            updatedAt: Date()
-        )
-        recentPrograms.removeAll {
-            $0.plan.brief.id == plan.brief.id
-        }
-        recentPrograms.insert(saved, at: 0)
-        guard archive != nil else {
-            return
-        }
-        enqueue(saved, pending: false)
-    }
-
     func refreshRecentPrograms() async throws {
-        do { try await flush() } catch { persistence = nil }
-        guard let archive else { isLoaded = true; return }
-        let snapshot = try await archive.snapshot()
-        recentPrograms = snapshot.programs
-        pendingIDs = Set(snapshot.pendingIDs)
-        pendingPlan = snapshot.programs.first { snapshot.pendingIDs.contains($0.plan.brief.id) }?.plan
-        isLoaded = true
+        do { try await archive?.importLegacy(); project(try await client.read()) }
+        catch { fail("节目存储读取失败：\(error.localizedDescription)"); throw error }
     }
-
-    func flush() async throws { try await persistence?.value }
-
-    private func enqueue(_ saved: SavedDJProgram, pending: Bool) {
-        guard let archive else { return }
-        let previous = persistence
-        persistence = Task { [weak self] in
-            // A failed prior write remains visible but does not prevent retrying newer state.
-            do { try await previous?.value } catch { }
-            do {
-                try await archive.save(plan: saved.plan, activeSlotIndex: saved.activeSlotIndex,
-                                       updatedAt: saved.updatedAt, pending: pending)
-            } catch {
-                self?.fail("节目保存失败：\(error.localizedDescription)")
-                throw error
-            }
-        }
-    }
+    func flush() async throws { try await client.flush() }
 }

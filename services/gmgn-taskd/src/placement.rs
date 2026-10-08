@@ -31,6 +31,9 @@ pub struct Grid {
 pub struct Footprint {
     pub size: [f32; 2],
     pub yaw: f32,
+    /// World-planar translation after yaw, matching Swift's centerOffset.
+    #[serde(default, rename = "centerOffset")]
+    pub center_offset: [f32; 2],
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,13 +121,19 @@ fn valid_box(b: &BoxVolume) -> bool {
 }
 impl Footprint {
     pub fn valid(&self) -> bool {
-        self.size.iter().all(|x| x.is_finite() && *x > 0.) && self.yaw.is_finite()
+        self.size.iter().all(|x| x.is_finite() && *x > 0.)
+            && self.yaw.is_finite()
+            && self.center_offset.iter().all(|x| x.is_finite())
     }
     pub fn center(&self, a: Column, s: f32) -> [f32; 2] {
         let (sin, cos) = self.yaw.sin_cos();
         [
-            a.x as f32 * s + cos * self.size[0] / 2. + sin * self.size[1] / 2.,
-            a.z as f32 * s - sin * self.size[0] / 2. + cos * self.size[1] / 2.,
+            a.x as f32 * s
+                + self.center_offset[0]
+                + cos * self.size[0] / 2.
+                + sin * self.size[1] / 2.,
+            a.z as f32 * s + self.center_offset[1] - sin * self.size[0] / 2.
+                + cos * self.size[1] / 2.,
         ]
     }
     pub fn columns(&self, a: Column, s: f32) -> Vec<Column> {
@@ -457,6 +466,7 @@ mod tests {
             footprint: Footprint {
                 size: [0.45, 0.45],
                 yaw: 0.,
+                center_offset: [0.; 2],
             },
             height: 1.,
             triangles: vec![[[-10., 0., -10.], [10., 0., -10.], [0., 0., 10.]]],
@@ -567,7 +577,8 @@ mod tests {
             .iter_mut()
             .filter(|l| l.column.x == 1)
             .for_each(|l| l.support_height = -0.16);
-        r.triangles.push([[0.25, 0., 0.], [0.25, -0.16, 0.], [0.25, -0.16, 1.]]);
+        r.triangles
+            .push([[0.25, 0., 0.], [0.25, -0.16, 0.], [0.25, -0.16, 1.]]);
         assert!(evaluate(r).can_place);
     }
     #[test]
@@ -653,6 +664,7 @@ mod tests {
         let f = Footprint {
             size: [0.75, 0.5],
             yaw: std::f32::consts::FRAC_PI_2,
+            center_offset: [0.; 2],
         };
         let cols = f.columns(a, 0.25);
         assert_eq!(cols.len(), 6);
@@ -660,6 +672,34 @@ mod tests {
         assert_eq!(cols.iter().map(|c| c.x).max(), Some(5));
         assert_eq!(cols.iter().map(|c| c.z).min(), Some(-6));
         assert_eq!(cols.iter().map(|c| c.z).max(), Some(-4));
+    }
+    #[test]
+    fn exact_center_offset_is_world_space_and_zero_preserves_legacy_wire() {
+        let legacy: Footprint =
+            serde_json::from_value(serde_json::json!({"size":[0.75,0.5],"yaw":0})).unwrap();
+        assert_eq!(legacy.center_offset, [0.; 2]);
+        let f = Footprint {
+            size: [0.75, 0.5],
+            yaw: std::f32::consts::FRAC_PI_2,
+            center_offset: [0.073, -0.119],
+        };
+        let base = Footprint {
+            center_offset: [0.; 2],
+            ..f
+        };
+        let a = Column { x: 4, z: -3 };
+        let actual = f.center(a, 0.25);
+        let b = base.center(a, 0.25);
+        assert!((actual[0] - b[0] - 0.073).abs() < 1e-6);
+        assert!((actual[1] - b[1] + 0.119).abs() < 1e-6);
+        let mut r = request();
+        r.footprint.center_offset = [0.137, -0.091];
+        let center = r.footprint.center(r.anchor.column, r.grid.spacing);
+        let result = evaluate(r);
+        assert!(result.can_place);
+        let volume = result.volume.unwrap();
+        assert_eq!(volume.center[0], center[0]);
+        assert_eq!(volume.center[2], center[1]);
     }
     #[test]
     fn closed_proxy_contains_small_box() {

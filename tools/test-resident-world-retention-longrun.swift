@@ -299,6 +299,7 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let worldRuntimeModules = worldRuntimeFlags[1]
 let objects = Array(worldRuntimeFlags.dropFirst(2))
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-swift-version", "6", "-parse-as-library", "-I", worldRuntimeModules,
+    "apps/macos/Sources/GMGNRadio/Presence/RustResidentSchedulerClient.swift",
     contextSource.path, sources.appendingPathComponent("ResidentAgentLoop.swift").path,
     sources.appendingPathComponent("ResidentMemoryStore.swift").path,
     sources.appendingPathComponent("ResidentStateClient.swift").path,

@@ -316,10 +316,10 @@ struct StageVisualPalette: Equatable, Sendable {
 
 @MainActor
 final class StageVisualDirectionStore: ObservableObject {
-    private static let pointCloudDefaultsKey = "stage.point-cloud-choice"
-    private static let particleSizeDefaultsKey = "stage.particle-size-multiplier"
-
-    private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
+    private var settingsLoad: Task<Void, Error>?
+    nonisolated(unsafe) private var settingsObserver: NSObjectProtocol?
+    @Published private(set) var settingsError: String?
     @Published private(set) var currentMood: StageVisualMood?
     @Published private(set) var currentPalette: StageVisualPalette?
     @Published private(set) var currentPointCloudChoice:
@@ -328,17 +328,30 @@ final class StageVisualDirectionStore: ObservableObject {
     @Published private(set) var transitionDuration: TimeInterval = 2.4
     @Published private(set) var particleSizeMultiplier: Float = 1
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        currentPointCloudChoice = defaults
-            .string(forKey: Self.pointCloudDefaultsKey)
-            .flatMap(StagePointCloudChoice.init(rawValue:))
-            ?? .automatic
-        if defaults.object(forKey: Self.particleSizeDefaultsKey) != nil {
-            particleSizeMultiplier = Self.clampParticleSize(
-                Float(defaults.double(forKey: Self.particleSizeDefaultsKey))
-            )
+    init(defaults: UserDefaults = .standard, settings: RustProductSettingsClient = .shared) {
+        self.settings = settings
+        let legacy = RustProductSettingsClient.stageLegacySnapshot(defaults)
+        settingsObserver = NotificationCenter.default.addObserver(forName: .init("gmgnProductSettingsConfirmed"), object: settings, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.projectConfirmed() }
         }
+        projectConfirmed()
+        settingsLoad = Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await settings.importStageLegacy(legacy: legacy); projectConfirmed() }
+            catch { settingsError = "舞台设置未能确认。"; throw error }
+        }
+    }
+
+    deinit { if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) } }
+
+    func awaitSettingsReady() async throws { try await settingsLoad?.value }
+
+    private func projectConfirmed() {
+        guard let values = settings.confirmed?.values,
+              let choice = StagePointCloudChoice(rawValue: values.stagePointCloudChoice) else { return }
+        if currentPointCloudChoice != choice { transitionDuration = 1.8 }
+        currentPointCloudChoice = choice
+        particleSizeMultiplier = Float(values.stageParticleSizeMultiplier)
     }
 
     func update(_ mood: StageVisualMood?) {
@@ -356,29 +369,25 @@ final class StageVisualDirectionStore: ObservableObject {
     }
 
     func selectPointCloud(_ choice: StagePointCloudChoice) {
-        currentPointCloudChoice = choice
-        transitionDuration = 1.8
-
-        if choice == .automatic {
-            defaults.removeObject(forKey: Self.pointCloudDefaultsKey)
-        } else {
-            defaults.set(choice.rawValue, forKey: Self.pointCloudDefaultsKey)
-        }
+        Task { do { try await selectPointCloud(rawValue: choice.rawValue) }
+            catch { settingsError = "点阵选择未能确认。" } }
     }
 
     func setParticleSizeMultiplier(_ value: Float) {
-        particleSizeMultiplier = Self.clampParticleSize(value)
-        defaults.set(
-            particleSizeMultiplier,
-            forKey: Self.particleSizeDefaultsKey
-        )
+        Task { do { try await setParticleSizeMultiplier(rawValue: Double(value)) }
+            catch { settingsError = "粒径设置未能确认。" } }
     }
 
-    private static func clampParticleSize(_ value: Float) -> Float {
-        min(
-            max(value, StageParticleSizing.manualRange.lowerBound),
-            StageParticleSizing.manualRange.upperBound
-        )
+    func selectPointCloud(rawValue: String) async throws {
+        try await awaitSettingsReady()
+        _ = try await settings.selectPointCloud(raw: rawValue)
+        projectConfirmed(); settingsError = nil
+    }
+
+    func setParticleSizeMultiplier(rawValue: Double) async throws {
+        try await awaitSettingsReady()
+        _ = try await settings.setParticleSizeMultiplier(rawValue)
+        projectConfirmed(); settingsError = nil
     }
 }
 

@@ -41,7 +41,9 @@ enum PropGenerationError: Error { case invalidInput }
     @MainActor static func main() async throws {
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.accessory)
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-drop-check-\(UUID())")
+        let rpc = try PrivateRPC(CommandLine.arguments[1])
+        let authority = RustChatAttachmentClient(call: rpc.call)
+        let directory = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("gmgn-drop-check-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 450), styleMask: [.borderless], backing: .buffered, defer: false)
@@ -52,7 +54,7 @@ enum PropGenerationError: Error { case invalidInput }
         let sceneInput = NSView(frame: content.bounds); sceneInput.autoresizingMask = [.width, .height]; content.addSubview(sceneInput)
         let target = ImageDropWindowReference(window)
         let drop = UnityChatImageDropBridge(window: { target.window })
-        let images = UnityChatImageBridge(directory: directory.appendingPathComponent("draft"), parentWindow: { window })
+        let images = UnityChatImageBridge(directory: directory.appendingPathComponent("draft"), authority: authority, parentWindow: { window })
         var fileCalls = 0, bitmapCalls = 0
         drop.configure(onFileURLs: { urls in fileCalls += 1; _ = images.addDroppedImages(urls: urls) },
                        onBitmap: { bytes in bitmapCalls += 1; _ = images.addDroppedImage(data: bytes) })
@@ -108,7 +110,7 @@ enum PropGenerationError: Error { case invalidInput }
         precondition(view.performDragOperation(sender)); view.concludeDragOperation(sender)
         try await ready(images)
         precondition(fileCalls == 1 && bitmapCalls == 0 && images.snapshot()["count"] as! Int == 1)
-        try checkPreparedImage(images)
+        try await checkPreparedImage(images)
         board.clearContents(); board.setData(encoded as Data, forType: .png)
         precondition(view.draggingUpdated(sender) == .copy && view.performDragOperation(sender))
         try await ready(images)
@@ -147,10 +149,10 @@ enum PropGenerationError: Error { case invalidInput }
             try await Task.sleep(for: .milliseconds(10))
         }
     }
-    @MainActor static func checkPreparedImage(_ bridge: UnityChatImageBridge) throws {
+    @MainActor static func checkPreparedImage(_ bridge: UnityChatImageBridge) async throws {
         let snapshot = bridge.snapshot(), objects = snapshot["attachments"] as! [[String: String]]
         let generation = snapshot["generation"] as! UInt64
-        let submission = try bridge.takeSubmission(text: "", attachmentIDs: objects.map { $0["id"]! }, generation: generation)
+        let submission = try await bridge.takeSubmission(text: "", attachmentIDs: objects.map { $0["id"]! }, generation: generation)
         let image = submission.attachments[0]
         let properties = CGImageSourceCopyPropertiesAtIndex(CGImageSourceCreateWithURL(image.url as CFURL, nil)!, 0, nil)! as NSDictionary
         precondition((properties[kCGImagePropertyPixelWidth] as! NSNumber).intValue <= 2048)
@@ -160,7 +162,8 @@ enum PropGenerationError: Error { case invalidInput }
         precondition(exif?[kCGImagePropertyExifUserComment] == nil && exif?[kCGImagePropertyExifDateTimeOriginal] == nil && properties[kCGImagePropertyGPSDictionary] == nil)
         let data = try Data(contentsOf: image.url)
         precondition(data.count <= 8 * 1024 * 1024)
-        precondition(bridge.restoreSubmission(submission), "Inspection restores only its own issued draft; no chat.send")
+        let restored = await bridge.restoreSubmission(submission)
+        precondition(restored, "Inspection restores only its own issued draft; no chat.send")
     }
 }
 

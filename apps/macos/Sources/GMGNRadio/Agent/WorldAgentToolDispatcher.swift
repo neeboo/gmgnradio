@@ -120,7 +120,7 @@ final class WorldAgentToolDispatcher {
         if let completed = completedCalls[call.id] {
             return completed
         }
-        let result = execute(call)
+        let result = await execute(call)
         completedCalls[call.id] = result
         return result
     }
@@ -129,7 +129,7 @@ final class WorldAgentToolDispatcher {
         completedCalls.removeAll(keepingCapacity: true)
     }
 
-    private func execute(_ call: RealtimeDJToolCall) -> RealtimeDJToolResult {
+    private func execute(_ call: RealtimeDJToolCall) async -> RealtimeDJToolResult {
         guard let capability = WorldAgentToolContract.capabilities.first(where: {
             $0.name == call.name
         }) else {
@@ -184,7 +184,7 @@ final class WorldAgentToolDispatcher {
                     return makeResult(callID: call.id, ok: false, code: "activity_unavailable",
                         message: "当前角色未安装或不兼容这项活动的动作，请选择当前可用活动")
                 }
-                try context.startActivity(id: arguments.activityID)
+                try await context.startActivityMeasured(id: arguments.activityID)
                 if let requestID = context.currentActivityRequestID {
                     onActivityStarted(context, requestID)
                     activityRequest = .init(requestID: requestID, activityID: arguments.activityID,
@@ -204,18 +204,15 @@ final class WorldAgentToolDispatcher {
                 message = "角色已转向 \(arguments.placeID)"
             case "set_world_weather":
                 let arguments = try decode(WeatherArguments.self, from: call.argumentsJSON)
-                guard let weather = WorldWeather(rawValue: arguments.weather) else {
-                    throw WorldAgentDispatchError.invalidWeather(arguments.weather)
-                }
-                try context.setWeather(weather)
-                message = "世界天气已切换为 \(weather.rawValue)"
+                try await context.setWeather(rawValue: arguments.weather)
+                message = "世界天气已切换为 \(arguments.weather)"
             case "move_live_camera":
                 let arguments = try decode(CameraArguments.self, from: call.argumentsJSON)
-                try context.selectCamera(id: arguments.cameraID)
+                try await context.selectCamera(id: arguments.cameraID)
                 message = "Live Cam 已切换到 \(arguments.cameraID)"
             case "complete_world_goal":
                 let arguments = try decode(GoalArguments.self, from: call.argumentsJSON)
-                try context.completeGoal(
+                try await context.completeGoal(
                     id: arguments.goalID,
                     summary: arguments.summary
                 )

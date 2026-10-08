@@ -56,7 +56,6 @@ namespace GMGN.UnityPlayer
         void Next();
         void Previous();
         void SelectQueueItem(int index);
-        void OpenSettings();
         void Seek(double seconds);
         void SetVolume(float volume);
         void Send(string messageId, string text);

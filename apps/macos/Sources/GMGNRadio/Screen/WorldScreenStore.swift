@@ -39,15 +39,15 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         /// 物件的显示名（面板与回执用）。
         let displayName: @MainActor (String) -> String
         /// 把一份屏幕定义**持久化**（写进物件 metadata / 走权威）。为 nil 时只在本次会话里生效。
-        let persistDefinition: (@MainActor (WorldScreenDefinition) -> Void)?
+        let persistDefinition: (@MainActor (WorldScreenDefinition) async throws -> Void)?
         /// 把屏幕内容**持久化**。为 nil 时同上。
-        let persistContent: (@MainActor (WorldScreenContent) -> Void)?
+        let persistContent: (@MainActor (WorldScreenContent) async throws -> Void)?
         /// 从本机持久化恢复屏幕定义（标定 / 来源）。为 nil 时不恢复。
-        let restoreDefinition: (@MainActor (String) -> WorldScreenDefinition?)?
+        let restoreDefinition: (@MainActor (String) async throws -> WorldScreenDefinition?)?
         /// 从本机持久化恢复屏幕内容。为 nil 时不恢复。
-        let restoreContent: (@MainActor (String) -> WorldScreenContent?)?
+        let restoreContent: (@MainActor (String) async throws -> WorldScreenContent?)?
         /// 物件不再存在时清掉它的持久化记录（过期内容不许复活）。
-        let removePersisted: (@MainActor (String) -> Void)?
+        let removePersisted: (@MainActor (String) async throws -> Void)?
     }
 
     /// 同时播放的上限（与覆盖层同一份数字）。
@@ -94,6 +94,14 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     /// 每块屏幕上一次写进日志的几何出处（`出处|原文`）。同样只在**变了**的时候写。
     private var lastGeometryLogged: [String: String] = [:]
     private var trackingTask: Task<Void, Never>?
+    private let metadataWorldID: @MainActor () -> String?
+    private var persistenceWorld: String?
+    private var persistenceLease = UUID()
+    private var persistenceTask: Task<Void, Never>?
+    private var attemptedRemovals: Set<String> = []
+    @Published private(set) var persistenceStatus = "loading"
+    @Published private(set) var persistenceNotice = "正在读取屏幕记录。"
+    var onPersistenceError: (@MainActor (String) -> Void)?
     private var lastTrackingKey = ""
     private var tickCount = 0
     /// 最近一拍的总耗时（毫秒）。60 Hz 节拍：**同状态时它是"什么都没做"的那一拍**。
@@ -112,17 +120,21 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         spatialStage: SpatialStageStore,
         overlay: WorldScreenOverlayController,
         source: Source,
-        projectionProvider: @escaping @MainActor () -> WorldScreenProjection
+        projectionProvider: @escaping @MainActor () -> WorldScreenProjection,
+        mediaCache: any ScreenMediaCaching = ScreenMediaCacheClient(),
+        playbackAuthority: any ScreenPlaybackAuthorizing = RustScreenPlaybackClient(),
+        worldID: @escaping @MainActor () -> String? = { nil }
     ) {
         self.spatialStage = spatialStage
         self.overlay = overlay
         self.source = source
         self.projectionProvider = projectionProvider
+        metadataWorldID = worldID
         // Rust owns fetching and cache files; the player consumes its local progressive streams.
         let registry = WorldScreenNativeVideoRegistry()
         self.nativeRegistry = registry
         self.nativeCoordinator = NativeScreenPlaybackCoordinator(
-            cache: ScreenMediaCacheClient(), registry: registry
+            cache: mediaCache, registry: registry, authority: playbackAuthority, worldID: worldID
         )
         nativeCoordinator.onChange = { [weak self] in
             guard let self else { return }
@@ -214,6 +226,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         let signpost = screenTrackingSignposter.beginInterval("screen.rebuild")
         defer { screenTrackingSignposter.endInterval("screen.rebuild", signpost) }
         let states = source.objectStates()
+        guard preparePersistence(states: states) else { return }
         // 遮挡盒跟着世界状态的刷新节拍（6 Hz）重建 —— 与屏幕几何同一份输入。
         rebuildOccluderBoxes(from: states)
         var seen: Set<String> = []
@@ -238,14 +251,14 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             placements[objectID] = nil
             // 物件没了：原生会话连播放器一起彻底清掉，过期解析结果不许复活它。
             nativeCoordinator.remove(objectID)
-            source.removePersisted?(objectID)
+            removePersisted(objectID)
             overlay.removeSurface(for: objectID)
         }
         for objectID in Array(issues.keys) where !seen.contains(objectID) {
             issues[objectID] = nil
             placements[objectID] = nil
             nativeCoordinator.remove(objectID)
-            source.removePersisted?(objectID)
+            removePersisted(objectID)
             overlay.removeSurface(for: objectID)
         }
         logGeometryIfChanged()
@@ -273,16 +286,94 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
         }
     }
 
+    private func preparePersistence(states: [String: WorldObjectState]) -> Bool {
+        guard source.restoreDefinition != nil || source.restoreContent != nil else {
+            persistenceStatus = "ready"; persistenceNotice = ""; return true
+        }
+        guard let world = metadataWorldID(), !world.isEmpty else { return false }
+        if persistenceWorld != world {
+            persistenceTask?.cancel(); persistenceWorld = world; persistenceLease = UUID()
+            let lease = persistenceLease
+            persistenceStatus = "loading"; persistenceNotice = "正在读取屏幕记录。"
+            attemptedRemovals.removeAll()
+            nativeCoordinator.stopAll()
+            for id in Array(overlay.surfaces.keys) { overlay.removeSurface(for: id) }
+            // Only the new-world projection is cleared; the actor retains confirmed records by world.
+            definitions.removeAll(); issues.removeAll(); contents.removeAll(); calibrationOverrides.removeAll(); placements.removeAll()
+            snapshots = []
+            persistenceTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    var restoredDefinitions: [String: WorldScreenDefinition] = [:]
+                    var restoredContents: [String: WorldScreenContent] = [:]
+                    for id in states.keys.sorted() {
+                        try Task.checkCancellation()
+                        if let value = try await self.source.restoreDefinition?(id) {
+                            guard value.isValid, value.objectID == id else { throw RustScreenStateError.invalidResponse }
+                            restoredDefinitions[id] = value
+                        }
+                        if let value = try await self.source.restoreContent?(id) {
+                            guard value.isValid, value.objectID == id else { throw RustScreenStateError.invalidResponse }
+                            restoredContents[id] = value
+                        }
+                    }
+                    guard self.persistenceLease == lease, self.metadataWorldID() == world else { return }
+                    self.calibrationOverrides = restoredDefinitions; self.contents = restoredContents
+                    self.persistenceStatus = "ready"; self.persistenceNotice = ""
+                    self.rebuild()
+                } catch {
+                    guard self.persistenceLease == lease, self.metadataWorldID() == world, !Task.isCancelled else { return }
+                    _ = self.persistenceFailure(error)
+                }
+            }
+        }
+        return persistenceStatus == "ready"
+    }
+
+    private func persistenceReady() async -> Bool {
+        rebuild()
+        if persistenceStatus == "loading" { await persistenceTask?.value }
+        return persistenceStatus == "ready"
+    }
+    private func persistenceFailure(_ error: Error) -> WorldScreenCommandOutcome {
+        let code = (error as? RustScreenStateError)?.code ?? "screen_state_unavailable"
+        persistenceStatus = "error"; persistenceNotice = "屏幕记录尚未确认，已暂停修改（\(code)）。"
+        onPersistenceError?(persistenceNotice)
+        snapshots = makeSnapshots()
+        return .failure(.screenLoadFailed, persistenceNotice, details: ["cause":code])
+    }
+    private func persistDefinition(_ definition: WorldScreenDefinition) async -> WorldScreenCommandOutcome? {
+        guard await persistenceReady() else { return .failure(.screenLoadFailed, persistenceNotice) }
+        let world = metadataWorldID()
+        do { try await source.persistDefinition?(definition) }
+        catch { return persistenceFailure(error) }
+        guard world == metadataWorldID() else { return .failure(.screenNotFound, "屏幕所属世界已切换。") }
+        return nil
+    }
+    private func persistContent(_ content: WorldScreenContent) async -> WorldScreenCommandOutcome? {
+        guard await persistenceReady() else { return .failure(.screenLoadFailed, persistenceNotice) }
+        let world = metadataWorldID()
+        do { try await source.persistContent?(content) }
+        catch { return persistenceFailure(error) }
+        guard world == metadataWorldID() else { return .failure(.screenNotFound, "屏幕所属世界已切换。") }
+        return nil
+    }
+    private func removePersisted(_ objectID: String) {
+        guard let remove = source.removePersisted, attemptedRemovals.insert(objectID).inserted else { return }
+        let world = metadataWorldID()
+        Task { @MainActor [weak self] in
+            guard let self, self.metadataWorldID() == world else { return }
+            do { try await remove(objectID) }
+            catch { guard self.metadataWorldID() == world else { return }; _ = self.persistenceFailure(error) }
+        }
+    }
+
     private func resolve(objectID: String, state: WorldObjectState) {
         let calibratedJSON: String?
         if let override = calibrationOverrides[objectID] {
             calibratedJSON = WorldScreenDefinitionCoding.encode(override)
         } else if let stored = state.metadata[WorldScreenMetadataKey.definition] {
             calibratedJSON = stored
-        } else if let restored = source.restoreDefinition?(objectID) {
-            // 本机持久化的标定 / 来源：只补会话缓存，不冒充世界状态。
-            calibrationOverrides[objectID] = restored
-            calibratedJSON = WorldScreenDefinitionCoding.encode(restored)
         } else {
             calibratedJSON = nil
         }
@@ -324,12 +415,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             contents[objectID] = stored
             return stored.url
         }
-        // 本机持久化恢复（重启后仍记得上次放的是什么）。
-        if let restored = source.restoreContent?(objectID),
-           restored.isValid, restored.objectID == objectID {
-            contents[objectID] = restored
-            return restored.url
-        }
+        // Async authority restoration completes before rebuild; no HTTP on a render tick.
         return nil
     }
 
@@ -492,7 +578,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 guard let nativeState, case .loading = nativeState else { return nil }
                 return native?.cacheState?.panelText
             }()
-            let stateText = issues[objectID]?.errorDescription
+            let stateText = (persistenceStatus == "error" ? persistenceNotice : nil)
+                ?? issues[objectID]?.errorDescription
                 ?? preparationText
                 ?? nativeState?.displayText
                 ?? surface?.state.displayText
@@ -615,8 +702,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             objectID: target, kind: .officialEmbed, url: url.absoluteString,
             title: WorldScreenEmbedPolicy.displayName(for: url)
         )
+        if let failure = await persistContent(content) { return failure }
         contents[target] = content
-        source.persistContent?(content)
         surface.geometryIssue = nil
         // **先挂网页视图，再载页**（2026-10-03：待机不再挂着网页视图，所以"挂上"这一步
         // 被挪到了播放这条路上）。造的这一次 WebKit 内容进程是这条通路唯一的**一次性**代价，
@@ -677,8 +764,8 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             objectID: target, kind: .nativeLink, url: pageURL,
             title: site?.displayName ?? "网站链接"
         )
+        if let failure = await persistContent(content) { return failure }
         contents[target] = content
-        source.persistContent?(content)
         overlay.surface(for: target).geometryIssue = nil
         let outcome = await nativeCoordinator.play(
             objectID: target, pageURL: pageURL,
@@ -717,7 +804,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
             objectID: target, kind: .nativeLink, url: url, title: "非 HLS 声音对照"
         )
         contents[target] = content
-        source.persistContent?(content)
+        // Diagnostic file URLs are output-only and are not valid durable page metadata.
         overlay.surface(for: target).geometryIssue = nil
         let outcome = await nativeCoordinator.playDirectFileMedia(
             objectID: target, fileURL: url, title: "非 HLS 声音对照",
@@ -740,7 +827,7 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
 
     func calibrateScreen(
         objectID: String, widthMeters: Float, heightMeters: Float, centerHeightMeters: Float
-    ) -> WorldScreenCommandOutcome {
+    ) async -> WorldScreenCommandOutcome {
         let quad = WorldScreenQuad(
             center: SIMD3<Float>(0, centerHeightMeters, 0),
             yaw: 0, pitch: 0,
@@ -759,11 +846,11 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
                 "这个大小不合适：宽高要在 0.04–10 m 之间，中心高在 ±100 m 之内。"
             )
         }
+        if let failure = await persistDefinition(definition) { return failure }
         calibrationOverrides[objectID] = definition
         definitions[objectID] = definition
         issues[objectID] = nil
         overlay.surface(for: objectID).geometryIssue = nil
-        source.persistDefinition?(definition)
         snapshots = makeSnapshots()
         // `message` 是面板与 agent 共用的那一句 ⇒ 人话；`note`（工程口径的那份原文）
         // 已经随定义落进 metadata，进 `details` 给工具看，不摆到面板上。
@@ -774,15 +861,15 @@ final class WorldScreenStore: ObservableObject, WorldScreenControlling {
     }
 
     /// 把一台电视**显式**指定成屏幕（给"名字里没有 tv 但确实是电视"的物件一条明路）。
-    func designateScreen(objectID: String, size: SIMD3<Float>?) -> WorldScreenCommandOutcome {
+    func designateScreen(objectID: String, size: SIMD3<Float>?) async -> WorldScreenCommandOutcome {
         switch WorldScreenResolution.resolve(
             objectID: objectID, calibratedJSON: nil, size: size, allowsDefault: true
         ) {
         case let .success(definition):
+            if let failure = await persistDefinition(definition) { return failure }
             calibrationOverrides[objectID] = definition
             definitions[objectID] = definition
             issues[objectID] = nil
-            source.persistDefinition?(definition)
             snapshots = makeSnapshots()
             return .ok(
                 "已经把\(source.displayName(objectID))当成电视了。",

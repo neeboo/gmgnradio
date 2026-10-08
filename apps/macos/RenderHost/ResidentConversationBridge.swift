@@ -9,7 +9,9 @@ final class RenderHostResidentConversation {
     private var service: AgentConversationService
     private var connector: RenderHostDSHConnector
     private let dataRoot: URL
+    private let authorityEndpointFile: String
     private let defaults: UserDefaults
+    private let productSettings: RustProductSettingsClient
     private var rebuildConnection = false
     private var task: Task<Void, Never>?
     private var generation: UInt64 = 0
@@ -29,11 +31,12 @@ final class RenderHostResidentConversation {
     private var worldLease: ResidentWorldToolSession?
     private var backgroundTask: Task<String, Error>?
     private var backgroundRunID: UUID?
+    private(set) var lastReplySpeechSource: [String: Any] = [:]
 
     var installedBackendSnapshot: [[String: Any]] {
         // Snapshot is polled by the Unity render loop. Discovery runs only at
         // initialization or an explicit settings/selection action.
-        service.cachedInstalledBackends.filter { $0.kind == .dsh || $0.kind == .codex }
+        service.cachedInstalledBackends.filter { [.dsh, .codex, .claudeCode].contains($0.kind) }
             .map { ["id": $0.kind.rawValue, "name": $0.displayName, "installed": true, "selected": $0.kind.rawValue == backend] }
     }
 
@@ -43,7 +46,7 @@ final class RenderHostResidentConversation {
 
     @discardableResult
     func selectBackend(_ id: String) -> Bool {
-        guard ["dsh", "codex"].contains(id),
+        guard ["dsh", "codex", "claudeCode"].contains(id),
               service.installedBackends(refresh: true).contains(where: { $0.kind.rawValue == id }) else { return false }
         guard id != backend else { return true }
         if let id = backgroundRunID { cancelRun(runID: id) }
@@ -52,7 +55,7 @@ final class RenderHostResidentConversation {
         connector.close()
         service.resetSession()
         backend = id
-        service = Self.makeService(connector: connector, defaults: defaults, backend: id)
+        service = Self.makeService(connector: connector, defaults: defaults, backend: id, productSettings: productSettings)
         rebuildConnection = true
         return true
     }
@@ -111,30 +114,31 @@ final class RenderHostResidentConversation {
         replySpeechProvider = provider
     }
 
-    init(backend: String, dataRoot: URL, defaults: UserDefaults) throws {
+    init(backend: String, dataRoot: URL, defaults: UserDefaults, productSettings: RustProductSettingsClient = .shared) throws {
+        self.productSettings = productSettings
         self.backend = backend
-        guard ["dsh", "codex"].contains(backend) else { throw RenderHostDSHConnectionError.unsupportedBackend }
+        guard ["dsh", "codex", "claudeCode"].contains(backend) else { throw RenderHostDSHConnectionError.unsupportedBackend }
         let directory = dataRoot.appendingPathComponent("chat", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         self.dataRoot = directory
+        authorityEndpointFile = WorldAuthorityEndpoint(applicationSupportBase: dataRoot).endpointFile
         self.defaults = defaults
         let connector = try RenderHostDSHConnector(dataRoot: directory, requiresNative: backend == "dsh")
         self.connector = connector
-        service = Self.makeService(connector: connector, defaults: defaults, backend: backend)
+        service = Self.makeService(connector: connector, defaults: defaults, backend: backend, productSettings: productSettings)
     }
 
-    private static func makeService(connector: RenderHostDSHConnector, defaults: UserDefaults, backend: String) -> AgentConversationService {
+    private static func makeService(connector: RenderHostDSHConnector, defaults: UserDefaults, backend: String, productSettings: RustProductSettingsClient) -> AgentConversationService {
         let service = AgentConversationService(
             defaults: defaults,
             // Fail closed if a future service change attempts a CLI fallback.
             runnerFactory: { _ in RenderHostForbiddenHeadlessRunner() },
             residentDSHImageConnector: connector,
-            useResidentAgent: true
+            useResidentAgent: true,
+            productSettings: productSettings
         )
-        service.selectBackend(backend == "codex" ? .codex : .dsh)
         _ = service.installedBackends(refresh: true)
-        service.setAutoSpeakReplies(false)
         service.resetSession()
         return service
     }
@@ -147,7 +151,10 @@ final class RenderHostResidentConversation {
     func send(
         requestID: UInt64,
         submission: ResidentChatSubmission,
-        authorizeImages: (@MainActor (UUID, @escaping @MainActor () -> Bool) throws -> Void)? = nil
+        authorizeImages: (@MainActor (UUID, @escaping @MainActor () -> Bool) async throws -> Void)? = nil,
+        executionRunID: UUID? = nil,
+        rustClaim: (scheduler: RustResidentSchedulerClient, ticket: RustResidentSchedulerClient.Ticket)? = nil,
+        actualCompletion: (@MainActor (Result<String, Error>) -> Void)? = nil
     ) -> Bool {
         guard task == nil else {
             enqueue(kind: "failure", requestID: requestID, message: "正在回复，请先停止当前回复。")
@@ -164,7 +171,7 @@ final class RenderHostResidentConversation {
                 let replacement = try RenderHostDSHConnector(dataRoot: dataRoot, requiresNative: backend == "dsh")
                 replacement.musicStateProvider = musicStateProvider
                 connector = replacement
-                service = Self.makeService(connector: replacement, defaults: defaults, backend: backend)
+                service = Self.makeService(connector: replacement, defaults: defaults, backend: backend, productSettings: productSettings)
                 rebuildConnection = false
             } catch {
                 enqueue(kind: "failure", requestID: requestID, message: error.localizedDescription)
@@ -194,8 +201,9 @@ final class RenderHostResidentConversation {
         }
         generation &+= 1
         let lease = generation
+        var imageAuthorization: (@MainActor () async throws -> Void)?
         if let services = worldServices {
-            let scope = submission.id
+            let scope = executionRunID ?? submission.id
             let worldID = services.context.snapshot.worldID
             let isCurrent: @MainActor () -> Bool = { [weak self] in
                 guard let self else { return false }
@@ -203,22 +211,19 @@ final class RenderHostResidentConversation {
                     && services.context.snapshot.worldID == worldID
             }
             if !submission.attachments.isEmpty, let authorizeImages {
-                do {
-                    try authorizeImages(scope, isCurrent)
-                } catch {
-                    let recovered = recovery.restore(submission, text: draft, attachments: [])
-                    draft = recovered.text
-                    statusNotice = "图片授权失败，请确认当前空间后重试。"
-                    failureCode = Self.safeFailureCode(error)
-                    enqueue(kind: "failure", requestID: requestID,
-                            message: statusNotice, category: "connection")
-                    return false
+                imageAuthorization = {
+                    try await authorizeImages(scope, isCurrent)
+                    guard isCurrent() else { throw CancellationError() }
                 }
             }
             let tools = ResidentWorldToolSession(scopeID: scope, worldID: worldID,
                 dispatcher: services.dispatcher, deadline: Date().addingTimeInterval(180),
                 isCurrent: isCurrent, onCancel: services.onCancel,
-                additionalTools: services.additionalTools(scope, submission.text, isCurrent))
+                additionalTools: services.additionalTools(scope, submission.text, isCurrent),
+                rustOperationAuthority: { name, canonical in
+                    RustResidentToolBindingFactory.decision(scopeID: scope, worldID: worldID,
+                        revision: services.context.snapshot.revision, name: name, canonical: canonical)
+                })
             worldLease = tools
             connector.worldLease = tools
         }
@@ -239,13 +244,24 @@ final class RenderHostResidentConversation {
         let turnConnector = connector
         let turnWorldLease = worldLease
         let turnWorldContext = worldServices.map(currentWorldContext)
-        let codexTools: ResidentConversationTools? = backend == "codex" ? turnWorldLease.map { lease in
+        turnService.setRustResidentMode(true)
+        let rustOwner = rustClaim.flatMap { claim in turnWorldLease.flatMap { lease in
+            try? RustResidentToolBindingFactory(session: lease, claim: claim,
+                endpointFile: authorityEndpointFile)
+        }}
+        let codexTools: ResidentConversationTools? = turnWorldLease.map { lease in
             .init(worldID: lease.worldID, schemasJSON: lease.toolSchemasJSON,
                 call: { id, name, arguments in
-                    let result = await lease.call(requestID: id, name: name, argumentsJSON: arguments)
+                    let result: RealtimeDJToolResult
+                    if let rustOwner { result = await rustOwner.call(callID: id, name: name, arguments: arguments) }
+                    else { result = .init(callID: id, resultJSON: Data("{\"error\":\"rust_claim_required\"}".utf8), isError: true) }
                     return .init(resultJSON: result.resultJSON, isError: result.isError)
-                }, cancel: { lease.cancel() })
-        } : nil
+                }, cancel: { lease.cancel() }, rustBinding: rustOwner?.binding,
+                rustDSHBinding: try? rustOwner?.dshBinding(),
+                rustClaudeBinding: backend == "claudeCode" ? (try? rustOwner?.claudeBinding(
+                    adapterExecutableURL: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-mcpd"),
+                    environment: ProcessInfo.processInfo.environment)) : nil)
+        }
         turnConnector.onTextDelta = { [weak self] text in
             guard let self, lease == self.generation,
                   self.activeRequestID == requestID, !text.isEmpty else { return }
@@ -257,14 +273,18 @@ final class RenderHostResidentConversation {
         task = Task { [weak self] in
             guard let self else { return }
             do {
+                try await imageAuthorization?()
+                guard lease == generation, !Task.isCancelled else { throw CancellationError() }
                 let persona = ResidentPreferences(defaults: defaults).persona
                 let prompt = turnWorldContext == nil ? (ResidentPreferences.personaInjection(persona) ?? "") + submission.text : submission.text
                 let response = try await turnService.send(prompt, imageURLs: imageURLs, history: previous,
                     worldContext: turnWorldContext, worldTools: codexTools,
                     nativeToolsAvailable: self.backend == "dsh" && turnWorldLease != nil,
                     userMessage: submission.text)
+                actualCompletion?(.success(response))
                 guard lease == generation, !Task.isCancelled else { return }
                 reply = response
+                lastReplySpeechSource = turnService.lastSpeechSource
                 turnConnector.onTextDelta = nil
                 transcript += [.init(role: .user, text: submission.text), .init(role: .agent, text: response)]
                 transcript = Array(transcript.suffix(24))
@@ -274,6 +294,9 @@ final class RenderHostResidentConversation {
                 activeRequestID = nil
                 task = nil
             } catch {
+                // This is the actual provider return, including late returns.
+                // UI cancellation alone never invokes this completion.
+                actualCompletion?(.failure(error))
                 guard lease == generation else { return }
                 turnConnector.onTextDelta = nil
                 draft = recovery.restore(submission, text: draft, attachments: []).text
@@ -330,7 +353,8 @@ final class RenderHostResidentConversation {
 
     /// Autonomous input never calls the human factory or registers a human
     /// message/reference grant. It shares the selected backend and real world.
-    func runBackground(input: ResidentAgentLoop.Input) async throws -> String {
+    func runBackground(input: ResidentAgentLoop.Input, preserveActualCompletion: Bool = false,
+                       rustClaim: (scheduler: RustResidentSchedulerClient, ticket: RustResidentSchedulerClient.Ticket)? = nil) async throws -> String {
         guard input.isBackground, input.userMessages.isEmpty else { throw RenderHostBackgroundError.humanInput }
         guard task == nil, backgroundRunID == nil else { throw RenderHostBackgroundError.busy }
         guard let services = worldServices, services.isCurrent(), services.dispatcher.context === services.context else {
@@ -341,7 +365,7 @@ final class RenderHostResidentConversation {
             let replacement = try RenderHostDSHConnector(dataRoot: dataRoot, requiresNative: backend == "dsh")
             replacement.musicStateProvider = musicStateProvider
             connector = replacement
-            service = Self.makeService(connector: replacement, defaults: defaults, backend: backend)
+            service = Self.makeService(connector: replacement, defaults: defaults, backend: backend, productSettings: productSettings)
             rebuildConnection = false
         }
         generation &+= 1
@@ -355,16 +379,30 @@ final class RenderHostResidentConversation {
         }
         let lease = ResidentWorldToolSession(scopeID: runID, worldID: worldID, dispatcher: services.dispatcher,
             deadline: Date().addingTimeInterval(180), isCurrent: isCurrent, onCancel: services.onCancel,
-            additionalTools: services.backgroundTools(runID, isCurrent))
+            additionalTools: services.backgroundTools(runID, isCurrent), rustOperationAuthority: { name, canonical in
+                RustResidentToolBindingFactory.decision(scopeID: runID, worldID: worldID,
+                    revision: services.context.snapshot.revision, name: name, canonical: canonical)
+            })
         worldLease = lease
         connector.worldLease = lease
         connector.onTextDelta = nil
         let turnService = service
-        let tools: ResidentConversationTools? = backend == "codex" ? .init(worldID: worldID, schemasJSON: lease.toolSchemasJSON,
+        turnService.setRustResidentMode(true)
+        let rustOwner = try rustClaim.map { claim in
+            try RustResidentToolBindingFactory(session: lease, claim: claim,
+                endpointFile: authorityEndpointFile)
+        }
+        let tools: ResidentConversationTools? = .init(worldID: worldID, schemasJSON: lease.toolSchemasJSON,
             call: { id, name, arguments in
-                let result = await lease.call(requestID: id, name: name, argumentsJSON: arguments)
+                let result: RealtimeDJToolResult
+                if let rustOwner { result = await rustOwner.call(callID: id, name: name, arguments: arguments) }
+                else { result = .init(callID: id, resultJSON: Data("{\"error\":\"rust_claim_required\"}".utf8), isError: true) }
                 return .init(resultJSON: result.resultJSON, isError: result.isError)
-            }, cancel: { lease.cancel() }) : nil
+            }, cancel: { lease.cancel() }, rustBinding: rustOwner?.binding,
+            rustDSHBinding: try? rustOwner?.dshBinding(),
+            rustClaudeBinding: backend == "claudeCode" ? (try? rustOwner?.claudeBinding(
+                adapterExecutableURL: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-mcpd"),
+                environment: ProcessInfo.processInfo.environment)) : nil)
         let context = currentWorldContext(services)
         let operation = Task {
             try await turnService.send(input.promptText, imageURLs: input.imageURLs,
@@ -381,6 +419,8 @@ final class RenderHostResidentConversation {
         }
         return try await withTaskCancellationHandler(operation: {
             let result = try await operation.value
+            if isCurrent() { lastReplySpeechSource = turnService.lastSpeechSource }
+            if preserveActualCompletion { return result }
             try Task.checkCancellation()
             guard isCurrent() else { throw CancellationError() }
             return result
@@ -425,6 +465,13 @@ final class RenderHostResidentConversation {
         statusNotice = "已停止本次回复。"
         enqueue(kind: "cancelled", requestID: cancelledID, message: statusNotice)
         return true
+    }
+
+    /// The scheduler withdrew this input before send() began. Keep UI/draft
+    /// ownership here; this does not claim that a provider invocation stopped.
+    func cancelUnstarted(requestID: UInt64, submission: ResidentChatSubmission) {
+        draft = recovery.restore(submission, text: draft, attachments: []).text
+        enqueue(kind: "cancelled", requestID: requestID, message: "已停止尚未发送的消息。")
     }
 
     func close() {
@@ -535,6 +582,7 @@ final class RenderHostResidentConversation {
         if let text { event["text"] = text }
         if let message { event["message"] = message }
         if let category { event["category"] = category }
+        if kind == "reply" { event["speechSource"] = lastReplySpeechSource }
         events.append(event)
         if events.count > 64 { events.removeFirst(events.count - 64) }
     }
@@ -568,116 +616,22 @@ private struct RenderHostForbiddenHeadlessRunner: CodexCommandRunning {
     }
 }
 
-/// A lifecycle/cwd adapter around the real production ACP connector. It owns
-/// no authentication policy, key or provider override. Composition emission,
-/// verification, mounted modules and managed credentials remain production DSH.
+/// UI callback holder only. World ACP process/tool ownership lives in taskd.
 @MainActor
 private final class RenderHostDSHConnector: ResidentDSHImageConnecting {
     var onTextDelta: (@MainActor (String) -> Void)?
     var musicStateProvider: (@MainActor () -> [String: Any])?
     var worldLease: ResidentWorldToolSession?
-    private let node: URL?
-    private let entry: URL?
-    private let dataRoot: URL
-    private var native: ResidentDSHConnector?
-    private var sandbox: ResidentDSHSandbox?
-    private var musicTools: ResidentDSHHostToolsChannel?
-
     init(dataRoot: URL, requiresNative: Bool = true) throws {
-        let transport = ResidentDSHComposition.locateNativeTransport(using: AgentExecutableLocator())
-        guard !requiresNative || transport != nil else {
-            throw RenderHostDSHConnectionError.unavailable
-        }
-        self.node = transport?.node
-        self.entry = transport?.entry
-        self.dataRoot = dataRoot
+        _ = dataRoot
+        if requiresNative && ResidentDSHComposition.locateNativeTransport(using: AgentExecutableLocator()) == nil { throw RenderHostDSHConnectionError.unavailable }
     }
-
-    var isUsable: Bool { native?.isUsable ?? true }
-
-    func openSession(cwd: URL) async throws -> ResidentDSHSessionHandle {
-        close()
-        guard let node, let entry else { throw RenderHostDSHConnectionError.unavailable }
-        try Task.checkCancellation()
-        if worldLease != nil || musicStateProvider != nil {
-            let schema = Data(#"{"type":"object","properties":{},"additionalProperties":false}"#.utf8)
-            var registrations = try worldLease.map { try ResidentDSHHostToolSet.parse(schemasJSON: $0.toolSchemasJSON) } ?? []
-            let registeredNames = Set(registrations.map(\.canonicalName))
-            registrations += ["read_current_track", "read_radio_state"].filter { musicStateProvider != nil && !registeredNames.contains($0) }.map { name in
-                ResidentDSHHostToolRegistration(canonicalName: name, declaredName: "gmgn_" + name,
-                    description: "读取应用播放器此刻的真实歌曲、播放状态和进度。询问正在播放的音乐时必须调用此工具；没有歌曲时明确返回空状态。只读，不控制播放。",
-                    originalSchemaJSON: schema)
-            }
-            musicTools = try ResidentDSHHostToolsChannel.start(configuration: .init(
-                scope: worldLease?.scopeID.uuidString ?? "unity-player-music", worldID: worldLease?.worldID ?? "player", registrations: registrations,
-                handler: { [weak self] request in
-                    if let lease = self?.worldLease,
-                       !(request.canonicalName == "read_current_track" || request.canonicalName == "read_radio_state") || registeredNames.contains(request.canonicalName) {
-                        let result = await lease.call(requestID: request.callID, name: request.canonicalName, argumentsJSON: request.argumentsJSON)
-                        return .init(resultJSON: result.resultJSON, isError: result.isError)
-                    }
-                    guard let provider = self?.musicStateProvider,
-                          ["read_current_track", "read_radio_state"].contains(request.canonicalName),
-                          let args = try? JSONSerialization.jsonObject(with: request.argumentsJSON) as? [String: Any],
-                          args.isEmpty else {
-                        return .init(resultJSON: Data(#"{"ok":false,"code":"music_state_unavailable"}"#.utf8), isError: true)
-                    }
-                    // Read-only public playback facts only. A host accidentally
-                    // returning its full snapshot must not expose paths/tokens.
-                    let allowed: Set<String> = ["title", "artist", "trackID", "provider", "isPlaying", "position", "duration", "queueIndex", "queueCount", "hasTrack"]
-                    let state = provider().filter { allowed.contains($0.key) }
-                    guard let result = try? JSONSerialization.data(withJSONObject: ["ok": true, "state": state], options: [.sortedKeys]) else {
-                        return .init(resultJSON: Data(#"{"ok":false,"code":"invalid_music_state"}"#.utf8), isError: true)
-                    }
-                    return .init(resultJSON: result, isError: false)
-                }))
-            musicTools?.revoke()
-        }
-        let box: ResidentDSHSandbox
-        do {
-            box = try ResidentDSHComposition.makeResidentSandbox(resolvingFrom: entry, rootDirectory: dataRoot,
-                hostToolsPluginPath: musicTools?.pluginFileURL.path)
-        } catch { close(); throw error }
-        let connection = ResidentDSHConnector(nodeExecutable: node, entryPoint: entry,
-            compositionFileURL: box.compositionFileURL, requestTimeout: 120)
-        sandbox = box
-        native = connection
-        do {
-            // The service's injected-connector fallback cwd is intentionally
-            // ignored: both the Process and ACP session use the owned sandbox.
-            let handle = try await connection.openSession(cwd: box.workspace)
-            guard native === connection, !Task.isCancelled else { throw CancellationError() }
-            return handle
-        } catch {
-            if native === connection {
-                close()
-            } else {
-                // A cancelled handshake can finish after a replacement has
-                // started. Release only the old operation's owned resources.
-                connection.close()
-                box.removeAll()
-            }
-            throw error
-        }
-    }
-
-    func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock]) async throws -> String {
-        guard let native else { throw ResidentDSHTransportError.notConnected }
-        let turnTools = musicTools
-        try turnTools?.arm(worldRevision: nil)
-        defer { turnTools?.revoke() }
-        return try await native.prompt(sessionID: sessionID, blocks: blocks, onTextDelta: onTextDelta)
-    }
-    func cancelActivePrompt() { musicTools?.revoke(); native?.cancelActivePrompt() }
-    func awaitCancellationSettled() async { await native?.awaitCancellationSettled() }
-    func close() {
-        musicTools?.stop()
-        musicTools = nil
-        native?.close()
-        native = nil
-        sandbox?.removeAll()
-        sandbox = nil
-    }
+    var isUsable: Bool { true }
+    func openSession(cwd: URL) async throws -> ResidentDSHSessionHandle { throw RenderHostDSHConnectionError.headlessForbidden }
+    func prompt(sessionID: String, blocks: [ResidentDSHPromptBlock]) async throws -> String { throw RenderHostDSHConnectionError.headlessForbidden }
+    func cancelActivePrompt() {}
+    func awaitCancellationSettled() async {}
+    func close() {}
 }
 
 private func bridgeJSON(_ value: [String: Any]) -> UInt? {
@@ -691,7 +645,7 @@ func gmgnRenderHostChatConfigure(_ pointer: UnsafeMutableRawPointer?, _ backendP
     guard Thread.isMainThread, let pointer, let backendPointer else { return 0 }
     let address = UInt(bitPattern: pointer)
     let backend = String(cString: backendPointer)
-    guard ["dsh", "codex"].contains(backend) else { return 0 }
+    guard ["dsh", "codex", "claudeCode"].contains(backend) else { return 0 }
     return MainActor.assumeIsolated {
         let host = Unmanaged<GPUIRenderHost>.fromOpaque(UnsafeMutableRawPointer(bitPattern: address)!).takeUnretainedValue()
         do {

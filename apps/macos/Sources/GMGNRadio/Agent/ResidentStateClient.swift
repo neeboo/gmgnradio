@@ -96,6 +96,10 @@ final class ResidentStateClient {
     init(transport: ResidentStateTransport) {
         self.transport = transport
     }
+    func residentIntentCall(method: String, params: [String: ResidentStateJSON]) async throws -> [String: ResidentStateJSON] {
+        guard ["resident_intent_restore", "resident_intent_update", "resident_intent_pause", "resident_intent_enqueue", "resident_intent_drain"].contains(method) else { throw ResidentStateError.invalidResponse }
+        return try await transport.call(method: method, params: params)
+    }
 
     private func scopeParams(_ scope: ResidentStateScope) -> [String: ResidentStateJSON] {
         ["scope": scope.nestedParam]

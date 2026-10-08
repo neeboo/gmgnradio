@@ -91,8 +91,12 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         try context.startActivity(id: "wish_machine.collect")
         for _ in 0..<900 {
             try context.tick(deltaTime: 1.0/30)
-            if context.snapshot.activeActivity?.phase == .loop { break }
+            if context.snapshot.activeActivity?.phase == .enter { break }
         }
+        check(context.snapshot.activeActivity?.phase == .enter, "navigation reaches the authored pickup enter operation")
+        // Explicit native completion simulation; the authored pickup clip has
+        // no wall-time duration and this hostless harness does not play avatars.
+        try context.completeActivityPlayback(requestID: context.currentActivityRequestID!, phase: .enter)
         check(context.snapshot.activeActivity?.id == "wish_machine.collect" && context.snapshot.activeActivity?.phase == .loop, "resident reaches pickup loop against actual collider")
         let p = context.snapshot.agentTransform.position
         let target = pickupAnchor.position
@@ -119,7 +123,7 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         check(node.simdPosition == WishMachineScene.position, "machine placed in metre coordinates")
         check(node.childNode(withName: "wish_machine.header", recursively: true) == nil, "tray has no lid hiding generated item")
         check(node.childNode(withName: "wish_machine.back", recursively: true) == nil, "tray has no back wall")
-        check(WishMachineScene.size.y == 0.5, "low tray height")
+        check(declaration.size?.y == 0.12 && WishMachineScene.size.y == declaration.size?.y, "low tray height follows the bundled declaration")
         let visualBounds = node.boundingBox
         check(Float(visualBounds.max.x - visualBounds.min.x) >= WishMachineScene.size.x * 1.25, "machine body is enlarged without changing formal collision size")
         node.removeFromParentNode()
@@ -155,8 +159,10 @@ func check(_ value: Bool, _ message: String) { if !value { print("FAIL:", messag
         try context.startActivity(id: "music.listen")
         for _ in 0..<900 {
             try context.tick(deltaTime: 1.0/30)
-            if context.snapshot.activeActivity?.phase == .loop { break }
+            if context.snapshot.activeActivity?.phase == .enter { break }
         }
+        check(context.snapshot.activeActivity?.phase == .enter, "navigation reaches the authored jukebox enter operation")
+        try context.completeActivityPlayback(requestID: context.currentActivityRequestID!, phase: .enter)
         check(context.snapshot.activeActivity?.id == "music.listen" && context.snapshot.activeActivity?.phase == .loop, "jukebox remains reachable from machine")
         print("PASS: wish machine route and activity reach actual pickup point", p)
     }
@@ -172,6 +178,8 @@ func run(_ executable: String, _ arguments: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
     try process.run(); process.waitUntilExit(); return process.terminationStatus
 }
-let status = try run("/usr/bin/nice", ["-n","15","/usr/bin/swiftc","-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,"apps/macos/Sources/GMGNRadio/Agent/WorldAgentContext.swift","apps/macos/Sources/GMGNRadio/Presence/WishMachineScene.swift",source.path] + objects.map(\.path) + ["-o",executable.path])
+let authorityInputs = ["RustActivityCatalogClient", "RustWorldActivityClient", "WorldAuthorityClient", "AuthorityWorldStatePersistence", "TaskdHTTPTransport", "RetryBackoff"]
+    .map { "apps/macos/Sources/GMGNRadio/Presence/" + $0 + ".swift" }
+let status = try run("/usr/bin/nice", ["-n","15","/usr/bin/swiftc","-j1","-parse-as-library","-I",build.appendingPathComponent("Modules").path,"apps/macos/Sources/GMGNRadio/Agent/WorldAgentContext.swift","apps/macos/Sources/GMGNRadio/Presence/WishMachineScene.swift",source.path] + authorityInputs + objects.map(\.path) + ["-o",executable.path])
 guard status == 0 else { exit(status) }
 exit(try run(executable.path, []))

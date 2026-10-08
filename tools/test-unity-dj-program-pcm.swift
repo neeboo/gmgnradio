@@ -1,6 +1,10 @@
 import Foundation
 import AVFoundation
+#if GMGN_STORAGE_RELEASE_TYPECHECK
+import UnityMediaHost
+#else
 @testable import UnityMediaHost
+#endif
 
 // No network transport, provider account, planning agent or user archive is used.
 struct PCMTransport: MusicProviderHTTPTransport {
@@ -42,14 +46,12 @@ func candidate(_ name: String) -> MusicCandidate {
           title: name, artist: "fixture", album: nil, duration: 8, isPlayable: true,
           matchScore: 1, userAffinity: 1, energy: 0.5, moodTags: [], genres: [], releaseYear: nil)
 }
-func program(_ id: String, _ names: [String]) -> ProgramPlan {
-    .init(brief: .init(id: id, targetDuration: 1800, moodTags: [], energyArc: [], conversationMode: .ambient),
-          slots: names.map { name in
-              let track = candidate(name)
-              return .init(track: track, role: .build, hostHint: .init(shouldTalkBefore: false, maxSentenceCount: 1,
-                  selectionReason: "fixture", currentTrack: .init(id: track.id, title: track.title, artist: track.artist),
-                  nextTrack: nil, facts: [], transitionIntent: nil))
-          }, revision: 1, generatedAt: Date(), replanAfterTrackCount: 5, title: id)
+@MainActor func program(_ id: String, _ names: [String]) async throws -> ProgramPlan {
+    let backend = MusicStorageRPCFixture()
+    let library = SyncedMusicLibraryStore(storage: backend.client)
+    library.merge(playlists: [MusicPlaylistSnapshot(id: id, providerID: .netease, name: id, artworkURL: nil, tracks: names.map(candidate), totalTrackCount: names.count)])
+    try await library.flush()
+    return try await RustMusicProgramClient(call: backend.call).playlistPlan(playlistID: id)
 }
 enum Rejected: Error { case host }
 @MainActor final class PCMObservations {
@@ -60,10 +62,25 @@ enum Rejected: Error { case host }
 }
 @main struct Regression {
     @MainActor static func main() async throws {
+        precondition(ProcessInfo.processInfo.environment["GMGN_TEST_ENABLE_ACTUAL_PCM_DEVICE"] == "1", "PCM fixture is compile-only unless explicitly authorized")
+        guard let endpoint = ProcessInfo.processInfo.environment["GMGN_MUSIC_LIBRARY_FIXTURE_URL"], let url = URL(string: endpoint), ["127.0.0.1", "localhost"].contains(url.host ?? ""), let port = url.port,
+              let token = ProcessInfo.processInfo.environment["GMGN_MUSIC_LIBRARY_FIXTURE_TOKEN"] else { preconditionFailure("Explicit private authority endpoint is required") }
         let files = FileManager.default
         let root = files.temporaryDirectory.appendingPathComponent("gmgn-dj-pcm-\(UUID())")
         try files.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? files.removeItem(at: root) }
+        let authorityEndpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        guard let actualTaskRoot = ProcessInfo.processInfo.environment["GMGN_MUSIC_LIBRARY_FIXTURE_ROOT"] else {
+            preconditionFailure("Explicit actual private taskd root is required")
+        }
+        let cacheAuthority = RustMusicCacheClient(endpointFile: root.appendingPathComponent("private-cache.endpoint.json").path,
+            helperPath: "/no-launch", allowsLaunching: false,
+            taskRoot: URL(fileURLWithPath: actualTaskRoot), hostSessionID: UUID().uuidString)
+        let endpointFile = URL(fileURLWithPath: authorityEndpoint.endpointFile)
+        try files.createDirectory(at: endpointFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["version": 2, "address": "127.0.0.1:\(port)", "token": token]).write(to: endpointFile)
+        try JSONSerialization.data(withJSONObject: ["version": 2, "address": "127.0.0.1:\(port)", "token": token])
+            .write(to: root.appendingPathComponent("private-cache.endpoint.json"))
         setenv("GMGN_UNITY_MUSIC_LIBRARY_ROOT", root.path, 1)
         let wave = root.appendingPathComponent("fixture.wav")
         let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
@@ -73,11 +90,13 @@ enum Rejected: Error { case host }
         try AVAudioFile(forWriting: wave, settings: format.settings).write(from: pcm)
         let sessions = InMemoryMusicProviderSessionStore()
         await sessions.save(.init(credential: .cookieHeader("isolated-fixture"), expiresAt: nil), for: .netease)
+        let backend = MusicStorageRPCFixture()
+        let programClient = RustMusicProgramClient(call: backend.call)
+        let programStore = DJProgramStore(client: programClient)
         let runtime = MusicRuntime(netease: NeteaseMusicSource(sessions: sessions, client: PCMProvider()),
             qqMusic: QQMusicSource(sessions: sessions, client: PCMProvider()), appleMusic: AppleMusicSource(),
-            cache: StreamingMusicCache(rootURL: root.appendingPathComponent("cache"), transport: PCMTransport(bytes: try Data(contentsOf: wave))))
-        let backend = MusicStorageRPCFixture()
-        let library = UnityMusicLibraryBridge(root: root, runtime: runtime, storage: backend.client)
+            cache: StreamingMusicCache(authority: cacheAuthority, transport: PCMTransport(bytes: try Data(contentsOf: wave))), programClient: programClient)
+        let library = UnityMusicLibraryBridge(root: root, runtime: runtime, storage: backend.client, programCall: backend.call)
         defer { library.close() }
         let graph = AudioGraphController(visualStore: VisualAudioFeatureStore())
         let player = LocalMusicPlayer(graph: graph)
@@ -103,7 +122,7 @@ enum Rejected: Error { case host }
         do { _ = try await library.activateProgram(program("rejected", ["playing", "later"])); preconditionFailure("Player should reject") } catch Rejected.host {}
         precondition(library.queue.isEmpty && observed.accepted.isEmpty)
         observed.reject = false
-        let active = program("current", ["playing", "later"])
+        let active = try await program("current", ["playing", "later"])
         let index = try await library.activateProgram(active)
         precondition(index == 0 && library.index == 0 && library.queue.map(\.title) == ["playing", "later"])
         let before = player.track?.url
@@ -113,7 +132,9 @@ enum Rejected: Error { case host }
         do { _ = try await library.activateProgram(program("unavailable", ["unavailable"])); preconditionFailure("Replacement preflight should reject") } catch {}
         precondition(library.queue.map(\.title) == ["playing", "later"] && player.track?.url == before)
         observed.reject = false
-        let revised = DJProgramEditor.revise(current: active, activeSlotIndex: 0, proposal: program("insert", ["inserted"]), mode: .insertNext)
+        try await programStore.publish(active)
+        try await programStore.activateSlot(at: 0)
+        let revised = try await programStore.revise(activeSlotIndex: 0, proposal: program("insert", ["inserted"]), mode: .insertNext)
         try await library.replaceUpcomingProgram(revised, at: 0)
         precondition(library.queue.map(\.title) == ["playing", "inserted", "later"] && player.track?.url == before && player.isGraphPlaying)
         _ = try await library.toolNavigate(1)
@@ -134,13 +155,13 @@ enum Rejected: Error { case host }
         let archiveRoot = root.appendingPathComponent("archive")
         var archived: UnityDJProgramBridge? = UnityDJProgramBridge(archiveRoot: archiveRoot, hooks: .init(
             plan: { _ in preconditionFailure("Restore must not plan") }, activate: { _ in preconditionFailure("Restore must not autoplay") },
-            replaceUpcoming: { _, _ in }, notify: { _ in }), storage: backend.client)
-        archived!.store.publish(revised)
-        archived!.store.activateSlot(at: 1)
+            replaceUpcoming: { _, _ in }, notify: { _ in }), storage: backend.client, programClient: programClient)
+        try await archived!.store.publish(revised)
+        try await archived!.store.activateSlot(at: 1)
         try await archived!.store.flush()
         archived!.shutdown()
         archived = nil
-        let restoredLibrary = UnityMusicLibraryBridge(root: root, runtime: runtime, storage: backend.client)
+        let restoredLibrary = UnityMusicLibraryBridge(root: root, runtime: runtime, storage: backend.client, programCall: backend.call)
         defer { restoredLibrary.close() }
         restoredLibrary.onToolPrepared = { url, _, _ in
             do { try player.load(url); return true } catch { return false }
@@ -150,7 +171,7 @@ enum Rejected: Error { case host }
             plan: { _ in preconditionFailure("Restore must not plan") }, activate: { _ in preconditionFailure("Restore must not autoplay") },
             replaceUpcoming: { _, _ in }, notify: { _ in },
             restore: { try await restoredLibrary.restoreProgram($0, startingAt: $1) },
-            selectHistorical: { try await restoredLibrary.activateProgram($0, startingAt: $1) }), storage: backend.client)
+            selectHistorical: { try await restoredLibrary.activateProgram($0, startingAt: $1) }), storage: backend.client, programClient: programClient)
         let didRestore = try await reopened.restoreSavedPlayback()
         precondition(didRestore && reopened.store.activeSlot?.track.title == "inserted")
         precondition(restoredLibrary.index == 1 && restoredLibrary.queue.map(\.title) == ["playing", "inserted", "later"])
@@ -173,7 +194,7 @@ enum Rejected: Error { case host }
         precondition(reopened.store.activeSlotIndex == 2 && restoredLibrary.index == 2 && restoredLibrary.queue[2].title == "later" && player.isGraphPlaying)
         do { try await reopened.selectProgram(id: "current", slotIndex: 99); preconditionFailure("Invalid historical slot accepted") } catch UnityDJProgramBridge.Failure.noPreparedProgram {}
         print("PASS: archived history list and explicit exact-slot play use same production player; failure preserves previous selection; invalid slot rejected")
-        let failedLibrary = UnityMusicLibraryBridge(root: root, runtime: runtime, storage: backend.client)
+        let failedLibrary = UnityMusicLibraryBridge(root: root, runtime: runtime, storage: backend.client, programCall: backend.call)
         defer { failedLibrary.close() }
         failedLibrary.onToolPrepared = { _, _, _ in preconditionFailure("Failed preflight reached player") }
         let priorURL = player.track?.url
@@ -182,8 +203,8 @@ enum Rejected: Error { case host }
         let delayed = DelayedRestorePCM(bytes: try Data(contentsOf: wave))
         let staleRuntime = MusicRuntime(netease: NeteaseMusicSource(sessions: sessions, client: PCMProvider()),
             qqMusic: QQMusicSource(sessions: sessions, client: PCMProvider()), appleMusic: AppleMusicSource(),
-            cache: StreamingMusicCache(rootURL: root.appendingPathComponent("stale-cache"), transport: delayed))
-        let staleLibrary = UnityMusicLibraryBridge(root: root, runtime: staleRuntime, storage: backend.client)
+            cache: StreamingMusicCache(authority: cacheAuthority, transport: delayed), programClient: programClient)
+        let staleLibrary = UnityMusicLibraryBridge(root: root, runtime: staleRuntime, storage: backend.client, programCall: backend.call)
         defer { staleLibrary.close() }
         staleLibrary.onToolPrepared = { url, _, _ in
             do { try player.load(url); return true } catch { return false }

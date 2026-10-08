@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import os
+import CryptoKit
+import Darwin
 
 /// **居民图片链[1] 附件**：用户给的图片到底有没有真的进草稿。
 ///
@@ -231,16 +233,32 @@ final class ResidentAttachmentStore: ObservableObject {
     var onChange: @MainActor () -> Void = {}
     private let directory: URL
     private let prepare: @Sendable (URL) async throws -> Data
-    private var unsentCopies: [UUID: URL] = [:]
-    var canSubmit: Bool { !isPreparing && attachments.count <= 4 }
+    private let authority: RustChatAttachmentClient
+    private let authorityIdentity: RustChatAttachmentClient.Identity
+    private var authorityOpened = false
+    private var draftRevision: UInt64 = 0
+    private var frameGeneration: UInt64 = 0
+    private var authorityCanSend = true
+    private var lifecycleTail: Task<Void, Never>?
+    private var pendingMutations = 0
+    private var closed = false
+    private var knownSubmissions = Set<UUID>()
+    var canSubmit: Bool { !isPreparing && pendingMutations == 0 && authorityCanSend }
 
-    init(directory: URL? = nil, prepare: @escaping @Sendable (URL) async throws -> Data = { try await PropImagePreparation.prepare(url: $0) }) {
+    init(directory: URL? = nil, authority: RustChatAttachmentClient? = nil,
+         prepare: @escaping @Sendable (URL) async throws -> Data = { try await PropImagePreparation.prepare(url: $0) }) {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gmgn radio/ResidentAttachments", isDirectory: true)
         self.prepare = prepare
+        let root = WorldAuthorityEndpoint.taskServiceRoot()
+        self.authority = authority ?? RustChatAttachmentClient(endpointFile:root.appendingPathComponent("taskd.endpoint.json").path,
+            helperPath:Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-taskd").path)
+        authorityIdentity = .init(ownerID:SHA256.hash(data:Data(self.directory.standardizedFileURL.path.utf8)).map {String(format:"%02x",$0)}.joined(),
+            hostSessionID:UUID().uuidString)
     }
 
     func add(urls: [URL]) async {
+        guard !closed else {return}
         // **不允许静默丢弃**：上一批还在准备时的第二次接入（＋/⌘V/拖拽都走这里）也要
         // 留下可见原因，而不是无声无息地什么都不发生 —— 那正是这次踩的坑。
         guard !isPreparing else {
@@ -272,12 +290,17 @@ final class ResidentAttachmentStore: ObservableObject {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try await prepare(url)
+                guard !closed, !Task.isCancelled else {throw CancellationError()}
                 guard !data.isEmpty, data.count <= 8 * 1024 * 1024 else { throw CocoaError(.fileReadTooLarge) }
                 let id = UUID()
                 let destination = directory.appendingPathComponent("\(id.uuidString).png")
                 try writePrivate(data, to: destination)
-                attachments.append(.init(id: id, url: destination, displayName: url.lastPathComponent))
-                unsentCopies[id] = destination
+                let hash = SHA256.hash(data:data).map {String(format:"%02x",$0)}.joined()
+                _ = try await mutate { [self] in
+                    frameGeneration += 1
+                    return try await authority.register(authorityIdentity,revision:draftRevision,frameGeneration:frameGeneration,
+                        attachmentID:id,localPath:try canonical(destination).path,sha256:hash,byteCount:data.count,displayName:url.lastPathComponent)
+                }
                 ResidentImageChainLog.note(
                     "居民图片链[1] 附件就绪 名称=\(url.lastPathComponent) 归一化格式=png 归一化字节=\(data.count) 草稿张数=\(attachments.count) 落盘=\(destination.path)"
                 )
@@ -293,6 +316,7 @@ final class ResidentAttachmentStore: ObservableObject {
     }
 
     func add(imageData: Data) async {
+        guard !closed else {return}
         // 同上：并发接入不许静默丢弃。
         guard !isPreparing else {
             errorMessage = "上一批图片还在准备，请稍后再试。"
@@ -317,33 +341,103 @@ final class ResidentAttachmentStore: ObservableObject {
         }
     }
 
-    func remove(id: UUID) {
-        // Only discard our own never-submitted draft copies. A submitted image can
-        // still be referenced by an asynchronous wish job after it leaves the UI.
-        if let copy = unsentCopies.removeValue(forKey: id),
-           copy == directory.appendingPathComponent("\(id.uuidString).png") {
-            try? FileManager.default.removeItem(at: copy)
-        }
-        attachments.removeAll { $0.id == id }
-        onChange()
+    func remove(id: UUID) async {
+        do {_ = try await mutate { [self] in try await authority.remove(authorityIdentity,revision:draftRevision,attachmentID:id) }}
+        catch {errorMessage="图片移除未完成，请重试。";onChange()}
     }
-    func takeAttachments() -> [ResidentImageAttachment] {
-        let result = attachments
-        for image in result { unsentCopies.removeValue(forKey: image.id) }
-        attachments = []; onChange()
+    func takeSubmission(text: String, id: UUID = UUID()) async throws -> ResidentChatSubmission {
+        let result = ResidentChatSubmission(text:text,attachments:attachments,id:id)
+        let ids = result.attachments.map(\.id)
+        let hasText = !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty
+        _ = try await mutate { [self] in
+            do {
+                return try await authority.take(authorityIdentity,revision:draftRevision,
+                    submissionID:id,attachmentIDs:ids,hasText:hasText)
+            } catch {
+                let failure = error
+                // A transport failure may follow a committed take. Only the
+                // persisted binding can acknowledge it; never dispatch take again.
+                guard let recovered = try? await authority.read(authorityIdentity,submissionID:id),
+                      let binding = recovered.submission,
+                      binding.submissionID == id.uuidString.lowercased(),
+                      binding.attachmentIDs == ids.map({$0.uuidString.lowercased()}),
+                      binding.hasText == hasText, binding.state == "issued" else {throw failure}
+                return recovered
+            }
+        }
+        knownSubmissions.insert(id)
         ResidentImageChainLog.note(
-            "居民图片链[1] 提交取走附件 张数=\(result.count) 文件=[\(result.map(\.url.lastPathComponent).joined(separator: ","))] 名称=[\(result.map(\.displayName).joined(separator: ","))]"
+            "居民图片链[1] Rust确认提交附件 张数=\(result.attachments.count)"
         )
         return result
     }
 
-    func restore(_ images: [ResidentImageAttachment]) {
-        attachments = images + attachments.filter { image in !images.contains { $0.id == image.id } }
-        if attachments.count > 4 { errorMessage = "失败消息的图片已保留；每条消息最多 4 张，请移除多余图片后发送。" }
+    @discardableResult
+    func restoreSubmission(_ submission: ResidentChatSubmission) async -> Bool {
+        // Voice/text-only inputs may never have owned an attachment reference.
+        if submission.attachments.isEmpty && !knownSubmissions.contains(submission.id) {return true}
+        do {_ = try await mutate { [self] in try await authority.restore(authorityIdentity,revision:draftRevision,submissionID:submission.id) };return true}
+        catch {errorMessage="图片恢复未确认，请稍后重试。";onChange();return false}
+    }
+    func finishSubmission(id: UUID, state: String = "completed") async {
+        guard knownSubmissions.contains(id) else {return}
+        do {_ = try await mutate { [self] in try await authority.finish(authorityIdentity,revision:draftRevision,submissionID:id,state:state) }
+            if state == "completed" {knownSubmissions.remove(id)}
+        }
+        catch {errorMessage="图片交付状态待确认。";onChange()}
+    }
+    func close() async {
+        closed = true
+        do {_ = try await mutate { [self] in try await authority.close(authorityIdentity,revision:draftRevision) }}
+        catch {errorMessage="图片输入结束状态待确认。";onChange()}
+    }
+    private func mutate(_ operation: @escaping @MainActor () async throws -> RustChatAttachmentClient.Reply) async throws -> RustChatAttachmentClient.Reply {
+        pendingMutations += 1;onChange()
+        defer {pendingMutations -= 1;onChange()}
+        let previous = lifecycleTail
+        let task = Task { @MainActor [self] in
+            await previous?.value
+            if !authorityOpened {
+                try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
+                try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:directory.path)
+                let opened = try await authority.open(authorityIdentity,directory:try canonical(directory).path)
+                try apply(opened);authorityOpened = true
+            }
+            do {let reply = try await operation();try apply(reply);return reply}
+            catch {
+                // Reconcile only by reading; a lost response never dispatches a
+                // second registration, take, finish or deletion candidate.
+                if let state = try? await authority.read(authorityIdentity) {try? apply(state)}
+                throw error
+            }
+        }
+        lifecycleTail = Task {_ = try? await task.value}
+        return try await task.value
+    }
+    private func apply(_ reply: RustChatAttachmentClient.Reply) throws {
+        let root = try canonical(directory)
+        func privateFile(_ path: String) throws -> URL {
+            let url = URL(fileURLWithPath:path)
+            guard url.deletingLastPathComponent()==root,
+                  (try? url.resourceValues(forKeys:[.isSymbolicLinkKey]).isSymbolicLink) != true else {throw CocoaError(.fileReadNoPermission)}
+            return url
+        }
+        let images = try reply.snapshot.attachments.map { row -> ResidentImageAttachment in
+            guard let id = UUID(uuidString:row.id) else {throw CocoaError(.fileReadCorruptFile)}
+            return .init(id:id,url:try privateFile(row.localPath),displayName:row.displayName)
+        }
+        for path in reply.deletePaths {try? FileManager.default.removeItem(at:try privateFile(path))}
+        attachments = images;draftRevision = reply.snapshot.revision
+        frameGeneration = reply.snapshot.frameGeneration;authorityCanSend = reply.snapshot.canSend
+        if !authorityCanSend {errorMessage="失败消息的图片已保留；每条消息最多 4 张，请移除多余图片后发送。"}
         onChange()
-        ResidentImageChainLog.note(
-            "居民图片链[1] 失败回填附件 回填=\(images.count) 回填后草稿张数=\(attachments.count)"
-        )
+    }
+    private func canonical(_ url: URL) throws -> URL {
+        guard let path = realpath(url.path,nil) else {throw CocoaError(.fileReadNoSuchFile)}
+        defer {free(path)}
+        // Foundation standardization rewrites /private/var back to /var on
+        // macOS; retain POSIX realpath for the authority's exact-path contract.
+        return URL(fileURLWithPath:String(cString:path),isDirectory:url.hasDirectoryPath)
     }
     func chooseImages() {
         let panel = NSOpenPanel()
@@ -376,6 +470,8 @@ final class ResidentAttachmentStore: ObservableObject {
         return true
     }
     private func writePrivate(_ data: Data, to url: URL) throws {
+        if FileManager.default.fileExists(atPath:directory.path),
+           try directory.resourceValues(forKeys:[.isSymbolicLinkKey]).isSymbolicLink == true {throw CocoaError(.fileWriteNoPermission)}
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         try data.write(to: url, options: .atomic)
@@ -397,7 +493,7 @@ struct ResidentAttachmentStrip: View {
                                     Image(nsImage: thumbnail).resizable().scaledToFit().frame(width: 54, height: 46)
                                         .background(.black.opacity(0.2)).clipShape(RoundedRectangle(cornerRadius: 6))
                                 }
-                                Button { store.remove(id: image.id) } label: { Image(systemName: "xmark.circle.fill") }
+                                Button { Task {await store.remove(id:image.id)} } label: { Image(systemName: "xmark.circle.fill") }
                                     .buttonStyle(.plain).help("移除 \(image.displayName)").accessibilityLabel("移除 \(image.displayName)")
                             }
                             .help(image.displayName)

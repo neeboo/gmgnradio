@@ -16,19 +16,26 @@ final class UnityMediaHost {
     let musicLibrary: UnityMusicLibraryBridge
     private let musicStorage: MusicStorageClient
     private var inbox: UnityInboxBridge? { worldSession?.inbox }
-    private var libraryQueueActive = false
+    private let musicPlayback: RustMusicPlaybackClient
+    private var libraryQueueActive: Bool { musicPlayback.state?.mode == "library" }
     private var libraryTrack: MusicCandidate?
+    private var nativeMusicRequestID: String?
     private var musicQueueRevision: UInt64 = 0
     private var emittedMusicQueueRevision: UInt64?
     private let root: URL
+    private let nativeHostSessionID = UUID().uuidString
     private let defaults: UserDefaults
+    private let productDefaults: UserDefaults?
     private let productSettings: UnityProductSettings
     private let visualDirection: StageVisualDirectionStore
     private let visualTimeline = StageVisualPresetTimeline()
     private let visualEpoch = ProcessInfo.processInfo.systemUptime
     private let lyricsStore: StageLyricsStore
     private var visualRevision: UInt64 = 0
-    private var settingsBridge: UnitySettingsBridge?
+    private var visualCommandTask: Task<Void, Never>?
+    private var visualCommandState: [String:Any] = [:]
+    private var gpuiSettingsTask: Task<Void, Never>?
+    private var gpuiSettingsResult: [String: Any] = [:]
     private var session: UInt64 = 0
     private var lines: [StageLyricLine] = []
     private var lyricRevision: UInt64 = 0
@@ -38,18 +45,22 @@ final class UnityMediaHost {
     private var closed = false
     private var worldSession: UnityWorldSessionComposition?
     private var characterPosition: UnityCharacterPositionBridge?
+    let worldPhysics = UnityWorldPhysicsClient()
     private var savedProgramRestoreTask: Task<Void, Never>?
     private var spatialSceneTransitionInProgress = false
     private var spatialSceneSelectionRevision: UInt64?
     private lazy var chatImages = UnityChatImageBridge(directory: root.appendingPathComponent("gmgn radio/UnityChatAttachments", isDirectory: true))
+    private var takingChatImageRequestID: UInt64?
+    private var chatImageAdmissionTask: Task<Bool, Never>?
     private let chatImageDrop = UnityChatImageDropBridge.shared
     private let humanImageConversationID = "unity-chat:" + UUID().uuidString
     private var chatImageSubmissions: [UInt64: ResidentChatSubmission] = [:]
+    private var scheduledHumanSubmission: (requestID: UInt64, submission: ResidentChatSubmission, session: UnityWorldSessionComposition)?
     private lazy var spatialPresentation = UnitySpatialPresentationBridge(
         currentWorldID: { [weak self] in self?.worldSession?.context.state.worldID },
         changeWeather: { [weak self] weather in
             guard let self, !self.closed, let session = self.worldSession else { throw CancellationError() }
-            try session.context.setWeather(weather)
+            try await session.context.setWeather(weather, source: .ui)
         })
     private lazy var djPreferences = DJAgentPreferences(defaults: defaults)
     private lazy var djProgram = UnityDJProgramBridge(archiveRoot: root.appendingPathComponent("gmgn radio/DJPrograms", isDirectory: true),
@@ -72,22 +83,35 @@ final class UnityMediaHost {
         }, selectHistorical: { [weak self] plan, slot in
             guard let self, !self.closed else { throw CancellationError() }
             return try await self.musicLibrary.activateProgram(plan, startingAt: slot)
-        }), storage: musicStorage)
+        }), storage: musicStorage, programClient: RustMusicProgramClient(root: root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true)))
     private var worldSelection: [String: Any] = [:]
     private var pendingWorldPackage: BundledLivingWorldPackage?
     private var worldSelectionTask: Task<Void, Never>?
     private var marbleRuntimeReady = false
-    private lazy var marbleRegistration: UnityMarbleAuthorityRegistration = UnityMarbleAuthorityRegistration(root: root, services: nil)
-    private lazy var marbleWorlds: UnityMarbleWorldBridge = UnityMarbleWorldBridge(root: root, services: nil,
+    private lazy var marbleRegistration: UnityMarbleAuthorityRegistration = {
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        return UnityMarbleAuthorityRegistration(services: { worldID in
+            .init(client: WorldAuthorityClient(worldID: worldID, endpointFile: endpoint.endpointFile,
+                helperPath: endpoint.helperPath, allowsLaunching: true))
+        })
+    }()
+    private lazy var marbleWorlds: UnityMarbleWorldBridge = {
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        let authority = RustMarbleControlClient(endpointFile: endpoint.endpointFile,
+            helperPath: endpoint.helperPath, allowsLaunching: true,
+            owner: "marble.worlds", hostSessionID: nativeHostSessionID)
+        let blobRoot = WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: root).appendingPathComponent("blobs", isDirectory: true)
+        return UnityMarbleWorldBridge(root: root, authority: authority, blobRoot: blobRoot, services: nil,
         runtimeReady: { [weak self] in self?.marbleRuntimeReady == true && self?.closed == false },
         register: { [weak self] package in
             guard let self, !self.closed else { throw CancellationError() }
             return try await self.registerMarblePackage(package)
         }, onRegistered: { [weak self] package in self?.spaceLibrary.registerPackage(package) ?? false })
+    }()
     private lazy var spaceLibrary: UnitySpaceLibraryBridge = UnitySpaceLibraryBridge(registeredPackageRoots: registeredWorldRoots(), defaults: defaults,
         selectedWorldID: { [weak self] in self?.worldSession?.context.state.worldID },
         requestSelection: { [weak self] package, revision in self?.prepareWorldSelection(package, revision: revision) ?? false },
-        productDefaults: UserDefaults(suiteName: ProductIdentity.bundleIdentifier),
+        productDefaults: productDefaults,
         livingPodWorldID: (try? LivingWorldBootstrap.loadBundledCanary(preferMarble: true))?.manifest.worldID,
         marble: marbleWorlds)
     private func registerMarblePackage(_ package: BundledLivingWorldPackage) async throws -> Bool {
@@ -102,7 +126,10 @@ final class UnityMediaHost {
         displayName: { [weak self] id in
             let object = self?.worldSession?.context.state.objectStates[id]
             return object?.generatedProp?.displayName ?? object?.metadata["displayName"] ?? id
-        }, currentTrack: { [weak self] in
+        }, videoAuthority:RustStageVideoClient(
+            endpointFile:WorldAuthorityEndpoint(applicationSupportBase:root).endpointFile,
+            helperPath:WorldAuthorityEndpoint(applicationSupportBase:root).helperPath,
+            allowsLaunching:true,scope:"stage.videos",hostSessionID:nativeHostSessionID), currentTrack: { [weak self] in
             guard let self, !self.closed, let actualTrack = self.player.track else { return nil }
             let id: String
             if self.libraryQueueActive, let libraryTrack = self.libraryTrack { id = libraryTrack.id }
@@ -113,7 +140,10 @@ final class UnityMediaHost {
                 ?? ProgramVisualDirector().cue(for: .build)
             return UnityScreenVideoBridge.CurrentTrack(id: id,
                 title: self.libraryQueueActive ? self.libraryTrack?.title ?? actualTrack.title : actualTrack.title, cue: cue)
-        })
+        }, mediaCache: ScreenMediaCacheClient(endpointFile:
+            URL(fileURLWithPath: WorldAuthorityEndpoint(applicationSupportBase: root).endpointFile)),
+        playbackAuthority: RustScreenPlaybackClient(endpointFile:
+            URL(fileURLWithPath: WorldAuthorityEndpoint(applicationSupportBase: root).endpointFile)))
     private var residentMusicActions: UnityMusicRadioActions?
     private var generatedAssets: UnityGeneratedAssetCatalog?
     private var wishOutputPreview: UnityWishOutputPreviewCatalog?
@@ -124,8 +154,6 @@ final class UnityMediaHost {
     private var autonomousRunID: UUID?
     private var autonomousReplyRevision: UInt64 = 0
     private var autonomousReplies: [[String: Any]] = []
-    private var replySpeechRequestID: UInt64?
-    private var announcedReplyRequestID: UInt64?
     private var pausedPosition: TimeInterval?
     private var characterSelection: [String: Any] = [:]
     private var characterSelectionRevision: UInt64 = 0
@@ -135,55 +163,93 @@ final class UnityMediaHost {
     private var renderedCharacterSelectionRevision: UInt64 = 0
     private var uiIntentRevision: UInt64 = 0
     private var uiIntents: [[String: Any]] = []
-    private lazy var shortcutSettings = UnityShortcutSettingsBridge(defaults: defaults) { [weak self] action in
+    private lazy var shortcutSettings = UnityShortcutSettingsBridge(defaults: defaults, settings: productSettings.authority) { [weak self] action in
         self?.performShortcut(action)
     }
     private lazy var presenceSettings = UnityPresenceSettingsBridge(defaults: defaults,
         packages: PresencePackageStore(rootURL: root.appendingPathComponent("gmgn radio/PresencePackages", isDirectory: true)),
         motions: MotionPackageStore(rootURL: root.appendingPathComponent("gmgn radio/MotionPackages", isDirectory: true)),
         supportedEngines: ["orb", "pmx", "vrm"],
+        productSettings: productSettings.authority,
         onRuntimeChanged: { [weak self] snapshot in self?.publishCharacterSelection(snapshot) })
-    private lazy var agentConnection = UnityAgentConnectionBridge(
+    private lazy var agentConnection: UnityAgentConnectionBridge = UnityAgentConnectionBridge(
         backends: { [unowned self] in chat.installedBackendSnapshot },
         currentBackend: { [unowned self] in chat.backend },
-        selectBackend: { [unowned self] id in
-            guard chat.selectBackend(id), chat.backend == id else { return false }
-            defaults.set(id, forKey: "unity.agent.backendID")
-            return true
+        selectBackend: { @MainActor [unowned self] id in
+            guard !closed else { return false }
+            guard chat.installedBackendSnapshot.contains(where: { $0["id"] as? String == id }) else { return false }
+            if productSettings.authority.confirmed?.values.agentBackend == id, chat.backend == id { return true }
+            do {
+                _ = try await productSettings.authority.apply(["agentBackend": id])
+                guard !closed, chat.selectBackend(id) else { return false }
+                bindResidentSchedulerIfRequested(); agentConnection.refresh()
+                return true
+            } catch {
+                // A missing HTTP receipt does not prove that the CAS write failed.
+                // Read the authority once; never replay the settings mutation.
+                do { try await productSettings.authority.reload() } catch { return false }
+                guard !closed, productSettings.authority.confirmed?.values.agentBackend == id,
+                      chat.selectBackend(id) else { return false }
+                bindResidentSchedulerIfRequested(); agentConnection.refresh()
+                return true
+            }
         })
-    private struct QueueEntry {
+    private struct QueueEntry: Codable {
         let url: URL
         let lyricURL: URL?
     }
-    private var queue: [QueueEntry] = []
-    private var queueIndex = 0
+    private var queue: [QueueEntry] { musicPlayback.items(mode: "local", as: QueueEntry.self) }
+    private var queueIndex: Int { musicPlayback.state?.mode == "local" ? musicPlayback.state?.index ?? 0 : 0 }
     private lazy var pushToTalk = UnityPushToTalkBridge(root: root,
         configuration: { [unowned self] in productSettings.voiceConfiguration(for: "asr") },
         preferredDeviceID: { [unowned self] in productSettings.microphoneDeviceID },
         submitTranscript: { _ in })
 
-    init(root: URL, defaults: UserDefaults) throws {
+    init(root: URL, defaults suppliedDefaults: UserDefaults) throws {
+        let defaults: UserDefaults
+        let voiceDefaults: UserDefaults?
+        if let suite = ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_SETTINGS_SUITE"] {
+            let prefix = "ai.gmgn.unity-sample.chat2."
+            guard suite.hasPrefix(prefix), UUID(uuidString: String(suite.dropFirst(prefix.count))) != nil,
+                  let isolated = UserDefaults(suiteName: suite) else {
+                throw NSError(domain: "UnityMediaHost", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "invalid_test_settings_suite"])
+            }
+            defaults = isolated
+            voiceDefaults = isolated
+            productDefaults = isolated
+        } else {
+            defaults = suppliedDefaults
+            voiceDefaults = UserDefaults(suiteName: "ai.gmgn.radio")
+            productDefaults = UserDefaults(suiteName: ProductIdentity.bundleIdentifier)
+        }
         self.root = root
         self.defaults = defaults
         UnityWindowModeBridge.shared.defaults = defaults
-        lyricsStore = StageLyricsStore(defaults: defaults)
         productSettings = UnityProductSettings(root: root, defaults: defaults,
-            productVoiceDefaults: UserDefaults(suiteName: "ai.gmgn.radio"))
-        visualDirection = StageVisualDirectionStore(defaults: defaults)
-        world = UnityWorldBridge(root: root)
+            productVoiceDefaults: voiceDefaults)
+        lyricsStore = StageLyricsStore(defaults: defaults, settings: productSettings.authority)
+        visualDirection = StageVisualDirectionStore(defaults: defaults, settings: productSettings.authority)
+        let pointerHostSessionID = nativeHostSessionID
+        world = UnityWorldBridge(root: root, propIdentity: { worldID in
+            guard !worldID.isEmpty, worldID.utf8.count <= 128 else { return nil }
+            return RustWorldPropClient.Identity(worldID: worldID, residentScope: "unity.ui." + worldID,
+                hostSessionID: pointerHostSessionID)
+        })
         let providedLibrary = ProcessInfo.processInfo.environment["GMGN_UNITY_MUSIC_LIBRARY_ROOT"].map { URL(fileURLWithPath: $0).appendingPathComponent("music-library.json") }
         musicStorage = MusicStorageClient(supportRoot: root,
             helperURL: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-taskd"),
             legacyFiles: (providedLibrary.map { [$0] } ?? []) + [
                 root.appendingPathComponent("gmgn radio/DJPrograms/unity-dj-programs.json"),
                 root.appendingPathComponent("music-library.json")])
-        musicLibrary = UnityMusicLibraryBridge(root: root, storage: musicStorage)
+        musicPlayback = RustMusicPlaybackClient(root: root)
+        musicLibrary = UnityMusicLibraryBridge(root: root, storage: musicStorage, playbackClient: musicPlayback)
         graph = AudioGraphController(visualStore: features)
         if ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1" {
             graph.musicVolume = 0
         }
         player = LocalMusicPlayer(graph: graph)
-        chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults)
+        chat = try RenderHostResidentConversation(backend: "dsh", dataRoot: root, defaults: defaults, productSettings: productSettings.authority)
         chatImageDrop.configure(onFileURLs: { [weak self] urls in
             guard let self, !self.closed else { return }
             _ = self.chatImages.addDroppedImages(urls: urls)
@@ -209,21 +275,23 @@ final class UnityMediaHost {
                     "queueIndex": self.libraryQueueActive ? self.musicLibrary.index : self.queueIndex,
                     "queueCount": self.libraryQueueActive ? self.musicLibrary.queue.count : self.queue.count]
         }
-        player.setCompletionHandler { [weak self] in
-            guard let self else { return }
-            _ = self.command(["op": "music.next"])
+        musicPlayback.onError = { [weak self] error in self?.notice = error.localizedDescription }
+        musicPlayback.onCommitRejected = { [weak self] ticket in
+            guard let self, self.nativeMusicRequestID == ticket.requestID else { return }
+            self.player.stop()
         }
+        musicPlayback.onCommitted = { [weak self] in self?.didCommitMusicPlayback() }
         musicLibrary.onPrepared = { [weak self] url, lyrics, candidate in
             guard let self, !self.closed else { return false }
             do {
                 // Validate the file before the shared graph stops its old node.
                 _ = try AVAudioFile(forReading: url)
                 try self.player.load(url)
+                self.nativeMusicRequestID = self.musicPlayback.state?.pending?.requestID
                 try self.player.play()
                 self.session &+= 1; self.pausedPosition = nil
-                self.queue = [self.entry(path: url.path)]; self.queueIndex = 0
                 self.lyricsStore.clear(); self.lines = []; self.lyricRevision &+= 1
-                self.libraryQueueActive = true; self.libraryTrack = candidate
+                self.libraryTrack = candidate
                 self.musicQueueRevision &+= 1
                 if let lyrics {
                     self.lyricsStore.publish(lyrics, trackID: candidate.id, trackDuration: candidate.duration)
@@ -237,10 +305,10 @@ final class UnityMediaHost {
             do {
                 _ = try AVAudioFile(forReading: url)
                 try self.player.load(url)
+                self.nativeMusicRequestID = self.musicPlayback.state?.pending?.requestID
                 self.session &+= 1; self.pausedPosition = 0
-                self.queue = [self.entry(path: url.path)]; self.queueIndex = 0
                 self.lyricsStore.clear(); self.lines = []; self.lyricRevision &+= 1
-                self.libraryQueueActive = true; self.libraryTrack = candidate
+                self.libraryTrack = candidate
                 self.musicQueueRevision &+= 1
                 if let lyrics {
                     self.lyricsStore.publish(lyrics, trackID: candidate.id, trackDuration: candidate.duration)
@@ -255,19 +323,23 @@ final class UnityMediaHost {
                   self.player.isGraphPlaying else { throw DJAgentMusicLibraryError.unsupported }
             _ = try await self.player.confirmPlaybackProgress()
         }
-        musicLibrary.onProgramSlotCommitted = { [weak self] index in self?.djProgram.activateSlot(at: index) }
-        musicLibrary.onProgramPlaybackReleased = { [weak self] in self?.djProgram.releasePlayback() }
-        settingsBridge = try? UnitySettingsBridge(root: root,
-            command: { [weak self] value in self?.settingsCommand(value) ?? false },
-            snapshot: { [weak self] in
-                guard let self else { return [:] }
-                return self.settingsSnapshot()
-            })
-        if let savedBackend = defaults.string(forKey: "unity.agent.backendID"),
-           chat.installedBackendSnapshot.contains(where: { $0["id"] as? String == savedBackend }) {
-            _ = chat.selectBackend(savedBackend)
+        musicLibrary.onProgramSlotCommitted = { [weak self] index in
+            guard let self, !self.closed else { throw CancellationError() }
+            try await self.djProgram.activateSlot(at: index)
         }
-        presenceSettings.load()
+        musicLibrary.onProgramPlaybackReleased = { [weak self] in self?.djProgram.releasePlayback() }
+        Task { [weak self] in
+            guard let self, !closed else { return }
+            do {
+                try await productSettings.authority.ensureLoaded()
+                guard !closed else { return }
+                // Presence's read-only transport cannot launch taskd. Restore
+                // only after this same authority has confirmed helper readiness.
+                presenceSettings.load()
+                guard let backend = productSettings.authority.confirmed?.values.agentBackend else { return }
+                _ = chat.selectBackend(backend); agentConnection.refresh()
+            } catch { /* No legacy candidate is promoted. */ }
+        }
         agentConnection.refresh()
         shortcutSettings.start()
         savedProgramRestoreTask = Task { [weak self] in
@@ -324,15 +396,10 @@ final class UnityMediaHost {
                     guard command(["op": { if case .next = action { return "music.next" }; return "music.previous" }()]) else { throw DJAgentMusicLibraryError.unsupported }
                 }
             case let .play(trackID, slotIndex):
-                if libraryQueueActive {
-                    let requested = trackID != nil || slotIndex != nil
-                    guard let index = requested ? UnityMusicTrackSelection.resolve(ids: musicLibrary.queue.map(\.id),
-                        trackID: trackID, slotIndex: slotIndex) : musicLibrary.index else { throw DJAgentMusicLibraryError.trackNotFound }
-                    _ = try await musicLibrary.toolSelect(index)
-                } else if trackID != nil || slotIndex != nil {
-                    guard let selected = UnityMusicTrackSelection.resolve(ids: queue.map { $0.url.path },
-                        trackID: trackID, slotIndex: slotIndex),
-                        command(["op": "music.select", "index": selected]) else { throw DJAgentMusicLibraryError.trackNotFound }
+                if trackID != nil || slotIndex != nil {
+                    let ticket = try musicPlayback.navigate(slotIndex: slotIndex, trackID: trackID)
+                    if ticket.mode == "library" { _ = try await musicLibrary.toolSelect(ticket.index) }
+                    else { try loadQueueEntry(ticket, autoplay: false) }
                 }
                 try player.play(); pausedPosition = nil
             case let .lyrics(mode):
@@ -411,10 +478,11 @@ final class UnityMediaHost {
             _ = self.world.command(["op": "world.snapshot", "worldID": selectedWorldID])
         }
         generationConfiguration = UnityGenerationConfigurationBridge(store: composition.generationStore,
+            authority: RustGenerationConfigurationClient(root: root.appendingPathComponent("TaskService")),
             fileURL: root.appendingPathComponent("secrets/prop-generation.json"),
             readableLegacyFileURL: PropGenerationConfigurationStore.defaultFileURL)
         deviceTemplates = UnityBuiltinDevicesBridge.snapshot(worldID: selectedWorldID)
-        let placement = UnityDevicePlacementBridge(root: root, worldID: selectedWorldID, templates: deviceTemplates)
+        let placement = UnityDevicePlacementBridge(root: root, worldID: selectedWorldID, templates: deviceTemplates, worldBridge: world)
         placement.onCommitted = { [weak self, weak composition] _ in
             Task { @MainActor in
                 guard let self, let composition, !self.closed, self.worldSession === composition else { return }
@@ -432,7 +500,7 @@ final class UnityMediaHost {
                   self.worldSession === composition else { throw CancellationError() }
             let requestID = "jukebox-functions:" + UUID().uuidString
             let refresh = try await Task.detached {
-                try placement.refreshJukeboxFunctions(requestID: requestID)
+                try await placement.refreshJukeboxFunctions(requestID: requestID)
             }.value
             guard !self.closed, self.worldSession === composition else { throw CancellationError() }
             // A formal no-op read must not restore an older durable simulation
@@ -464,7 +532,7 @@ final class UnityMediaHost {
             catch { return false }
             return self.presenceSettings.command(["op": "presence.motion", "id": id])
         }
-        let autonomy = UnityResidentAgentLoopBridge(context: composition.context, defaults: defaults,
+        let autonomy = UnityResidentAgentLoopBridge(context: composition.context, defaults: defaults, settings: productSettings.authority,
             available: { [weak self, weak composition] in
                 guard let self, let composition, !self.closed,
                       self.worldSession === composition else { return false }
@@ -476,7 +544,14 @@ final class UnityMediaHost {
                 self.autonomousRunID = input.runID
                 defer { if self.autonomousRunID == input.runID { self.autonomousRunID = nil } }
                 do {
-                    let reply = try await self.chat.runBackground(input: input)
+                    let persistedScheduler = self.residentAutonomy?.usesRustScheduler == true
+                    let reply = try await self.chat.runBackground(input: input, preserveActualCompletion: persistedScheduler,
+                        rustClaim: self.residentAutonomy?.loop.claimedRustBinding(runID: input.runID))
+                    if persistedScheduler && (Task.isCancelled || self.closed || self.worldSession !== composition) {
+                        // Preserve the real result for its original durable claim,
+                        // without consuming current-world events or showing stale UI.
+                        return reply
+                    }
                     try Task.checkCancellation()
                     guard !self.closed, self.worldSession === composition else { throw CancellationError() }
                     guard !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -501,9 +576,57 @@ final class UnityMediaHost {
                 self.autonomousReplyRevision &+= 1
                 self.autonomousReplies.append(["revision": self.autonomousReplyRevision, "text": text])
                 self.autonomousReplies = Array(self.autonomousReplies.suffix(24))
-                self.productSettings.speakReply(text)
+                let source = self.chat.lastReplySpeechSource
+                if let runID = source["runID"] as? String {
+                    let requestID = "world-run:" + runID
+                    self.productSettings.replySpeechEvent(requestID: requestID, kind: "accepted")
+                    self.productSettings.replySpeechEvent(requestID: requestID, kind: "reply", source: source)
+                }
             })
         residentAutonomy = autonomy
+        composition.context.onRustEventsPublished = { [weak self, weak composition, weak autonomy] events in
+            guard let self, let composition, let autonomy, !self.closed,
+                  self.worldSession === composition, self.residentAutonomy === autonomy else { return }
+            for event in events {
+                if let observation = ResidentWorldObservation.event(event,
+                    worldID: composition.context.manifest.worldID, scopeID: "", authorityFact: true) {
+                    autonomy.receive(observation)
+                }
+            }
+        }
+        autonomy.humanRun = { [weak self, weak composition] input in
+            guard let self, let composition, self.worldSession === composition,
+                  let pending = self.scheduledHumanSubmission, pending.session === composition,
+                  input.userMessages == [pending.submission.text],
+                  input.imageURLs == pending.submission.attachments.map(\.url) else { throw CancellationError() }
+            defer {
+                if self.scheduledHumanSubmission?.submission.id == pending.submission.id {
+                    self.scheduledHumanSubmission = nil
+                }
+            }
+            return try await withCheckedThrowingContinuation { continuation in
+                let accepted = self.chat.send(requestID: pending.requestID, submission: pending.submission,
+                    authorizeImages: { [weak self, weak composition] runID, isCurrent in
+                        guard let self, let composition, self.worldSession === composition, isCurrent() else { throw CancellationError() }
+                        try await composition.authorizeHumanImages(runID: runID, conversationID: self.humanImageConversationID,
+                            attachments: pending.submission.attachments, isCurrent: isCurrent)
+                    }, executionRunID: input.runID,
+                    rustClaim: self.residentAutonomy?.loop.claimedRustBinding(runID: input.runID),
+                    actualCompletion: { result in continuation.resume(with: result) })
+                if !accepted {
+                    continuation.resume(throwing: NSError(domain: "GMGNResidentTurn", code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "人类消息未开始执行，输入已保留。 "]))
+                }
+            }
+        }
+        autonomy.humanCancel = { [weak self] in
+            guard let self, let pending = self.scheduledHumanSubmission else { return }
+            if !self.chat.cancel(requestID: pending.requestID) {
+                self.chat.cancelUnstarted(requestID: pending.requestID, submission: pending.submission)
+                if self.scheduledHumanSubmission?.submission.id == pending.submission.id { self.scheduledHumanSubmission = nil }
+            }
+        }
+        bindResidentSchedulerIfRequested()
         let inboxClient = ResidentStateClient(transport: ResidentTaskDaemonStateTransport(client:
             PropTaskDaemonClient(root: root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true),
                 allowsLaunching: false)))
@@ -538,7 +661,7 @@ final class UnityMediaHost {
                           let input = schema["inputSchema"] as? [String: Any] else { return nil }
                     return ResidentWorldToolSession.AdditionalTool(name: name, description: description,
                         inputSchema: input, validate: { _ in isCurrent() }, handle: { callID, data in
-                            let result = tools.handle(name: name, argumentsJSON: data)
+                            let result = await tools.handle(name: name, argumentsJSON: data)
                             return .init(callID: callID, resultJSON: result.data, isError: result.isError)
                         })
                 } + services.backgroundTools(runID, isCurrent) + self.screenTools(isCurrent: isCurrent)
@@ -727,7 +850,10 @@ final class UnityMediaHost {
         }
         let next: UnityWorldSessionComposition
         do {
-            next = try UnityWorldSessionComposition(applicationSupportBase: root, selectedWorldID: id, validatedPackage: package)
+            let nativeWorld = world
+            next = try UnityWorldSessionComposition(applicationSupportBase: root, selectedWorldID: id, validatedPackage: package,
+                nativePropFacts: { identity in try await nativeWorld.nativePropFacts(identity: identity) },
+                nativePhysicsClient: worldPhysics)
             guard let record = worldSelection["record"] as? [String: Any], let state = record["state"] else { throw WorldAuthorityError.noAuthorityRecord }
             let rendered = try JSONDecoder().decode(WorldState.self, from: JSONSerialization.data(withJSONObject: state))
             guard next.context.state == rendered else {
@@ -761,12 +887,16 @@ final class UnityMediaHost {
     private func installWishOutputPreview(_ composition: UnityWorldSessionComposition, worldID: String) {
         wishOutputPreview?.close()
         let catalog = UnityWishOutputPreviewCatalog(root: root, worldID: worldID,
-            residentScope: composition.residentScope, projectionSessionID: composition.wishProjectionSessionID)
+            residentScope: composition.residentScope, projectionSessionID: composition.wishProjectionSessionID,
+            hostSessionID: composition.residentHostSessionID)
         wishOutputPreview = catalog
         catalog.onChange = { [weak self, weak composition, weak catalog] in
             guard let self, let composition, let catalog, !self.closed,
                   self.worldSession === composition, self.wishOutputPreview === catalog else { return }
             composition.updateWishOutputProjections(catalog.snapshot()["entries"] as? [[String: Any]] ?? [])
+            if let failure = (catalog.snapshot()["errors"] as? [[String:String]])?.first {
+                self.notice = "许愿输出预览暂不可用（" + (failure["code"] ?? "wish_output_preview_unavailable") + "）。"
+            }
         }
         let refresh: @MainActor () -> Void = { [weak self, weak composition, weak catalog] in
             guard let self, let composition, let catalog, !self.closed,
@@ -819,8 +949,25 @@ final class UnityMediaHost {
         return QueueEntry(url: url, lyricURL: lyric)
     }
 
-    private func loadQueueEntry(autoplay: Bool) throws {
-        let selected = queue[queueIndex]
+    private func didCommitMusicPlayback() {
+        guard let state = musicPlayback.state, state.queue.indices.contains(state.index) else { return }
+        let identity = state.sessionID, trackID = state.queue[state.index].id
+        musicQueueRevision &+= 1
+        player.setCompletionHandler { [weak self] in
+            guard let self, !self.closed else { return }
+            do {
+                try self.musicPlayback.receipt(status: "completed", sessionID: identity, trackID: trackID)
+                // An explicit replacement being prepared owns the next selection.
+                guard self.musicPlayback.state?.pending == nil else { return }
+                _ = self.command(["op": "music.next"])
+            } catch { self.notice = error.localizedDescription }
+        }
+    }
+
+    private func loadQueueEntry(_ ticket: RustMusicPlaybackClient.Ticket, autoplay: Bool) throws {
+        let selected = try JSONDecoder().decode(QueueEntry.self, from: ticket.queue[ticket.index].payload)
+        _ = try AVAudioFile(forReading: selected.url)
+        guard try musicPlayback.isCurrent(ticket) else { throw CancellationError() }
         session &+= 1
         pausedPosition = nil
         lyricRevision &+= 1
@@ -828,6 +975,8 @@ final class UnityMediaHost {
         lyricsStore.clear()
         player.stop()
         try player.load(selected.url)
+        nativeMusicRequestID = ticket.requestID
+        try musicPlayback.commit(ticket, accepted: true)
         // A bad optional lyric must not prevent an otherwise valid song playing.
         if let lyric = selected.lyricURL,
            let text = try? String(contentsOf: lyric, encoding: .utf8) {
@@ -839,7 +988,15 @@ final class UnityMediaHost {
                                 trackID: selected.url.path, trackDuration: player.track?.duration)
             lines = lyricsStore.lines
         }
-        if autoplay { try player.play() }
+        if autoplay {
+            do {
+                try player.play()
+                try musicPlayback.receipt(status: "playing", sessionID: ticket.requestID, trackID: ticket.trackID)
+            } catch {
+                try? musicPlayback.receipt(status: "failed", sessionID: ticket.requestID, trackID: ticket.trackID)
+                throw error
+            }
+        }
     }
 
     private func screenTools(isCurrent: @escaping @MainActor () -> Bool) -> [ResidentWorldToolSession.AdditionalTool] {
@@ -852,16 +1009,39 @@ final class UnityMediaHost {
         }
     }
     func command(_ value: [String: Any]) -> Bool {
+        if value["op"] as? String == "ui.settings.command" {
+            guard !closed, gpuiSettingsTask == nil,
+                  let requestID = value["requestID"] as? String,
+                  !requestID.isEmpty, requestID.utf8.count <= 128,
+                  let command = value["command"] as? [String: Any],
+                  let operation = command["op"] as? String,
+                  (settingsSnapshot()["supportedCommands"] as? [String])?.contains(operation) == true else { return false }
+            gpuiSettingsResult = ["requestID": requestID, "status": "pending"]
+            gpuiSettingsTask = Task { [weak self] in
+                guard let self else { return }
+                let completed = await self.settingsCommand(command)
+                guard !self.closed, !Task.isCancelled else { return }
+                // This is the existing owner's handler receipt. Some handlers
+                // begin asynchronous persistence; only its later snapshot is
+                // evidence of confirmed saved values.
+                self.gpuiSettingsResult = ["requestID": requestID, "status": completed ? "accepted" : "failed",
+                                           "code": completed ? NSNull() : "settings_command_rejected"]
+                self.gpuiSettingsTask = nil
+            }
+            return true
+        }
+        if value["op"] as? String == "world.physics.receipt" { return worldPhysics.accept(value) }
         if value["op"] as? String == "presence.position.rendered" { return characterPosition?.acknowledgeRendered(value) ?? false }
         if let op = value["op"] as? String, op == "presence.position" || op == "presence.position.reset" { return characterPosition?.command(value) ?? false }
         if let op = value["op"] as? String, UnityChatImageBridge.supportedCommands.contains(op) { return chatImages.command(value) }
         if value["op"] as? String == "spatial.presentation.receipt" { return spatialPresentation.command(value) }
         if value["op"] as? String == "ui.textInput" { return !closed && shortcutSettings.updateTextInput(value) }
+        if value["op"] as? String == "tts.stop" { return !closed && productSettings.command(value) }
         if value["op"] as? String == "world.selection.prepared" { return completeWorldSelection(value) }
         if let operation = value["op"] as? String, UnityScreenVideoBridge.supportedCommands.contains(operation) {
             return screenVideo.command(value)
         }
-        if value["op"] as? String == "world.device.place" { return devicePlacement?.command(value) ?? false }
+        if ["world.device.place", "world.device.preview"].contains(value["op"] as? String ?? "") { return devicePlacement?.command(value) ?? false }
         if let operation = value["op"] as? String,
            operation == "activity.projected" || operation.hasPrefix("wish.") || operation == "inventory.retry" || operation == "inventory.delete" {
             return worldSession?.command(value) ?? false
@@ -875,9 +1055,6 @@ final class UnityMediaHost {
                 marbleRuntimeReady = version.intValue == 2
                 return true
             case "world.attachment.ready": return worldSession?.adoptAttachmentReadiness(value) ?? false
-            case "settings.open":
-                chat.refreshInstalledBackends()
-                return settingsBridge?.open() ?? false
             case "presence.motion.completed":
                 guard !closed,
                       let revision = value["revision"] as? UInt64,
@@ -909,12 +1086,9 @@ final class UnityMediaHost {
             case "inbox.list", "inbox.read", "inbox.post": return inbox?.command(value) ?? false
             case "stage.load": return true
             case "stage.player.lyrics":
-                guard let id = value["id"] as? String,
-                      let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == id }) else { return false }
-                lyricsStore.setVisualMode(mode)
-                visualRevision &+= 1
-            case "stage.player.cloud", "stage.player.particles": return settingsCommand(value)
-            case "world.snapshot", "world.commit", "world.placement.evaluate", "world.placement.derive":
+                return settingsVisualCommand(value)
+            case "stage.player.cloud", "stage.player.particles": return settingsVisualCommand(value)
+            case "world.snapshot", "world.placement.evaluate", "world.placement.derive", "world.prop.preview", "world.prop.command", "world.prop.loaded":
                 return world.command(value)
             case "music.library": return musicLibrary.refresh()
             case "music.program.history":
@@ -965,36 +1139,32 @@ final class UnityMediaHost {
                 let rawLyric = value["lyricPath"] as? String
                 let lyric = rawLyric.flatMap { $0.isEmpty ? nil : $0 }
                 guard lyric == nil || lyric!.hasPrefix("/") else { return false }
-                musicLibrary.clearQueue(); libraryQueueActive = false; libraryTrack = nil
-                musicQueueRevision &+= 1
-                queue = [entry(path: path, lyricPath: lyric)]
-                queueIndex = 0
-                try loadQueueEntry(autoplay: value["autoplay"] as? Bool == true)
+                let entries = [entry(path: path, lyricPath: lyric)]
+                let ticket = try musicPlayback.begin(queue: entries, ids: entries.map { $0.url.path }, index: 0, mode: "local")
+                try loadQueueEntry(ticket, autoplay: value["autoplay"] as? Bool == true)
+                musicLibrary.cancelPreparation(); libraryTrack = nil
             case "music.queue":
                 guard let paths = value["paths"] as? [String], !paths.isEmpty,
                       paths.allSatisfy({ $0.hasPrefix("/") }) else { return false }
                 let index = value["index"] as? Int ?? 0
                 guard paths.indices.contains(index) else { return false }
-                musicLibrary.clearQueue(); libraryQueueActive = false; libraryTrack = nil
-                musicQueueRevision &+= 1
-                queue = paths.map { entry(path: $0) }
-                queueIndex = index
-                try loadQueueEntry(autoplay: value["autoplay"] as? Bool == true)
+                let entries = paths.map { entry(path: $0) }
+                let ticket = try musicPlayback.begin(queue: entries, ids: entries.map { $0.url.path }, index: index, mode: "local")
+                try loadQueueEntry(ticket, autoplay: value["autoplay"] as? Bool == true)
+                musicLibrary.cancelPreparation(); libraryTrack = nil
             case "music.next":
-                if libraryQueueActive { return musicLibrary.select(musicLibrary.index + 1) }
-                guard queueIndex + 1 < queue.count else { return false }
-                queueIndex += 1
-                try loadQueueEntry(autoplay: true)
+                let ticket = try musicPlayback.navigate(delta: 1)
+                if ticket.mode == "library" { return musicLibrary.select(ticket.index) }
+                try loadQueueEntry(ticket, autoplay: true)
             case "music.select":
-                if libraryQueueActive, let index = value["index"] as? Int { return musicLibrary.select(index) }
-                guard let index = value["index"] as? Int, queue.indices.contains(index) else { return false }
-                queueIndex = index
-                try loadQueueEntry(autoplay: true)
+                guard let index = value["index"] as? Int else { return false }
+                let ticket = try musicPlayback.navigate(slotIndex: index)
+                if ticket.mode == "library" { return musicLibrary.select(ticket.index) }
+                try loadQueueEntry(ticket, autoplay: true)
             case "music.previous":
-                if libraryQueueActive { return musicLibrary.select(musicLibrary.index - 1) }
-                guard queueIndex > 0 else { return false }
-                queueIndex -= 1
-                try loadQueueEntry(autoplay: true)
+                let ticket = try musicPlayback.navigate(delta: -1)
+                if ticket.mode == "library" { return musicLibrary.select(ticket.index) }
+                try loadQueueEntry(ticket, autoplay: true)
             case "music.play":
                 try player.play()
                 pausedPosition = nil
@@ -1009,7 +1179,8 @@ final class UnityMediaHost {
                 graph.musicVolume = Float(volume)
             case "music.seek": return false
             case "chat.send":
-                guard let id = value["requestID"] as? NSNumber, CFGetTypeID(id) != CFBooleanGetTypeID(),
+                guard takingChatImageRequestID == nil,
+                      let id = value["requestID"] as? NSNumber, CFGetTypeID(id) != CFBooleanGetTypeID(),
                       id.doubleValue.isFinite, id.doubleValue >= 0,
                       id.doubleValue <= 9_007_199_254_740_991, id.doubleValue.rounded() == id.doubleValue,
                       chatImageSubmissions[id.uint64Value] == nil,
@@ -1027,34 +1198,52 @@ final class UnityMediaHost {
                 } else {
                     attachmentIDs = []; imageRevision = imageState["generation"] as? UInt64 ?? 0
                 }
-                let submission = try chatImages.takeSubmission(text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+                takingChatImageRequestID = id.uint64Value
+                chatImageAdmissionTask = Task { @MainActor [self] in
+                defer {takingChatImageRequestID = nil;chatImageAdmissionTask = nil}
+                do {
+                guard !closed, !Task.isCancelled else {return false}
+                let submission = try await chatImages.takeSubmission(text: text.trimmingCharacters(in: .whitespacesAndNewlines),
                     attachmentIDs: attachmentIDs, generation: imageRevision)
+                guard !closed, !Task.isCancelled else {
+                    _ = await chatImages.restoreSubmission(submission)
+                    chat.cancelUnstarted(requestID:id.uint64Value,submission:submission)
+                    return false
+                }
                 let imageSession = worldSession
                 residentAutonomy?.humanTurnWillBegin()
+                if let autonomy = residentAutonomy, autonomy.usesRustScheduler {
+                    guard scheduledHumanSubmission == nil, let imageSession else {
+                        _ = await chatImages.restoreSubmission(submission); autonomy.humanTurnDidFinish(); return false
+                    }
+                    scheduledHumanSubmission = (id.uint64Value, submission, imageSession)
+                    autonomy.loop.receiveUserMessage(submission.text, imageURLs: submission.attachments.map(\.url), submissionID: submission.id)
+                } else {
                 guard chat.send(requestID: id.uint64Value, submission: submission, authorizeImages: { [weak self, weak imageSession] runID, isCurrent in
                     guard let self, let imageSession, !self.closed,
                           self.worldSession === imageSession, isCurrent() else { throw CancellationError() }
-                    try imageSession.authorizeHumanImages(runID: runID, conversationID: self.humanImageConversationID,
+                    try await imageSession.authorizeHumanImages(runID: runID, conversationID: self.humanImageConversationID,
                         attachments: submission.attachments, isCurrent: isCurrent)
                 }) else {
-                    _ = chatImages.restoreSubmission(submission)
+                    _ = await chatImages.restoreSubmission(submission)
                     residentAutonomy?.humanTurnDidFinish(); return false
+                }
                 }
                 chatImageSubmissions[id.uint64Value] = submission
                 pushToTalk.cancel()
-                productSettings.stopReplySpeech()
-                replySpeechRequestID = id.uint64Value
-                announcedReplyRequestID = nil
+                productSettings.replySpeechEvent(requestID: String(id.uint64Value), kind: "accepted")
+                return true
+                } catch {notice = error.localizedDescription;return false}
+                }
                 return true
             case "chat.cancel":
+                chatImageAdmissionTask?.cancel()
                 guard let id = value["requestID"] as? NSNumber else { return false }
+                if residentAutonomy?.usesRustScheduler == true,
+                   scheduledHumanSubmission?.requestID == id.uint64Value { residentAutonomy?.loop.cancel() }
                 let cancelled = chat.cancel(requestID: id.uint64Value)
                 if cancelled { residentAutonomy?.humanTurnDidFinish() }
-                if replySpeechRequestID == id.uint64Value {
-                    replySpeechRequestID = nil
-                    productSettings.stopReplySpeech()
-                    return true
-                }
+                productSettings.replySpeechEvent(requestID: String(id.uint64Value), kind: "cancelled")
                 return cancelled
             case "resident.autonomy.pause": residentAutonomy?.pauseByUser(); return residentAutonomy != nil
             case "resident.autonomy.resume": residentAutonomy?.resumeByUser(); return residentAutonomy != nil
@@ -1137,22 +1326,20 @@ final class UnityMediaHost {
                 if let request = event["requestID"] as? NSNumber,
                    ["reply", "failure", "cancelled"].contains(event["kind"] as? String ?? ""),
                    let submission = chatImageSubmissions.removeValue(forKey: request.uint64Value) {
-                    if event["kind"] as? String == "reply" { chatImages.finishSubmission(id: submission.id) }
-                    else { _ = chatImages.restoreSubmission(submission) }
+                    Task { @MainActor [self] in
+                        if event["kind"] as? String == "reply" {await chatImages.finishSubmission(id:submission.id)}
+                        else {_ = await chatImages.restoreSubmission(submission)}
+                    }
                 }
                 if ["reply", "failure", "cancelled"].contains(event["kind"] as? String ?? "") {
                     residentAutonomy?.humanTurnDidFinish()
                 }
-                guard let request = event["requestID"] as? NSNumber,
-                      request.uint64Value == replySpeechRequestID else { continue }
+                guard let request = event["requestID"] as? NSNumber else { continue }
                 switch event["kind"] as? String {
                 case "reply":
-                    guard announcedReplyRequestID != request.uint64Value else { continue }
-                    announcedReplyRequestID = request.uint64Value
-                    if let text = event["text"] as? String { productSettings.speakReply(text) }
+                    productSettings.replySpeechEvent(requestID: String(request.uint64Value), kind: "reply", source: event["speechSource"] as? [String: Any])
                 case "failure", "cancelled":
-                    replySpeechRequestID = nil
-                    productSettings.stopReplySpeech()
+                    productSettings.replySpeechEvent(requestID: String(request.uint64Value), kind: event["kind"] as! String)
                 default: break
                 }
             }
@@ -1170,11 +1357,14 @@ final class UnityMediaHost {
             spatialPresentation.observeWorldWeather(worldID: session.context.state.worldID, value: session.context.state.weather)
         }
         return ["version": 1, "locale": productSettings.locale, "music": music, "musicLibrary": musicLibrary.snapshot(), "chat": conversation, "world": world.snapshot(), "inbox": worldServices["inbox"] ?? [:], "voice": pushToTalk.snapshot,
+                "settings": settingsSnapshot(), "settingsCommandResult": gpuiSettingsResult,
                 "worldSelection": worldSelection,
                 "runtimeCapabilities": ["marbleSPZVersion": marbleRuntimeReady ? 2 : 0],
                 "spatialPresentation": spatialPresentation.snapshot(),
-                "chatAttachments": chatImages.snapshot(),
+                "chatAttachments": chatAttachmentSnapshot(),
                 "characterPosition": characterPosition?.snapshot() ?? [:],
+                "worldPhysicsProbes": worldPhysics.snapshot(),
+                "visualSettingsCommand": visualCommandState,
                 "selection": characterSelection, "uiIntents": uiIntents,
                 "activity": worldServices["activity"] ?? NSNull(),
                 "heldAvatarBindingNotice": worldServices["heldAvatarBindingNotice"] ?? NSNull(),
@@ -1188,15 +1378,22 @@ final class UnityMediaHost {
                 "screenVideo": screenVideo.snapshot(), "replySpeech": productSettings.replyPlaybackSnapshot]
     }
 
+    private func chatAttachmentSnapshot() -> [String:Any] {
+        var snapshot = chatImages.snapshot()
+        if takingChatImageRequestID != nil {snapshot["canSubmit"] = false;snapshot["isPreparing"] = true}
+        return snapshot
+    }
+
     func close() {
+        gpuiSettingsTask?.cancel(); gpuiSettingsTask = nil
+        visualCommandTask?.cancel(); visualCommandTask=nil
+        worldPhysics.close()
         closed = true
         chatImageDrop.close()
         savedProgramRestoreTask?.cancel(); savedProgramRestoreTask = nil
         spatialPresentation.close()
         characterPosition?.close()
-        chatImages.close(); chatImageSubmissions.removeAll()
-        replySpeechRequestID = nil
-        announcedReplyRequestID = nil
+        chatImageAdmissionTask?.cancel();chatImages.close();chatImageSubmissions.removeAll()
         openPanel?.cancel(nil)
         openPanel = nil
         player.stop()
@@ -1213,28 +1410,44 @@ final class UnityMediaHost {
         musicLibrary.close()
         djProgram.shutdown()
         pushToTalk.close()
-        settingsBridge?.close()
         shortcutSettings.stop()
         presenceSettings.stop()
         agentConnection.stop()
         productSettings.close()
     }
 
-    private func settingsCommand(_ value: [String: Any]) -> Bool {
+    private var residentSchedulerBindingKey: String?
+
+    private func bindResidentSchedulerIfRequested() {
+        guard let composition = worldSession, let autonomy = residentAutonomy else { return }
+        let key = "\(ObjectIdentifier(composition))|\(composition.context.snapshot.worldID)|\(composition.residentScope)|\(chat.backend)"
+        guard residentSchedulerBindingKey != key else { return }
+        residentSchedulerBindingKey = key
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        let scheduler = RustResidentSchedulerClient(worldID: composition.context.snapshot.worldID,
+            residentScope: composition.residentScope, endpointFile: endpoint.endpointFile,
+            hostSessionID: composition.residentHostSessionID)
+        autonomy.bindScheduler(scheduler, backend: chat.backend)
+    }
+
+    private func settingsCommand(_ value: [String: Any]) async -> Bool {
         guard !closed, let op = value["op"] as? String else { return false }
+        if let op = value["op"] as? String, UnityScreenVideoBridge.supportedCommands.contains(op) {
+            return screenVideo.command(value)
+        }
         defer { residentAutonomy?.refresh() }
         switch op {
         case "presence.position", "presence.position.reset": return characterPosition?.command(value) ?? false
         case _ where UnityMarbleWorldBridge.supportedCommands.contains(op): return spaceLibrary.settingsCommand(value)
         case "space.library.load", "space.library.select", "space.default": return spaceLibrary.settingsCommand(value)
         case "video.load", "video.choose", "video.select", "video.remove", "video.play", "video.pause", "video.stop", "video.mode", "video.brightness", "video.bind", "video.unbind", "video.bound.play", "video.bound.dismiss": return screenVideo.command(value)
-        case "generation.load", "generation.save", "generation.check": return generationConfiguration?.settingsCommand(value) ?? false
+        case "generation.load", "generation.save", "generation.check": return await generationConfiguration?.settingsCommand(value) ?? false
         case "settings.load":
             _ = musicLibrary.settingsCommand(["op": "music.load"])
             _ = presenceSettings.command(["op": "presence.load"])
             agentConnection.refresh()
             return productSettings.command(value)
-        case "agent.status", "agent.login", "agent.logout", "agent.backend": return agentConnection.command(value)
+        case "agent.status", "agent.login", "agent.logout", "agent.backend": return await agentConnection.command(value)
         case "agent.save":
             guard value.count > 1 else { return false }
             var remaining = value
@@ -1242,7 +1455,7 @@ final class UnityMediaHost {
             guard autonomyEnabled == nil || autonomyEnabled is Bool,
                   autonomyEnabled == nil || residentAutonomy != nil else { return false }
             if let backend = remaining.removeValue(forKey: "backendID") {
-                guard agentConnection.command(["op": "agent.save", "backendID": backend]) else { return false }
+                guard await agentConnection.command(["op": "agent.save", "backendID": backend]) else { return false }
             }
             guard remaining.count == 1 || productSettings.command(remaining) else { return false }
             if let enabled = autonomyEnabled as? Bool {
@@ -1262,14 +1475,42 @@ final class UnityMediaHost {
         case "stage.load": return true
         case "stage.player.lyrics": return command(value)
         case "stage.player.cloud":
-            guard let raw = value["id"] as? String, let choice = StagePointCloudChoice(rawValue: raw) else { return false }
-            visualDirection.selectPointCloud(choice); visualRevision &+= 1; return true
+            return settingsVisualCommand(value)
         case "stage.player.particles":
-            guard let number = value["value"] as? NSNumber, number.floatValue.isFinite,
-                  StageParticleSizing.manualRange.contains(number.floatValue) else { return false }
-            visualDirection.setParticleSizeMultiplier(number.floatValue); visualRevision &+= 1; return true
+            return settingsVisualCommand(value)
         default: return productSettings.command(value)
         }
+    }
+    private func settingsVisualCommand(_ value: [String: Any]) -> Bool {
+        guard !closed, visualCommandTask == nil, let operation=value["op"] as? String else { return false }
+        let requestID=value["requestID"] as? String ?? UUID().uuidString
+        let perform: @MainActor () async throws -> Void
+        switch operation {
+        case "stage.player.lyrics":
+            guard let raw=value["id"] as? String else {return false}
+            perform = { [lyricsStore] in try await lyricsStore.setVisualMode(rawValue:raw) }
+        case "stage.player.cloud":
+            guard let raw=value["id"] as? String else {return false}
+            perform = { [visualDirection] in try await visualDirection.selectPointCloud(rawValue:raw) }
+        case "stage.player.particles":
+            guard let number=value["value"] as? NSNumber else {return false}
+            let raw=number.doubleValue
+            perform = { [visualDirection] in try await visualDirection.setParticleSizeMultiplier(rawValue:raw) }
+        default:return false
+        }
+        visualCommandState=["requestID":requestID,"operation":operation,"status":"pending"]
+        visualCommandTask=Task { @MainActor [weak self] in
+            guard let self else {return}
+            defer {self.visualCommandTask=nil}
+            do {
+                try await perform();try Task.checkCancellation();guard !self.closed else {return}
+                self.visualRevision &+= 1
+                self.visualCommandState=["requestID":requestID,"operation":operation,"status":"completed"]
+            } catch {
+                self.visualCommandState=["requestID":requestID,"operation":operation,"status":"failed","code":"visual_settings_unconfirmed"]
+            }
+        }
+        return true // ABI accepts a pending request; only the confirmed snapshot reports completion.
     }
 
     private func runtimeDiagnostics() -> [String: Any] {
@@ -1281,18 +1522,19 @@ final class UnityMediaHost {
         UnityRuntimeDiagnostics.project(world: world,
             autonomy: autonomy,
             preview: preview,
-            ambientEnabled: defaults.object(forKey: UnityResidentAgentLoopBridge.enabledKey) as? Bool ?? true,
+            ambientEnabled: productSettings.authority.confirmed?.values.autonomyEnabled ?? false,
             editing: worldEditing)
     }
 
     private func settingsSnapshot() -> [String: Any] {
+        let video = screenVideo.settingsSnapshot()
         var settings = productSettings.snapshot
         settings["music"] = musicLibrary.settingsSnapshot
         settings["presence"] = presenceSettings.snapshot
         settings["characterPosition"] = characterPosition?.snapshot() ?? [:]
         settings["shortcuts"] = shortcutSettings.snapshot
         settings["generation"] = generationConfiguration?.snapshot ?? [:]
-        settings["video"] = screenVideo.settingsSnapshot()
+        settings["video"] = video
         settings["spaceLibrary"] = spaceLibrary.snapshot
         var space = settings["space"] as? [String: Any] ?? [:]
         for (key, value) in spaceLibrary.defaultSpaceSnapshot { space[key] = value }
@@ -1315,7 +1557,18 @@ final class UnityMediaHost {
                                      "lyricID": lyricsStore.visualMode.agentValue,
                                      "clouds": StagePointCloudChoice.allCases.map { ["id": $0.rawValue, "name": $0.title] },
                                      "cloudID": visualDirection.currentPointCloudChoice.rawValue,
-                                     "particleScale": visualDirection.particleSizeMultiplier]],
+                                     "particleScale": visualDirection.particleSizeMultiplier,
+                                     "videoModes": StageVideoPlaybackMode.allCases.map { ["id": $0.rawValue, "name": $0.displayName] },
+                                     "videoMode": video["mode"] ?? NSNull(),
+                                     "videoActive": video["activeID"] is String,
+                                     "videoAssetID": video["activeID"] ?? NSNull(),
+                                     "videoBrightness": video["brightness"] ?? NSNull(),
+                                     "videoAssets": video["assets"] ?? [],
+                                     "videoBoundAssetID": video["boundAssetID"] ?? NSNull(),
+                                     "videoTrackID": video["currentTrackID"] ?? NSNull(),
+                                     "videoTrackTitle": video["currentTrackTitle"] ?? NSNull(),
+                                     "videoNotice": video["notice"] ?? NSNull(),
+                                     "videoCanRecoverStop": video["canRecoverStop"] ?? false]],
                 "supportedCommands": ["app.language", "settings.load", "speech.settings.load", "speech.settings.cancel", "stage.load",
                                       "stage.player.lyrics", "stage.player.cloud", "stage.player.particles", "agent.save",
                                       "tts.provider", "tts.refresh", "tts.save", "tts.preview", "tts.stop", "asr.provider", "asr.save",
@@ -1342,8 +1595,7 @@ final class UnityMediaHost {
     }
 
     private func playerVisualSettingsSnapshot() -> [String: Any] {
-        let mode = StageLyricModeDirector.resolve(configuredMode: lyricsStore.visualMode,
-            trackID: lyricsStore.trackID, lines: lines, playbackTime: pausedPosition ?? player.playbackPosition)
+        let mode = lyricsStore.resolvedVisualMode
         let theme = lyricsStore.activeTheme ?? .gmgnDefaultDark
         let themeValue = (try? JSONEncoder().encode(theme)).flatMap { try? JSONSerialization.jsonObject(with: $0) }
         return ["revision": visualRevision, "configuredMode": lyricsStore.visualMode.agentValue,

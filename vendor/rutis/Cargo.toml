@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/rutis", "crates/rutis-agent"]
+
+[workspace.package]
+edition = "2021"
+version = "0.6.0"
+license = "MIT"
+repository = "https://github.com/arcships/rutis"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "net", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "2"

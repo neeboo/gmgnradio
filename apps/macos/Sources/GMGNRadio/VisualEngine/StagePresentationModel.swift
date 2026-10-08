@@ -641,29 +641,6 @@ enum StageLyricsVisualMode: CaseIterable, Equatable, Hashable, Sendable {
     }
 }
 
-enum StageLyricModeDirector {
-    static func resolve(
-        configuredMode: StageLyricsVisualMode,
-        trackID: String?,
-        lines: [StageLyricLine],
-        playbackTime: TimeInterval
-    ) -> StageLyricsVisualMode {
-        guard configuredMode == .automatic else {
-            return configuredMode
-        }
-        let seed = stableSeed(trackID ?? "")
-        return StageLyricsVisualMode.playbackModes[
-            seed % StageLyricsVisualMode.playbackModes.count
-        ]
-    }
-
-    private static func stableSeed(_ value: String) -> Int {
-        value.utf8.reduce(0) { partial, byte in
-            (partial &* 31 &+ Int(byte)) & 0x7FFF_FFFF
-        }
-    }
-}
-
 enum StageLyricTypography {
     static func fontSize(
         text: String,
@@ -1008,22 +985,73 @@ enum StageLyricSectionClassifier {
 
 @MainActor
 final class StageLyricsStore: ObservableObject {
-    static let shared = StageLyricsStore(defaults: .standard)
+    static let shared = StageLyricsStore(defaults: .standard, settings: .shared)
     static let visualModePreferenceKey = "stage.lyrics.visualMode"
-    private let defaults: UserDefaults?
+    private let settings: RustProductSettingsClient?
+    private var startup: Task<Void, Error>?
+    private var trackResolution: Task<Void, Error>?
+    private var confirmedRevision: Int64 = -1
+    nonisolated(unsafe) private var settingsObserver: NSObjectProtocol?
 
     @Published private(set) var trackID: String?
     @Published private(set) var lines: [StageLyricLine] = []
     @Published private(set) var visualMode: StageLyricsVisualMode = .automatic
+    @Published private(set) var resolvedVisualMode: StageLyricsVisualMode = .automatic
+    @Published private(set) var authorityError: String?
     @Published private(set) var activeTheme: StageAITheme?
 
     /// Explicit injection keeps test stores and isolated render hosts from
     /// reading or writing the installed application's preference domain.
-    init(defaults: UserDefaults? = nil) {
-        self.defaults = defaults
-        if let stored = defaults?.string(forKey: Self.visualModePreferenceKey),
-           let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == stored }) {
-            visualMode = mode
+    init(defaults: UserDefaults? = nil, settings: RustProductSettingsClient? = nil) {
+        self.settings = settings
+        guard let settings else { return }
+        let legacy = defaults.map(RustProductSettingsClient.stageLegacySnapshot) ?? [:]
+        settings.bootstrap(legacy: defaults.map(RustProductSettingsClient.legacySnapshot) ?? [:])
+        settingsObserver = NotificationCenter.default.addObserver(forName: .init("gmgnProductSettingsConfirmed"), object: settings, queue: .main) { [weak self, weak settings] _ in
+            MainActor.assumeIsolated {
+                guard let self, let snapshot = settings?.confirmed else { return }
+                do { try self.project(snapshot) } catch { self.authorityError = error.localizedDescription }
+            }
+        }
+        startup = Task { [weak self, settings] in
+            do {
+                try await settings.ensureLoaded()
+                let snapshot = try await settings.importStageLegacy(legacy: legacy)
+                try self?.project(snapshot)
+            } catch { self?.authorityError = error.localizedDescription; throw error }
+        }
+    }
+
+    deinit { if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) } }
+
+    private func project(_ snapshot: RustProductSettingsClient.Snapshot) throws {
+        guard snapshot.revision >= confirmedRevision else { return }
+        guard let mode = StageLyricsVisualMode(agentValue: snapshot.values.stageLyricsMode),
+              let resolved = StageLyricsVisualMode(agentValue: snapshot.values.stageLyricsResolvedMode) else {
+            throw RustProductSettingsClient.SettingsError.invalidProtocol
+        }
+        confirmedRevision = snapshot.revision
+        visualMode = mode
+        resolvedVisualMode = snapshot.values.stageLyricsTrackID == trackID ? resolved : .automatic
+        authorityError = nil
+    }
+
+    func waitForAuthority() async throws {
+        try await startup?.value
+        try await trackResolution?.value
+    }
+
+    private func resolveTrack() {
+        guard let settings else { return }
+        let previous = trackResolution, ready = startup, requestedTrack = trackID
+        trackResolution = Task { [weak self, settings] in
+            do {
+                try await ready?.value
+                _ = try? await previous?.value
+                let snapshot = try await settings.setStageLyricsTrack(requestedTrack)
+                guard let self, trackID == requestedTrack else { return }
+                try project(snapshot)
+            } catch { self?.authorityError = error.localizedDescription; throw error }
         }
     }
 
@@ -1034,17 +1062,34 @@ final class StageLyricsStore: ObservableObject {
     ) {
         if self.trackID != trackID {
             activeTheme = nil
+            resolvedVisualMode = .automatic
         }
         self.trackID = trackID
         lines = StageLyricsParser().parse(
             lyrics,
             trackDuration: trackDuration
         )
+        resolveTrack()
     }
 
-    func setVisualMode(_ mode: StageLyricsVisualMode) {
-        visualMode = mode
-        defaults?.set(mode.agentValue, forKey: Self.visualModePreferenceKey)
+    func setVisualMode(_ mode: StageLyricsVisualMode) async throws {
+        try await setVisualMode(rawValue: mode.agentValue)
+    }
+
+    func setVisualMode(rawValue: String) async throws {
+        guard let settings else { throw RustProductSettingsClient.SettingsError.unavailable }
+        do {
+            try await waitForAuthority()
+            try project(await settings.setStageLyricsMode(raw: rawValue))
+        } catch { authorityError = error.localizedDescription; throw error }
+    }
+
+    func cycleVisualMode() async throws {
+        guard let settings else { throw RustProductSettingsClient.SettingsError.unavailable }
+        do {
+            try await waitForAuthority()
+            try project(await settings.cycleStageLyricsMode())
+        } catch { authorityError = error.localizedDescription; throw error }
     }
 
     @discardableResult
@@ -1063,6 +1108,8 @@ final class StageLyricsStore: ObservableObject {
         trackID = nil
         lines = []
         activeTheme = nil
+        resolvedVisualMode = .automatic
+        resolveTrack()
     }
 }
 

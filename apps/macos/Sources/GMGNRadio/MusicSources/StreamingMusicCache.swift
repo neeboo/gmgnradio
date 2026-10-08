@@ -1,5 +1,6 @@
 import Foundation
-import os
+import CryptoKit
+import Darwin
 
 protocol MusicAssetCaching: Sendable {
     func store(
@@ -9,26 +10,16 @@ protocol MusicAssetCaching: Sendable {
 }
 
 actor StreamingMusicCache: MusicAssetCaching {
-    private let logger = Logger(
-        subsystem: "ai.gmgn.radio",
-        category: "StreamingMusicCache"
-    )
-    private let rootURL: URL
+    private let authority: RustMusicCacheClient
     private let transport: any MusicProviderHTTPTransport
-    private let fileManager: FileManager
 
     init(
-        rootURL: URL? = nil,
+        authority: RustMusicCacheClient,
         transport: any MusicProviderHTTPTransport =
-            URLSessionMusicProviderHTTPTransport(),
-        fileManager: FileManager = .default
+            URLSessionMusicProviderHTTPTransport()
     ) {
-        self.rootURL = rootURL ?? fileManager.urls(
-            for: .cachesDirectory,
-            in: .userDomainMask
-        )[0].appending(path: "ai.gmgn.radio/StreamingMusic", directoryHint: .isDirectory)
+        self.authority = authority
         self.transport = transport
-        self.fileManager = fileManager
     }
 
     func store(
@@ -38,38 +29,18 @@ actor StreamingMusicCache: MusicAssetCaching {
         let fileExtension = asset.url.pathExtension.isEmpty
             ? "m4a"
             : asset.url.pathExtension.lowercased()
-        let safeID = String(
-            trackID.map { $0.isLetter || $0.isNumber ? $0 : "-" }
-        )
-        let destination = rootURL.appending(
-            path: "\(safeID).\(fileExtension)"
-        )
-        if
-            fileManager.fileExists(atPath: destination.path),
-            let attributes = try? fileManager.attributesOfItem(
-                atPath: destination.path
-            ),
-            let size = attributes[.size] as? NSNumber,
-            size.int64Value > 0,
-            let cachedData = try? Data(contentsOf: destination),
-            StreamingAudioPayloadValidator.isAudio(cachedData)
-        {
-            logger.info(
-                "命中音频缓存：track=\(trackID, privacy: .public)，file=\(destination.path, privacy: .public)，bytes=\(size.int64Value)"
-            )
-            return destination
+        let initial = try await authority.prepare(trackID: trackID, fileExtension: fileExtension,
+            requestID: UUID().uuidString)
+        if initial.state == "ready" { return try await confirmedURL(initial) }
+        guard initial.state == "pending", let actionID = initial.actionID else {
+            throw MusicProviderClientError.playbackUnavailable
         }
-        if fileManager.fileExists(atPath: destination.path) {
-            let existingData = try? Data(contentsOf: destination)
-            logger.error(
-                "清理无效音频缓存：track=\(trackID, privacy: .public)，file=\(destination.path, privacy: .public)，bytes=\(existingData?.count ?? 0)，magic=\(StreamingAudioPayloadValidator.magicDescription(existingData ?? Data()), privacy: .public)"
-            )
-            try? fileManager.removeItem(at: destination)
+        // A lost claim reply is deliberately not retried: the durable slot may already be claimed.
+        let claimed = try await authority.claim(actionID: actionID)
+        guard claimed.state == "claimed", let stagePath = claimed.stagePath else {
+            throw MusicProviderClientError.playbackUnavailable
         }
-
-        logger.info(
-            "开始下载音频：track=\(trackID, privacy: .public)，host=\(asset.url.host ?? "nil", privacy: .public)，file=\(destination.path, privacy: .public)，headerNames=\(asset.requestHeaders.keys.sorted().joined(separator: ","), privacy: .public)"
-        )
+        let stage = try await privateURL(stagePath)
         var request = URLRequest(url: asset.url)
         request.timeoutInterval = 45
         for (name, value) in asset.requestHeaders {
@@ -81,34 +52,64 @@ actor StreamingMusicCache: MusicAssetCaching {
             response = try await transport.send(request)
             data = try checkedProviderResponse(response)
         } catch {
-            logger.error(
-                "音频下载失败：track=\(trackID, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
-            )
+            // The awaited native transport has ended; this download produced no usable payload.
+            _ = try? await authority.failed(actionID: actionID)
             throw error
         }
-
-        logger.info(
-            "音频下载响应：track=\(trackID, privacy: .public)，status=\(response.statusCode)，mime=\(response.mimeType ?? "nil", privacy: .public)，finalHost=\(response.responseURL?.host ?? "nil", privacy: .public)，finalPath=\(response.responseURL?.path ?? "nil", privacy: .public)，bytes=\(data.count)，magic=\(StreamingAudioPayloadValidator.magicDescription(data), privacy: .public)"
-        )
-        guard StreamingAudioPayloadValidator.isAudio(
-            data,
-            mimeType: response.mimeType
-        ) else {
-            logger.error(
-                "拒绝非音频响应：track=\(trackID, privacy: .public)，mime=\(response.mimeType ?? "nil", privacy: .public)，magic=\(StreamingAudioPayloadValidator.magicDescription(data), privacy: .public)"
-            )
+        let valid = StreamingAudioPayloadValidator.isAudio(data, mimeType: response.mimeType)
+        guard valid, data.count <= 256 * 1024 * 1024 else {
+            _ = try? await authority.failed(actionID: actionID)
             throw MusicProviderClientError.invalidAudioPayload
         }
+        let hash = try await Task.detached {
+            let manager = FileManager.default
+            try manager.createDirectory(at: stage.deletingLastPathComponent(), withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            guard !manager.fileExists(atPath: stage.path) else { throw MusicProviderClientError.invalidAudioPayload }
+            try data.write(to: stage, options: .withoutOverwriting)
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stage.path)
+            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }.value
+        let completed: RustMusicCacheClient.View
+        do {
+            completed = try await authority.receipt(actionID: actionID, sha256: hash,
+                bytes: UInt64(data.count), audioValid: valid)
+        } catch {
+            // Recover only the existing durable action; never repeat the HTTP download.
+            let recovered = try await authority.read(actionID: actionID)
+            guard recovered.state == "ready" else { throw error }
+            return try await confirmedURL(recovered)
+        }
+        return try await confirmedURL(completed)
+    }
 
-        try fileManager.createDirectory(
-            at: rootURL,
-            withIntermediateDirectories: true
-        )
-        try data.write(to: destination, options: .atomic)
-        logger.info(
-            "音频缓存完成：track=\(trackID, privacy: .public)，bytes=\(data.count)，file=\(destination.path, privacy: .public)"
-        )
-        return destination
+    private func privateURL(_ path: String) async throws -> URL {
+        let root = authority.directory
+        let url = URL(fileURLWithPath: path)
+        guard let actualParent = realpath(root.path, nil) else {
+            throw MusicProviderClientError.invalidAudioPayload
+        }
+        defer { free(actualParent) }
+        let canonicalParent = String(cString: actualParent)
+        guard canonicalParent == root.path,
+              !url.lastPathComponent.isEmpty,
+              url.lastPathComponent != ".", url.lastPathComponent != "..",
+              path == canonicalParent + "/" + url.lastPathComponent else {
+            throw MusicProviderClientError.invalidAudioPayload
+        }
+        var facts = stat()
+        if lstat(path, &facts) == 0 {
+            guard facts.st_mode & S_IFMT == S_IFREG else { throw MusicProviderClientError.invalidAudioPayload }
+        } else if errno != ENOENT {
+            throw MusicProviderClientError.invalidAudioPayload
+        }
+        return url
+    }
+    private func confirmedURL(_ view: RustMusicCacheClient.View) async throws -> URL {
+        guard view.state == "ready", let path = view.finalPath else {
+            throw MusicProviderClientError.playbackUnavailable
+        }
+        return try await privateURL(path)
     }
 }
 

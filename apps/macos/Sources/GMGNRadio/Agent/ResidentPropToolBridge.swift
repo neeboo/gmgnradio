@@ -66,8 +66,8 @@ extension ResidentPropDelegationError: LocalizedError {
     private let isCurrent: () -> Bool
     private let onChange: () -> Void
     private let prepareMutation: (WorldPropLayoutCommand) async throws -> Void
-    private let resolveDelegatedGrant: (String, WorldPropPlacement) throws -> ResidentPropDelegatedGrant?
-    private let recordDelegatedPlacement: (ResidentPropDelegatedGrant, WorldPropPlacement) throws -> Void
+    private let resolveDelegatedGrant: (String, WorldPropPlacement) async throws -> ResidentPropDelegatedGrant?
+    private let recordDelegatedPlacement: (ResidentPropDelegatedGrant, WorldPropPlacement) async throws -> Void
     /// 「这一件现在是什么状态」——**唯一投影** `ResidentOwnershipProjection.row` 的注入点。
     ///
     /// 回执里那两句（`ownership_state` / `ownership_status`）必须与面板那一行、任务行
@@ -84,14 +84,16 @@ extension ResidentPropDelegationError: LocalizedError {
     /// 现场（真机 2026-10-03）：居民读到 `interaction_status: appearance_only`、
     /// 回执里一件带功能的物件都没有，于是它答"这台电视在空间里登记的是纯外形摆件"。
     private let screenCapability: (String) -> ResidentPropScreenCapability?
+    private let rustTool: ((String, String, Data) async throws -> Data)?
     init(service: ResidentPropPlacementService, allowsMutation: Bool,
          isCurrent: @escaping () -> Bool, onChange: @escaping () -> Void = {},
          prepareMutation: @escaping (WorldPropLayoutCommand) async throws -> Void = { _ in },
          delegatedGrant: ResidentPropDelegatedGrant? = nil,
-         resolveDelegatedGrant: @escaping (String, WorldPropPlacement) throws -> ResidentPropDelegatedGrant? = { _,_ in nil },
-         recordDelegatedPlacement: @escaping (ResidentPropDelegatedGrant, WorldPropPlacement) throws -> Void = { _,_ in },
+         resolveDelegatedGrant: @escaping (String, WorldPropPlacement) async throws -> ResidentPropDelegatedGrant? = { _,_ in nil },
+         recordDelegatedPlacement: @escaping (ResidentPropDelegatedGrant, WorldPropPlacement) async throws -> Void = { _,_ in },
          ownershipRow: @escaping (String) -> OwnershipRow? = { _ in nil },
-         screenCapability: @escaping (String) -> ResidentPropScreenCapability? = { _ in nil }) {
+         screenCapability: @escaping (String) -> ResidentPropScreenCapability? = { _ in nil },
+         rustTool: ((String, String, Data) async throws -> Data)? = nil) {
         self.service = service; self.allowsMutation = allowsMutation
         self.isCurrent = isCurrent; self.onChange = onChange
         self.prepareMutation = prepareMutation
@@ -100,13 +102,15 @@ extension ResidentPropDelegationError: LocalizedError {
         self.recordDelegatedPlacement = recordDelegatedPlacement
         self.ownershipRow = ownershipRow
         self.screenCapability = screenCapability
+        self.rustTool = rustTool
     }
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
-        ["read_owned_props", "list_placement_surfaces", "preview_prop_placement", "apply_prop_placement", "withdraw_prop", "undo_prop_placement",
-         "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].map { name in
+        let names = ["read_owned_props", "list_placement_surfaces", "preview_prop_placement", "apply_prop_placement", "withdraw_prop", "undo_prop_placement",
+         "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"]
+        return (names + (rustTool == nil ? [] : ["resize_prop"])).map { name in
             var properties: [String: Any] = [:]
-            if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].contains(name) {
+            if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop", "resize_prop"].contains(name) {
                 properties["object_id"] = ["type": "string", "description": "read_owned_props 返回的已拥有物件编号"]
             }
             if name == "delete_prop" {
@@ -118,6 +122,7 @@ extension ResidentPropDelegationError: LocalizedError {
             if name == "enable_prop_capability" {
                 properties["capability"] = ["type": "string", "description": "受支持的使用能力模板，当前仅支持 coffee.brew"]
             }
+            if name == "resize_prop" { properties["target_longest_edge"] = ["type":"number","description":"目标最长边，单位米；由 Rust 验证尺寸及布局。"] }
             if name == "hold_prop" {
                 // 挂点：三个字面量与 `WorldPropSlot.rawValue` 同一份（`PropAttachmentSlots.acceptedNames`）。
                 // **可省**（省缺 = rightHand）：既有调用点与旧提示词一个字都不用改。
@@ -163,7 +168,7 @@ extension ResidentPropDelegationError: LocalizedError {
                 // 删除是**永久**的：描述里逐字写出来，agent 才不会把它当成又一次"收回"。
                 "delete_prop": "仅按本轮人类明确要求，**永久删除**一件已拥有的生成资产（不可恢复，没有撤销）。先用 read_owned_props 确认是哪一件。删除会自动收场：正在房间里摆着的、正拿在居民手里的或挂在身上的，都会在同一次提交里先收回/放回再删掉，不需要先调用 withdraw_prop 或 return_held_prop。回执里会说明删了什么、做了哪种收场、以及释放了哪些共享内容（还被别的物件引用的内容一律保留，不会误删）。只有这一件物件独占的内容才会进入可回收集合。删除后该物件不再出现在库存与回执的 objects 里，而是出现在 deleted 里。"
             ]
-            let description = descriptions[name]! + (name == "hold_prop"
+            let description = (descriptions[name] ?? "按用户指定目标最长边调整已拥有物件尺寸，填写最新 object_id 与 layout_revision。尺寸和布局仅由 Rust 验证。") + (name == "hold_prop"
                 ? " 已摆物件首次拿取必须在真实占地外缘 \(WorldPropActivityTemplate.interactionReach) 米内；远处先 move_to(place_id: object_id)，等 inspect_world 确认到达，再读取最新 read_owned_props 的 layout_revision 后拿取。prop_out_of_reach 是需要走近，不能用撤回库存来绕过距离。库存取出与当前持有同件的重新握持无需再次走近。"
                 : "")
             return .init(name: name, description: description, inputSchema: [
@@ -176,7 +181,7 @@ extension ResidentPropDelegationError: LocalizedError {
     }
 
     private static func isMutation(_ name: String) -> Bool {
-        ["apply_prop_placement", "withdraw_prop", "undo_prop_placement", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].contains(name)
+        ["apply_prop_placement", "withdraw_prop", "undo_prop_placement", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop", "resize_prop"].contains(name)
     }
     /// 挂点那三个取值的**人话名**（"rightHand（右手） / back（背后） / waist（腰间）"）。
     ///
@@ -212,6 +217,7 @@ extension ResidentPropDelegationError: LocalizedError {
         if ["preview_prop_placement", "apply_prop_placement", "withdraw_prop", "hold_prop", "adjust_held_prop_grip", "return_held_prop", "drop_held_prop", "enable_prop_capability", "delete_prop"].contains(name) { keys.insert("object_id") }
         if name == "enable_prop_capability" { keys.insert("capability") }
         if name == "delete_prop" { keys.insert("reason") }
+        if name == "resize_prop" { keys.formUnion(["object_id","target_longest_edge"]) }
         if ["preview_prop_placement", "apply_prop_placement"].contains(name) { keys.formUnion(["surface_id", "x", "y", "z", "yaw"]) }
         if name == "adjust_held_prop_grip" { keys.formUnion(["offset_x", "offset_y", "offset_z", "rotation_yaw"]) }
         if isMutation(name) { keys.insert("layout_revision") }
@@ -317,6 +323,24 @@ extension ResidentPropDelegationError: LocalizedError {
             .init(callID: callID, resultJSON: (try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)) ?? Data("{}".utf8), isError: error)
         }
         guard !Task.isCancelled, isCurrent() else { return result(["ok": false, "code": "stale_prop_session", "message": "本轮空间操作已停止。"], error: true) }
+        if let rustTool {
+            do {
+                let payload = try await rustTool(name, callID, data)
+                guard isCurrent(), !Task.isCancelled else { throw CancellationError() }
+                onChange()
+                return .init(callID: callID, resultJSON: payload, isError: false)
+            } catch {
+                let code: String
+                switch error {
+                case RustWorldPropError.rejected(let value): code = value
+                case RustWorldPropError.unavailable: code = "world_prop_execution_unknown"
+                case RustWorldPropError.executionUnknown: code = "world_prop_execution_unknown"
+                case is CancellationError: code = "stale_prop_session"
+                default: code = "world_prop_invalid_response"
+                }
+                return result(["ok":false,"code":code], error:true)
+            }
+        }
         guard let values = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return result(["ok": false, "code": "invalid_arguments",
                 "message": "摆放参数无效，请查询当前物件和支撑面。参数必须是一个 JSON 对象（键值对），本工具不接受数组或裸值。"], error: true)
@@ -354,13 +378,14 @@ extension ResidentPropDelegationError: LocalizedError {
                 else {
                     let objectID = values["object_id"] as! String
                     let command = WorldPropLayoutCommand.place(objectID: objectID, placement: placement)
-                    let resolved = try resolveGrantForApply(objectID: objectID, placement: placement)
+                    let resolved = try await resolveGrantForApply(objectID: objectID, placement: placement)
                     try await prepareMutation(command)
                     guard !Task.isCancelled, isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-                    let confirmed = try recheckGrantAfterAwait(objectID: objectID, placement: placement, previous: resolved)
+                    let confirmed = try await recheckGrantAfterAwait(objectID: objectID, placement: placement, previous: resolved)
+                    guard !Task.isCancelled, isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
                     let requestID = (!allowsMutation && confirmed != nil) ? confirmed!.requestID : callID
                     try service.commit(command, expectedLayoutRevision: (values["layout_revision"] as! NSNumber).uint64Value, requestID: requestID)
-                    if !allowsMutation, let confirmed { try recordDelegatedPlacement(confirmed, placement) }
+                    if !allowsMutation, let confirmed { try await recordDelegatedPlacement(confirmed, placement) }
                 }
             } else if name == "withdraw_prop" {
                 try service.commit(.withdraw(objectID: values["object_id"] as! String), expectedLayoutRevision: (values["layout_revision"] as! NSNumber).uint64Value, requestID: callID)
@@ -519,9 +544,9 @@ extension ResidentPropDelegationError: LocalizedError {
         return value("x") == target.position.x && value("y") == target.position.y
             && value("z") == target.position.z && value("yaw") == target.yaw
     }
-    private func resolveGrantForApply(objectID: String, placement: WorldPropPlacement) throws -> (ResidentPropDelegatedGrant?, Bool) {
+    private func resolveGrantForApply(objectID: String, placement: WorldPropPlacement) async throws -> (ResidentPropDelegatedGrant?, Bool) {
         guard !allowsMutation else { return (nil, false) }
-        if let dynamic = try resolveDelegatedGrant(objectID, placement) {
+        if let dynamic = try await resolveDelegatedGrant(objectID, placement) {
             try Self.validateGrant(dynamic, objectID: objectID, placement: placement)
             return (dynamic, true)
         }
@@ -530,9 +555,9 @@ extension ResidentPropDelegationError: LocalizedError {
         return (staticGrant, false)
     }
     private func recheckGrantAfterAwait(objectID: String, placement: WorldPropPlacement,
-                                        previous: (ResidentPropDelegatedGrant?, Bool)) throws -> ResidentPropDelegatedGrant? {
+                                        previous: (ResidentPropDelegatedGrant?, Bool)) async throws -> ResidentPropDelegatedGrant? {
         guard !allowsMutation else { return nil }
-        if let dynamic = try resolveDelegatedGrant(objectID, placement) {
+        if let dynamic = try await resolveDelegatedGrant(objectID, placement) {
             try Self.validateGrant(dynamic, objectID: objectID, placement: placement)
             if let prior = previous.0 { guard dynamic.requestID == prior.requestID else { throw ResidentPropDelegationError.requestChanged } }
             return dynamic

@@ -32,112 +32,29 @@ protocol MusicAccountServicing {
 }
 
 struct MusicAccountCommandService: Sendable {
+    private let authority: RustMusicAccountClient
     private let sessions: any MusicProviderSessionStore
-    private let neteaseClient: any AccountMusicProviderClient
-    private let qqMusicClient: any AccountMusicProviderClient
-
-    init(
-        sessions: any MusicProviderSessionStore,
-        neteaseClient: any AccountMusicProviderClient,
-        qqMusicClient: any AccountMusicProviderClient
-    ) {
-        self.sessions = sessions
-        self.neteaseClient = neteaseClient
-        self.qqMusicClient = qqMusicClient
+    init(authority: RustMusicAccountClient, sessions: any MusicProviderSessionStore) {
+        self.authority = authority; self.sessions = sessions
     }
-
     static func live() -> MusicAccountCommandService {
-        MusicAccountCommandService(
-            sessions: LocalMusicProviderSessionStore(),
-            neteaseClient: NeteaseMusicProviderClient(),
-            qqMusicClient: QQMusicProviderClient()
-        )
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/ai.gmgn.radio")
+        let authority = RustMusicAccountClient(applicationSupportBase: root)
+        return MusicAccountCommandService(authority: authority,
+            sessions: RustMusicProviderSessionStore(authority: authority,
+                legacyDirectory: root.appendingPathComponent("secrets/music-sessions")))
     }
-
-    func status(
-        providerID: MusicProviderID
-    ) async -> MusicAccountAuthorizationState {
+    func status(providerID: MusicProviderID) async -> MusicAccountAuthorizationState {
         do {
-            guard let session = try await sessions.session(for: providerID) else {
-                return .disconnected
-            }
-            return session.authorizationState()
-        } catch {
-            return .unavailable
-        }
+            _ = try await sessions.session(for: providerID)
+            return try await authority.account(providerID).state
+        } catch { return .unavailable }
     }
-
-    func connect(
-        providerID: MusicProviderID,
-        cookie: String
-    ) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            try await self.validateAndSave(providerID: providerID, cookie: cookie)
-        }.value
+    func connect(providerID: MusicProviderID, cookie: String) async throws {
+        try await authority.connect(providerID, cookie: cookie)
     }
-
-    private nonisolated func validateAndSave(
-        providerID: MusicProviderID,
-        cookie: String
-    ) async throws {
-        let trimmed = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
-        try validateCookieShape(trimmed, for: providerID)
-        let session = MusicProviderSession(
-            credential: .cookieHeader(trimmed),
-            expiresAt: nil
-        )
-        let client = try client(for: providerID)
-        let capabilities = try await client.capabilities(session: session)
-        guard capabilities.canPlay else {
-            throw MusicAccountConnectionError.accountCannotPlay
-        }
-
-        try await client.validateAccount(session: session)
-        try await sessions.save(session, for: providerID)
-    }
-
     func disconnect(providerID: MusicProviderID) async throws {
-        try await sessions.removeSession(for: providerID)
-    }
-
-    private nonisolated func client(
-        for providerID: MusicProviderID
-    ) throws -> any AccountMusicProviderClient {
-        switch providerID {
-        case .netease:
-            neteaseClient
-        case .qqMusic:
-            qqMusicClient
-        default:
-            throw MusicAccountConnectionError.unsupportedProvider
-        }
-    }
-
-    private nonisolated func validateCookieShape(
-        _ cookie: String,
-        for providerID: MusicProviderID
-    ) throws {
-        switch providerID {
-        case .netease:
-            guard cookie.contains("MUSIC_U=") else {
-                throw MusicAccountConnectionError.missingRequiredCookie
-            }
-        case .qqMusic:
-            let hasUIN = cookie.contains("uin=")
-                || cookie.contains("qqmusic_uin=")
-                || cookie.contains("wxuin=")
-                || cookie.contains("p_uin=")
-            let hasKey = cookie.contains("qm_keyst=")
-                || cookie.contains("qqmusic_key=")
-                || cookie.contains("music_key=")
-                || cookie.contains("wxskey=")
-            guard hasUIN, hasKey else {
-                throw MusicAccountConnectionError.missingRequiredCookie
-            }
-        default:
-            throw MusicAccountConnectionError.unsupportedProvider
-        }
+        _ = try await authority.disconnect(providerID)
     }
 }
-
 extension MusicAccountCommandService: MusicAccountServicing {}

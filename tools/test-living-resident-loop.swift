@@ -1153,6 +1153,7 @@ let compilerArguments: [String] = ["-disable-sandbox", "-j1", "-parse-as-library
     sources.appendingPathComponent("Agent/ResidentCodexAgent.swift").path,
     sources.appendingPathComponent("Agent/ResidentSteeringDelivery.swift").path,
     sources.appendingPathComponent("Agent/ResidentAgentLoop.swift").path,
+    sources.appendingPathComponent("Presence/RustResidentSchedulerClient.swift").path,
     sources.appendingPathComponent("Agent/ResidentMemoryStore.swift").path,
     sources.appendingPathComponent("Agent/ResidentStateClient.swift").path,
     sources.appendingPathComponent("Agent/ResidentMemoryClient.swift").path,

@@ -53,8 +53,8 @@ final class UnityDJProgramBridge {
         let index = try await select(plan, slotIndex)
         try Task.checkCancellation()
         guard !closed, playbackLease == lease else { throw CancellationError() }
-        store.publish(plan)
-        store.activateSlot(at: index)
+        guard try await store.selectProgram(id: plan.brief.id) != nil else { throw Failure.noPreparedProgram }
+        try await store.activateSlot(at: index)
         try await store.flush()
         ownsPlayback = true
     }
@@ -81,8 +81,8 @@ final class UnityDJProgramBridge {
     private var attemptedRestore = false
     var activePlaybackPlan: ProgramPlan? { ownsPlayback ? store.plan : nil }
 
-    init(archiveRoot: URL, hooks: Hooks, storage: MusicStorageClient) {
-        store = DJProgramStore(archive: DJProgramArchive(storage: storage))
+    init(archiveRoot: URL, hooks: Hooks, storage: MusicStorageClient, programClient: RustMusicProgramClient? = nil) {
+        store = DJProgramStore(archive: DJProgramArchive(storage: storage), client: programClient)
         self.hooks = hooks
     }
 
@@ -92,10 +92,7 @@ final class UnityDJProgramBridge {
     func restoreSavedPlayback() async throws -> Bool {
         guard !closed else { throw Failure.closed }
         guard !attemptedRestore else { return false }
-        await store.restoreLatest()
-        if case let .failed(message) = store.status {
-            throw NSError(domain: "MusicStorage", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-        }
+        try await store.restoreLatest()
         attemptedRestore = true
         guard let plan = store.plan, !plan.slots.isEmpty else { return false }
         guard let restore = hooks.restore else { return false }
@@ -107,7 +104,7 @@ final class UnityDJProgramBridge {
             let index = try await restore(plan, store.activeSlotIndex ?? 0)
             try Task.checkCancellation()
             guard !closed, lease == playbackLease else { throw CancellationError() }
-            store.activateSlot(at: index)
+            try await store.activateSlot(at: index)
             try await store.flush()
             ownsPlayback = true
             return true
@@ -124,10 +121,8 @@ final class UnityDJProgramBridge {
             // Preferences holds UserDefaults, not model/persona values. Read them
             // when each request starts so saved settings affect the next plan.
             let agent = try CodexTrackRankingAgent.live(preferences: preferences)
-            let hour = Calendar.current.component(.hour, from: Date())
-            let tags = hour < 6 ? ["深夜", "松弛", "陪伴"] : hour < 11 ? ["清晨", "清醒", "明亮"] : hour < 18 ? ["白天", "专注", "流动"] : ["夜晚", "放松", "氛围"]
-            let arc: [Double] = hour < 6 ? [0.2, 0.35, 0.25] : hour < 11 ? [0.35, 0.65, 0.55] : hour < 18 ? [0.45, 0.7, 0.55] : [0.4, 0.7, 0.35]
-            return try await runtime.makeProgramPlan(brief: ProgramBrief(id: "program-\(UUID().uuidString)", targetDuration: 1_800, moodTags: tags, energyArc: arc, conversationMode: .ambient, immediateUserInstruction: instruction), agent: agent)
+            let brief = try await runtime.dailyProgramBrief(instruction: instruction)
+            return try await runtime.makeProgramPlan(brief: brief, agent: agent)
         }
     }
 
@@ -155,16 +150,16 @@ final class UnityDJProgramBridge {
                 if insertion, ownsPlayback, let current = store.plan, let index = store.activeSlotIndex {
                     let playedIDs = Set(current.slots.prefix(index + 1).map { $0.track.id })
                     guard proposal.slots.contains(where: { !playedIDs.contains($0.track.id) }) else { throw Failure.noNewTrack }
-                    let revised = DJProgramEditor.revise(current: current, activeSlotIndex: index, proposal: proposal, mode: .insertNext)
+                    let revised = try await store.revise(activeSlotIndex: index, proposal: proposal, mode: .insertNext)
                     try await hooks.replaceUpcoming(revised, index)
                     try Task.checkCancellation()
                     guard !closed, requestID == id else { return }
-                    store.publish(revised)
-                    store.activateSlot(at: index)
+                    try await store.publish(revised)
+                    try await store.activateSlot(at: index)
                     try await store.flush()
                     await hooks.notify("后台插播完成，歌曲已排在当前歌曲之后；当前播放未切换。用户要求：\(instruction)")
                 } else {
-                    store.publishDraft(proposal)
+                    try await store.publishDraft(proposal)
                     try await store.flush()
                     await hooks.notify("后台节目已准备好：\(proposal.title ?? "新节目")，共 \(proposal.slots.count) 首。请告知用户并等待确认后调用 activate_prepared_program；此刻不要切换。用户要求：\(instruction)")
                 }
@@ -190,12 +185,12 @@ final class UnityDJProgramBridge {
         requestID = nil
         let index = try await hooks.activate(proposal)
         guard !closed else { throw Failure.closed }
-        store.publish(proposal)
-        store.activateSlot(at: index)
+        try await store.publish(proposal)
+        try await store.activateSlot(at: index)
         try await store.flush()
         ownsPlayback = true
     }
-    func activateSlot(at index: Int) { store.activateSlot(at: index) }
+    func activateSlot(at index: Int) async throws { try await store.activateSlot(at: index) }
     func refreshHistory() async throws -> [String: Any] {
         try await store.refreshRecentPrograms()
         return historySnapshot

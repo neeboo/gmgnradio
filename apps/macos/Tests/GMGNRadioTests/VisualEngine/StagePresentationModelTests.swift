@@ -423,8 +423,13 @@ func lyricSceneKeepsTheCurrentLineClearAndNeighborsInDepth() {
     #expect(scene.lines[2].depth < scene.lines[1].depth)
 }
 
-@Test
-func automaticLyricDirectorKeepsOneThemeForTheWholeTrack() {
+@Test @MainActor
+func automaticLyricDirectorKeepsOneThemeForTheWholeTrack() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(fixture) {} }
+    let settings = RustProductSettingsClient(root: fixture.root)
+    let store = StageLyricsStore(settings: settings)
+    try await store.waitForAuthority()
     let lines = (0 ..< 16).map { index in
         StageLyricLine(
             id: "line-\(index)",
@@ -433,17 +438,20 @@ func automaticLyricDirectorKeepsOneThemeForTheWholeTrack() {
             text: "第 \(index) 句"
         )
     }
+    let lrc = lines.enumerated().map { index, line in
+        String(format: "[%02d:%02d.00]%@", index * 4 / 60, index * 4 % 60, line.text)
+    }.joined(separator: "\n")
+    store.publish(MusicLyrics(original: lrc, translation: nil), trackID: "night-radio")
+    try await store.waitForAuthority()
+    let revision = settings.confirmed?.revision
     let modes = [1.0, 17.0, 33.0, 49.0].map { time in
-        StageLyricModeDirector.resolve(
-            configuredMode: .automatic,
-            trackID: "night-radio",
-            lines: lines,
-            playbackTime: time
-        )
+        _ = StageLyricSceneModel(lines: store.lines, playbackTime: time)
+        return store.resolvedVisualMode
     }
 
     #expect(Set(modes).count == 1)
     #expect(!modes.contains(.automatic))
+    #expect(settings.confirmed?.revision == revision)
 }
 
 @Test

@@ -105,7 +105,7 @@ pub fn publish(transaction: &Transaction<'_>, message: &NewMessage) -> Result<Me
             code: "invalid_message_payload",
         });
     }
-    let payload = serde_json::to_string(&message.payload).map_err(|_| MessageError {
+    let payload = crate::canonical_json::to_string(&message.payload).map_err(|_| MessageError {
         code: "invalid_message_payload",
     })?;
     if payload.len() > 64 * 1024 {

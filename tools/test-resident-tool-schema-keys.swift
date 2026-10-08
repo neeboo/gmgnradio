@@ -488,7 +488,7 @@ let compiledSources = ["ResidentSteeringDelivery", "ResidentAgentLoop", "Residen
                        "ResidentStateClient", "ResidentLoopTools"]
     .map { agentDir.appendingPathComponent("\($0).swift").path }
 compiler.arguments = ["-j1", "-swift-version", "6", "-parse-as-library"]
-    + compiledSources + [probeURL.path, "-o", executable.path]
+    + compiledSources + ["apps/macos/Sources/GMGNRadio/Presence/RustResidentSchedulerClient.swift", probeURL.path, "-o", executable.path]
 do {
     try compiler.run()
     compiler.waitUntilExit()

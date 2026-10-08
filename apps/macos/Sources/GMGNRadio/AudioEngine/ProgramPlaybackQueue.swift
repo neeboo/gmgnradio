@@ -87,193 +87,100 @@ struct SavedProgramPlaybackRestorer {
 
 @MainActor
 final class ProgramPlaybackQueue {
-    private let logger = Logger(
-        subsystem: "ai.gmgn.radio",
-        category: "program-playback"
-    )
+    private struct Entry: Decodable { let slot: ProgramSlot; let resourceHandle: String }
+    private struct State: Decodable {
+        let generation: UInt64
+        let current: Entry?
+        let locked: [Entry]
+        let reserve: [ProgramSlot]
+        let failedTrackIDs: [String]
+        let history: [Entry]
+    }
+    private struct Ticket: Decodable { let ticketID: String; let generation: UInt64; let slot: ProgramSlot; let kind: String }
+    private struct Reply: Decodable { let state: State; let ticket: Ticket?; let selected: Entry? }
     private let preflight: PlaybackPreflight
     private let lockedCapacity: Int
-
+    private let call: RustMusicProgramClient.Call
+    private let queueID = UUID().uuidString
+    private let hostSessionID = UUID().uuidString
+    private var generation: UInt64 = 0
+    private var resources: [String: PreparedProgramPlayback] = [:]
     private(set) var current: PreparedProgramPlayback?
     private(set) var locked: [PreparedProgramPlayback] = []
     private(set) var reserve: [ProgramSlot] = []
     private(set) var failedTrackIDs: [String] = []
     private(set) var history: [PreparedProgramPlayback] = []
-
-    var canReturnToPrevious: Bool {
-        !history.isEmpty
+    var canReturnToPrevious: Bool { !history.isEmpty }
+    var canAdvance: Bool { !locked.isEmpty || !reserve.isEmpty }
+    init(preflight: PlaybackPreflight, lockedCapacity: Int = 2, call: RustMusicProgramClient.Call? = nil) {
+        self.preflight = preflight; self.lockedCapacity = max(0, lockedCapacity)
+        let daemon = PropTaskDaemonClient()
+        self.call = call ?? { try await daemon.call(method: $0, params: $1) }
     }
-
-    var canAdvance: Bool {
-        !locked.isEmpty || !reserve.isEmpty
-    }
-
-    init(
-        preflight: PlaybackPreflight,
-        lockedCapacity: Int = 2
-    ) {
-        self.preflight = preflight
-        self.lockedCapacity = max(0, lockedCapacity)
-    }
-
-    func load(
-        _ plan: ProgramPlan,
-        startingAt requestedIndex: Int = 0
-    ) async throws {
-        let startingIndex = plan.slots.isEmpty
-            ? 0
-            : min(max(requestedIndex, 0), plan.slots.count - 1)
-        current = nil
-        locked = []
-        reserve = Array(plan.slots.dropFirst(startingIndex))
-        failedTrackIDs = []
-        history = []
-
-        logger.info(
-            "加载节目队列：program=\(plan.brief.id, privacy: .public)，requestedIndex=\(requestedIndex)，startingIndex=\(startingIndex)，slots=\(plan.slots.count)"
-        )
-        await fillPreparedWindow()
-        guard current != nil else {
-            logger.error(
-                "节目队列加载失败：failed=\(self.failedTrackIDs.joined(separator: ","), privacy: .public)"
-            )
-            throw ProgramPlaybackQueueError.noPlayableSlots(
-                failedTrackIDs: failedTrackIDs
-            )
-        }
-    }
-
-    func select(
-        _ plan: ProgramPlan,
-        at requestedIndex: Int
-    ) async throws {
-        guard !plan.slots.isEmpty else {
-            throw ProgramPlaybackQueueError.noPlayableSlots(
-                failedTrackIDs: []
-            )
-        }
-        let selectedIndex = min(
-            max(requestedIndex, 0),
-            plan.slots.count - 1
-        )
-        let selectedSlot = plan.slots[selectedIndex]
-        logger.info(
-            "选择歌曲：index=\(selectedIndex)，track=\(selectedSlot.track.id, privacy: .public)，title=\(selectedSlot.track.title, privacy: .public)"
-        )
-        let preparedByTrackID = (
-            [current].compactMap { $0 }
-                + locked
-                + history
-        ).reduce(into: [String: PreparedProgramPlayback]()) {
-            result, prepared in
-            result[prepared.slot.track.id] = prepared
-        }
-
-        let selected: PreparedProgramPlayback
-        do {
-            selected = if
-                let prepared = preparedByTrackID[selectedSlot.track.id]
-            {
-                prepared
-            } else {
-                try await preflight.prepare(selectedSlot)
+    private func request(_ op: String, _ input: [String: PropTaskJSON] = [:]) async throws -> Reply {
+        var params = input
+        params["op"] = .string(op); params["queueID"] = .string(queueID)
+        params["hostSessionID"] = .string(hostSessionID); params["generation"] = .number(Double(generation))
+        let result = try await call("music_program_playback_command", params)
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let reply = try decoder.decode(Reply.self, from: JSONEncoder().encode(result))
+        func prepared(_ entry: Entry) throws -> PreparedProgramPlayback {
+            guard let value = resources[entry.resourceHandle], value.slot.track.id == entry.slot.track.id else {
+                throw PropTaskDaemonError.invalidFrame
             }
-        } catch {
-            logger.error(
-                "选择歌曲预检失败：track=\(selectedSlot.track.id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
-            )
-            throw error
+            return value
         }
-
-        let remainingSlots = Array(
-            plan.slots.dropFirst(selectedIndex + 1)
-        )
-        let preparedUpcoming = remainingSlots.compactMap {
-            preparedByTrackID[$0.track.id]
-        }
-        current = selected
-        locked = Array(preparedUpcoming.prefix(lockedCapacity))
-        let lockedTrackIDs = Set(locked.map(\.slot.track.id))
-        reserve = remainingSlots.filter {
-            !lockedTrackIDs.contains($0.track.id)
-        }
-        failedTrackIDs = []
-        history = []
-        logger.info(
-            "选择歌曲完成：current=\(self.current?.slot.track.id ?? "nil", privacy: .public)，locked=\(self.locked.map(\.slot.track.id).joined(separator: ","), privacy: .public)，reserve=\(self.reserve.count)"
-        )
+        let projectedCurrent = try reply.state.current.map(prepared)
+        let projectedLocked = try reply.state.locked.map(prepared)
+        let projectedHistory = try reply.state.history.map(prepared)
+        generation = reply.state.generation; current = projectedCurrent
+        locked = projectedLocked; history = projectedHistory
+        reserve = reply.state.reserve; failedTrackIDs = reply.state.failedTrackIDs
+        let liveHandles = Set(([reply.state.current].compactMap { $0 } + reply.state.locked + reply.state.history).map(\.resourceHandle))
+        resources = resources.filter { liveHandles.contains($0.key) }
+        return reply
     }
-
-    func replaceUpcoming(with slots: [ProgramSlot]) async {
-        locked = []
-        reserve = slots
-        failedTrackIDs = []
-        await fillPreparedWindow()
-    }
-
-    @discardableResult
-    func advanceAfterCompletion() async -> PreparedProgramPlayback? {
-        if let current {
-            history.append(current)
-        }
-        current = locked.isEmpty ? nil : locked.removeFirst()
-        await fillPreparedWindow()
-        return current
-    }
-
-    @discardableResult
-    func returnToPrevious() -> PreparedProgramPlayback? {
-        guard let previous = history.popLast() else {
-            return nil
-        }
-        if let current {
-            locked.insert(current, at: 0)
-        }
-        current = previous
-        return previous
-    }
-
-    @discardableResult
-    func replaceCurrentAfterFailure() async -> PreparedProgramPlayback? {
-        if let failedID = current?.slot.track.id {
-            failedTrackIDs.append(failedID)
-        }
-        current = locked.isEmpty ? nil : locked.removeFirst()
-        logger.info(
-            "替换失败歌曲：current=\(self.current?.slot.track.id ?? "nil", privacy: .public)，failed=\(self.failedTrackIDs.joined(separator: ","), privacy: .public)"
-        )
-        await fillPreparedWindow()
-        return current
-    }
-
-    private func fillPreparedWindow() async {
-        while needsPreparedSlot, !reserve.isEmpty {
-            let slot = reserve.removeFirst()
-            logger.info(
-                "开始预检：track=\(slot.track.id, privacy: .public)，title=\(slot.track.title, privacy: .public)，provider=\(slot.track.providerID.rawValue, privacy: .public)"
-            )
+    private func execute(_ reply: Reply) async throws {
+        var next = reply.ticket
+        while let ticket = next {
+            let prepared: PreparedProgramPlayback
+            do { prepared = try await preflight.prepare(ticket.slot) }
+            catch {
+                let result = try await request("prepare_receipt", ["ticketID": .string(ticket.ticketID),
+                    "trackID": .string(ticket.slot.track.id), "accepted": .bool(false)])
+                if ticket.kind == "select" { throw error }
+                next = result.ticket
+                continue
+            }
+            let handle = UUID().uuidString; resources[handle] = prepared
             do {
-                let prepared = try await preflight.prepare(slot)
-                if current == nil {
-                    current = prepared
-                } else {
-                    locked.append(prepared)
-                }
-                logger.info(
-                    "预检完成：track=\(slot.track.id, privacy: .public)，target=\(String(describing: prepared.target), privacy: .public)，current=\(self.current?.slot.track.id ?? "nil", privacy: .public)"
-                )
-            } catch {
-                failedTrackIDs.append(slot.track.id)
-                let reason = (error as? any LocalizedError)?
-                    .errorDescription ?? String(reflecting: type(of: error))
-                logger.error(
-                    "预检失败：\(slot.track.id, privacy: .public)，\(reason, privacy: .public)"
-                )
-            }
+                next = try await request("prepare_receipt", ["ticketID": .string(ticket.ticketID),
+                    "trackID": .string(ticket.slot.track.id), "resourceHandle": .string(handle),
+                    "accepted": .bool(true)]).ticket
+            } catch { resources.removeValue(forKey: handle); throw error }
         }
     }
-
-    private var needsPreparedSlot: Bool {
-        current == nil || locked.count < lockedCapacity
+    func load(_ plan: ProgramPlan, startingAt requestedIndex: Int = 0) async throws {
+        try await execute(request("load", ["programID": .string(plan.brief.id),
+            "programRevision": .number(Double(plan.revision)),
+            "startingIndex": .number(Double(requestedIndex)), "lockedCapacity": .number(Double(lockedCapacity))]))
+        guard current != nil else { throw ProgramPlaybackQueueError.noPlayableSlots(failedTrackIDs: failedTrackIDs) }
+    }
+    func select(_ plan: ProgramPlan, at requestedIndex: Int) async throws {
+        guard !plan.slots.isEmpty else { throw ProgramPlaybackQueueError.noPlayableSlots(failedTrackIDs: []) }
+        try await execute(request("select", ["programID": .string(plan.brief.id), "programRevision": .number(Double(plan.revision)), "startingIndex": .number(Double(requestedIndex))]))
+    }
+    func replaceUpcoming(programID: String, programRevision: Int, startingAt index: Int) async throws {
+        try await execute(request("replace_upcoming", ["programID": .string(programID), "programRevision": .number(Double(programRevision)), "startingIndex": .number(Double(index))]))
+    }
+    @discardableResult func advanceAfterCompletion() async throws -> PreparedProgramPlayback? {
+        try await execute(request("advance")); return current
+    }
+    @discardableResult func returnToPrevious() async throws -> PreparedProgramPlayback? {
+        let reply = try await request("previous")
+        return reply.selected == nil ? nil : current
+    }
+    @discardableResult func replaceCurrentAfterFailure() async throws -> PreparedProgramPlayback? {
+        try await execute(request("current_failed")); return current
     }
 }

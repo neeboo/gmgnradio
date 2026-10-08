@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import SwiftUI
 
 /// GPUI owns NSApplication's delegate and run loop. This object retains the
 /// original product runtime and forwards lifecycle; no probe stores or agent
@@ -11,7 +10,6 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
     private var started = false
     private var stopped = false
     private var statusItem: NSStatusItem?
-    private var settingsWindow: NSWindow?
     private var submissions: [UUID: UInt64] = [:]
     private var completed: Set<UUID> = []
     private var cancelledRequests: Set<UInt64> = []
@@ -75,38 +73,30 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         runtime.gpuiResidentRecovery = nil
         runtime.gpuiOpenSettings = nil
         NotificationCenter.default.removeObserver(runtime)
-        settingsWindow?.close()
-        settingsWindow = nil
         if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
         statusItem = nil
     }
 
     func send(requestID: UInt64, text: String, attachmentIDs: [String]? = nil) -> Bool {
-        guard started, !stopped, !submissions.values.contains(requestID) else { return false }
+        guard started, !stopped, tasks[requestID] == nil, !submissions.values.contains(requestID) else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let submission: ResidentChatSubmission
-        if let attachmentIDs {
-            guard let built = runtime.gpuiBuildSubmission(text: trimmed, attachmentIDs: attachmentIDs) else { return false }
-            submission = built
-        } else { submission = ResidentChatSubmission(text: trimmed) }
-        guard submission.canSend else { return false }
-        submissions[submission.id] = requestID
-        observedScope = runtime.gpuiChatSnapshot()["scope"] as? String
-        latestRequestID = requestID
-        draft = ""
-        statusNotice = nil
-        enqueue(["requestID": requestID, "kind": "accepted", "text": submission.text])
         tasks[requestID] = Task { [weak self] in
             guard let self else { return }
-            guard !stopped, !Task.isCancelled else {
-                runtime.gpuiRestoreAttachments(submission.attachments)
+            defer { tasks[requestID] = nil }
+            guard !stopped, !Task.isCancelled else {return}
+            guard let submission = await runtime.gpuiBuildSubmission(text:trimmed,attachmentIDs:attachmentIDs ?? []) else {
+                enqueue(["requestID":requestID,"kind":"failure","message":"图片草稿已变化或登记未完成，请重试。"])
                 return
             }
-            defer { tasks[requestID] = nil }
+            guard !stopped, !Task.isCancelled else {await runtime.gpuiRestoreSubmission(submission);return}
+            submissions[submission.id] = requestID
+            observedScope = runtime.gpuiChatSnapshot()["scope"] as? String
+            latestRequestID = requestID;draft = "";statusNotice = nil
+            enqueue(["requestID":requestID,"kind":"accepted","text":submission.text])
             do {
                 try await runtime.gpuiSubmit(submission)
             } catch {
-                runtime.gpuiRestoreAttachments(submission.attachments)
+                await runtime.gpuiRestoreSubmission(submission)
                 guard !stopped, !completed.contains(submission.id) else { return }
                 completed.insert(submission.id)
                 draft = submission.text
@@ -186,6 +176,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         state["boundVideoPrompt"] = runtime.gpuiBoundVideoPromptSnapshot() as Any? ?? NSNull()
         state["liveCamPlayerMenu"] = runtime.gpuiLiveCamPlayerMenuSnapshot()
         state["propEditor"] = runtime.gpuiPropSnapshot()
+        state["errorNotice"] = runtime.gpuiErrorNoticeSnapshot() as Any? ?? NSNull()
         let autonomy = runtime.gpuiAutonomySnapshot()
         state["autonomy"] = autonomy
         if let stopped = autonomy["stopped"] as? Bool { state["autonomyStopped"] = stopped }
@@ -313,8 +304,9 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         case "chat.focus": runtime.gpuiChatFocus(); return true
         case "chat.task.stop": return runtime.gpuiPerformAction("stopResident")
         case "inbox.open":
-            guard let id = value["id"] as? String, let scope = value["scope"] as? String else { return false }
-            return runtime.gpuiOpenInboxEntry(id: id, scope: scope)
+            guard let id = value["id"] as? String, let scope = value["scope"] as? String,
+                  let event = value["expectedEventID"] as? String else { return false }
+            return runtime.gpuiOpenInboxEntry(id: id, scope: scope, expectedEventID: event)
         case "inbox.restore": runtime.gpuiRestoreInbox(); return true
         default: break
         }
@@ -355,30 +347,6 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
         else { _ = action(name) }
     }
 
-    private func showSettings() {
-        if let settingsWindow {
-            settingsWindow.makeKeyAndOrderFront(nil)
-            NSApplication.shared.activate(ignoringOtherApps: true)
-            return
-        }
-        let root = GMGNSettingsView(shortcutSettings: runtime.shortcutSettingsStore,
-            connectRealtimeVoice: { [weak runtime] in runtime?.connectRealtimeVoice($0) },
-            disconnectRealtimeVoice: { [weak runtime] in runtime?.disconnectRealtimeVoice() },
-            agentConfigurationChanged: { [weak runtime] in runtime?.refreshAgentConfiguration() })
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                              backing: .buffered, defer: false)
-        window.title = "设置"
-        window.identifier = NSUserInterfaceItemIdentifier("gmgn.settings")
-        window.contentView = NSHostingView(rootView: root)
-        window.contentMinSize = NSSize(width: 540, height: 440)
-        window.isReleasedWhenClosed = false
-        settingsWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
-    }
-
     private func enqueue(_ event: [String: Any]) {
         events.append(event)
         if events.count > 128 { events.removeFirst(events.count - 128) }
@@ -390,7 +358,7 @@ final class GPUIProductHost: NSObject, NSMenuDelegate {
 @MainActor
 private final class GPUIProductSettings {
     private let runtime: AppDelegate
-    private let agent = AgentSettingsModel(microphoneDevices: [], defaultMicrophoneDeviceID: nil)
+    private let agent = AgentSettingsModel()
     private let speech = RustSpeechPreferences(defaults: E2ERuntime.defaults)
     private let client = RustVoiceClient(root: E2ERuntime.productSupportDirectory()
         .appendingPathComponent("TaskService", isDirectory: true))
@@ -444,7 +412,7 @@ private final class GPUIProductSettings {
                 "hostPrompt": dj.hostPrompt(),
                 "takeoverEnabled": dj.takeoverEnabled(),
                 "planningModel": dj.planningModel() ?? "",
-                "autonomyEnabled": UserDefaults.standard.object(forKey: ResidentAutonomySwitch.defaultsKey) as? Bool ?? true,
+                "autonomyEnabled": RustProductSettingsClient.shared.confirmed?.values.autonomyEnabled ?? false,
                 "backgroundTurnsPerHour": resident.backgroundTurnsPerHour,
                 "budgetOptions": Array(0...ResidentPreferences.maximumBackgroundTurnsPerHour),
                 "autoSpeak": service.preferenceStore.autoSpeakReplies,
@@ -516,9 +484,10 @@ private final class GPUIProductSettings {
             let chosen = value["modelID"] as? String ?? old.model ?? caps.defaultASRModel ?? ""
             guard caps.asrModels.contains(where: { $0.id == chosen }) else { return false }
             let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            speech.save(RustVoiceConfiguration(provider: selected, apiKey: replacement.isEmpty ? old.apiKey : replacement,
-                voiceID: old.voiceID, model: chosen), for: "asr")
-            asrDraftProvider = selected
+            let configuration = RustVoiceConfiguration(provider: selected, apiKey: replacement.isEmpty ? old.apiKey : replacement,
+                voiceID: old.voiceID, model: chosen)
+            Task { do { try await speech.save(configuration, for: "asr"); asrDraftProvider = selected }
+                catch { notice = "设置未保存，请检查后台连接。" } }
         case "agent.save":
             // Use the original model validation/persistence and notify the
             // original runtime. No credentials, provider or login override.
@@ -537,7 +506,11 @@ private final class GPUIProductSettings {
             if let enabled = value["autoSpeak"] as? Bool { agent.setAutoSpeakAgentReplies(enabled) }
             if let budget = value["backgroundTurnsPerHour"] as? Int { _ = agent.saveBackgroundTurnsPerHour(budget) }
             if let enabled = value["autonomyEnabled"] as? Bool {
-                UserDefaults.standard.set(enabled, forKey: "resident.autonomous.enabled.v1")
+                Task { do {
+                    _ = try await RustProductSettingsClient.shared.apply(["autonomyEnabled": enabled])
+                    NotificationCenter.default.post(name: ResidentAutonomySwitch.didChangeNotification, object: nil)
+                    runtime.refreshAgentConfiguration()
+                } catch { notice = "自主设置未保存，请检查后台连接。" } }
             }
             NotificationCenter.default.post(name: Notification.Name("gmgnResidentAutonomyChanged"), object: nil)
             runtime.refreshAgentConfiguration()
@@ -565,9 +538,10 @@ private final class GPUIProductSettings {
             if op == "tts.save" {
                 let savedKey = speech.configuration(provider: provider, for: "tts", includesEnvironment: false).apiKey
                 let replacement = (value["apiKey"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                speech.save(RustVoiceConfiguration(provider: provider, apiKey: replacement.isEmpty ? savedKey : replacement,
-                    voiceID: voiceID, model: model), for: "tts")
-                notice = "已保存。"
+                let savedConfiguration = RustVoiceConfiguration(provider: provider, apiKey: replacement.isEmpty ? savedKey : replacement,
+                    voiceID: voiceID, model: model)
+                Task { do { try await speech.save(savedConfiguration, for: "tts"); notice = "已保存。" }
+                    catch { notice = "设置未保存，请检查后台连接。" } }
             } else {
                 let synthesizer = RustSpeechSynthesizer(configuration: { configuration },
                     statusStore: previewStatus, client: client)
@@ -687,8 +661,10 @@ private func withProductHost<T: Sendable>(_ pointer: UnsafeMutableRawPointer?, _
 public func gmgnProductHostCreate() -> UnsafeMutableRawPointer? {
     guard Thread.isMainThread else { return nil }
     E2ERuntime.bootstrap()
-    ResidentAutonomySwitch.registerDefaults()
-    let address = MainActor.assumeIsolated { UInt(bitPattern: Unmanaged.passRetained(GPUIProductHost()).toOpaque()) }
+    let address = MainActor.assumeIsolated {
+        ResidentAutonomySwitch.registerDefaults()
+        return UInt(bitPattern: Unmanaged.passRetained(GPUIProductHost()).toOpaque())
+    }
     return UnsafeMutableRawPointer(bitPattern: address)
 }
 

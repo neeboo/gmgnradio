@@ -135,6 +135,9 @@ namespace GMGN.UnityPlayer
 
         void Update()
         {
+            if (GetComponent<GPUIChat2Probe>()?.BlocksWorldInput == true) {
+                keyboardGate.Suspend(); dragging = false; return;
+            }
             if (!active || !Application.isFocused || view == null || Mouse.current == null) {
                 keyboardGate.Suspend(); dragging = false; return;
             }
@@ -197,8 +200,7 @@ namespace GMGN.UnityPlayer
             if (textFocused) return true;
             var point = RuntimePanelUtils.ScreenToPanel(root.panel, new Vector2(screen.x, Screen.height - screen.y));
             for (var hit = root.panel.Pick(point); hit != null; hit = hit.parent)
-                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView || hit is ListView ||
-                    hit.name == "chatPanel" || hit.name == "inboxPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) return true;
+                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView || hit is ListView) return true;
             return false;
         }
     }

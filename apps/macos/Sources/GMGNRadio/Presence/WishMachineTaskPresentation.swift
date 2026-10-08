@@ -236,9 +236,8 @@ enum ResidentConnectivityFact {
 enum ResidentAutonomySwitch {
     static let defaultsKey = "resident.autonomous.enabled.v1"
     static let didChangeNotification = Notification.Name("gmgnResidentAutonomyChanged")
-    static func registerDefaults(in defaults: UserDefaults = .standard) {
-        // Registration never overwrites a persisted explicit user choice.
-        defaults.register(defaults: [defaultsKey: true])
+    @MainActor static func registerDefaults(in defaults: UserDefaults = .standard) {
+        RustProductSettingsClient.shared.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
     }
 }
 
@@ -341,6 +340,12 @@ extension WishMachineTaskPresentation {
 
 @MainActor
 final class WishMachineTaskPresentationStore: ObservableObject {
+    private let productSettings: RustProductSettingsClient
+    init(productSettings: RustProductSettingsClient? = nil, legacyDefaults: UserDefaults = .standard) {
+        let settings = productSettings ?? .shared
+        self.productSettings = settings
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(legacyDefaults))
+    }
     @Published private(set) var tasks: [WishMachineTaskPresentation] = []
     /// 全局连通性提示：连不上后台的可读原因。`nil` 表示连通正常（横幅不显示）。
     @Published private(set) var connectivityNotice: String?
@@ -372,7 +377,7 @@ final class WishMachineTaskPresentationStore: ObservableObject {
     /// 全局开关的当前值。直接读设置里那**一个**键，不另存一份状态；
     /// 呈现侧每秒重算，所以设置里改一下这里一秒内跟上。
     var isAutonomySwitchOn: Bool {
-        UserDefaults.standard.object(forKey: ResidentAutonomySwitch.defaultsKey) as? Bool ?? true
+        productSettings.confirmed?.values.autonomyEnabled ?? false
     }
 
     /// 宿主推来的权威连通性事实（后台连不上时的可读原因）。这是**一条全局提示**。
@@ -415,7 +420,16 @@ final class WishMachineTaskPresentationStore: ObservableObject {
     ///
     /// 做不成时 `autonomyResumeFailure` 一定有话说 —— 不允许"点了没反应"。
     func resumeAutonomy() {
-        UserDefaults.standard.set(true, forKey: ResidentAutonomySwitch.defaultsKey)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await productSettings.apply(["autonomyEnabled": true])
+                resumeConfirmedAutonomy()
+            } catch { autonomyResumeFailure = "自主设置未保存，请检查后台连接。" }
+        }
+    }
+    func reportAutonomySettingsFailure(_ message: String?) { autonomyResumeFailure = message }
+    private func resumeConfirmedAutonomy() {
         // 复用设置里那条既有通知：宿主据此解除 run 级停止并热更新后台预算。
         NotificationCenter.default.post(name: ResidentAutonomySwitch.didChangeNotification, object: nil)
         let paused = tasks.filter(\.autoContinuationPaused)

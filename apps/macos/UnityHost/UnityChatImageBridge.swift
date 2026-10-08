@@ -34,12 +34,13 @@ final class UnityChatImageBridge {
     private var thumbnailCache: [UUID: String] = [:]
 
     init(directory: URL,
+         authority: RustChatAttachmentClient? = nil,
          pasteboard: @escaping @MainActor () -> NSPasteboard = { .general },
          parentWindow: @escaping @MainActor () -> NSWindow? = { UnityWindowModeBridge.shared.targetWindow },
          prepare: @escaping @Sendable (URL) async throws -> Data = { try await PropImagePreparation.prepare(url: $0) }) {
         self.pasteboard = pasteboard
         self.parentWindow = parentWindow
-        store = ResidentAttachmentStore(directory: directory, prepare: prepare)
+        store = ResidentAttachmentStore(directory:directory,authority:authority,prepare:prepare)
         store.onChange = { [weak self] in
             guard let self else { return }
             generation &+= 1
@@ -148,7 +149,7 @@ final class UnityChatImageBridge {
         case "chat.attachments.remove":
             guard let raw = value["id"] as? String, let id = UUID(uuidString: raw),
                   store.attachments.contains(where: { $0.id == id }) else { return false }
-            store.remove(id: id)
+            prepareDraft {await $0.remove(id:id)}
         default: return false
         }
         return true
@@ -185,25 +186,28 @@ final class UnityChatImageBridge {
 
     /// Host calls this only for the current human chat.send command. The UI sends
     /// IDs and a revision, never arbitrary paths or user-directory access.
-    func takeSubmission(text: String, attachmentIDs: [String], generation expected: UInt64) throws -> ResidentChatSubmission {
+    func takeSubmission(text: String, attachmentIDs: [String], generation expected: UInt64) async throws -> ResidentChatSubmission {
         guard !closed else { throw ImageError.closed }
         guard !isBusy else { throw busyError }
         guard expected == generation, attachmentIDs == store.attachments.map({ $0.id.uuidString }) else { throw ImageError.staleDraft }
-        let submission = ResidentChatSubmission(text: text, attachments: store.attachments)
-        guard store.canSubmit, submission.canSend else { throw ImageError.emptySubmission }
-        _ = store.takeAttachments()
+        guard store.canSubmit, !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || !store.attachments.isEmpty else {throw ImageError.emptySubmission}
+        let submission = try await store.takeSubmission(text:text)
+        guard !closed else {await store.finishSubmission(id:submission.id,state:"cancelled");throw ImageError.closed}
         issued[submission.id] = submission
         return submission
     }
     /// Failed current submissions can recover only images actually issued here.
     @discardableResult
-    func restoreSubmission(_ submission: ResidentChatSubmission) -> Bool {
+    func restoreSubmission(_ submission: ResidentChatSubmission) async -> Bool {
         guard !closed, let own = issued[submission.id], own == submission else { return false }
+        guard await store.restoreSubmission(own) else {return false}
         issued.removeValue(forKey: submission.id)
-        store.restore(own.attachments)
         return true
     }
-    func finishSubmission(id: UUID) { issued.removeValue(forKey: id) }
+    func finishSubmission(id: UUID) async {
+        await store.finishSubmission(id:id)
+        issued.removeValue(forKey:id)
+    }
     func close() {
         guard !closed else { return }
         closed = true; cancelPicker()
@@ -233,7 +237,6 @@ final class UnityChatImageBridge {
     private func discardUnsentDraft() {
         guard !cleaningClosedStore else { return }
         cleaningClosedStore = true
-        for image in store.attachments { store.remove(id: image.id) }
-        cleaningClosedStore = false
+        Task { [self] in await store.close();cleaningClosedStore = false }
     }
 }

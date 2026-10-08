@@ -4,6 +4,38 @@ import Foundation
 /// Transport-provided IDs identify calls only; they cannot select a different world.
 @MainActor
 final class ResidentWorldToolSession {
+    /// Set only by the trusted Rust ledger dispatcher, never from model arguments.
+    struct RustDispatchAuthority: Sendable {
+        let worldID: String
+        let residentScope: String
+        let hostSessionID: String
+        let runID: String
+        let callID: String
+        let operationID: String
+        let toolName: String
+    }
+    @TaskLocal static var rustDispatchAuthority: RustDispatchAuthority?
+    /// Supplied by the host's real request/intent step, never decoded from tool args.
+    /// decisionID remains stable across call IDs and world revisions for a retry.
+    struct HostBusinessDecision {
+        let scopeID: UUID
+        let worldID: String
+        let intentID: String
+        let decisionID: String
+        let factsRevision: UInt64
+    }
+    private struct RustBusinessKey: Hashable {
+        let intentID: String
+        let decisionID: String
+    }
+    private struct RustAuthorization {
+        let operationID: String
+        let identity: CallIdentity
+        var state: RustAuthorizationState = .authorized
+        var executionCallID: String?
+        var result: RealtimeDJToolResult?
+    }
+    private enum RustAuthorizationState { case authorized, inflight, completed, unknown }
     /// App-registered capabilities share the same world lease and call ledger.
     struct AdditionalTool {
         let name: String
@@ -46,6 +78,9 @@ final class ResidentWorldToolSession {
     private let additionalTools: [String: AdditionalTool]
     /// Nil uses the existing deadline and cancellation lease without a count cutoff.
     private let maximumCalls: Int?
+    private let rustOperationAuthority: (@MainActor (String, Data) -> HostBusinessDecision?)?
+    private var rustAuthorizations: [RustBusinessKey: RustAuthorization] = [:]
+    private var rustCallIdentities: [String: (RustBusinessKey, CallIdentity)] = [:]
     private var dispatchedCalls = 0
     private var registeredNames: Set<String> { Self.allowedToolNames.union(additionalTools.keys) }
     private var cancelled = false
@@ -68,7 +103,8 @@ final class ResidentWorldToolSession {
         afterDispatch: (@MainActor (String, Data, RealtimeDJToolResult) async -> RealtimeDJToolResult)? = nil,
         onCancel: (@MainActor () -> Void)? = nil,
         additionalTools: [AdditionalTool] = [],
-        maximumCalls: Int? = 64
+        maximumCalls: Int? = 64,
+        rustOperationAuthority: (@MainActor (String, Data) -> HostBusinessDecision?)? = nil
     ) {
         self.scopeID = scopeID
         self.worldID = worldID
@@ -80,6 +116,7 @@ final class ResidentWorldToolSession {
         self.afterDispatch = afterDispatch
         self.onCancel = onCancel
         self.maximumCalls = maximumCalls.map { max(0, $0) }
+        self.rustOperationAuthority = rustOperationAuthority
         var registered: [String: AdditionalTool] = [:]
         for tool in additionalTools where !Self.allowedToolNames.contains(tool.name) && registered[tool.name] == nil {
             guard tool.inputSchema["type"] as? String == "object",
@@ -109,6 +146,78 @@ final class ResidentWorldToolSession {
         cancelled = true
         onCancel?()
         for task in pending.values { task.cancel() }
+        for key in Array(rustAuthorizations.keys) where rustAuthorizations[key]?.state == .inflight {
+            rustAuthorizations[key]?.state = .unknown
+        }
+    }
+
+    /// Pure preflight; it does not dispatch or reserve an authorization from model IDs.
+    /// The injected authority must identify a host-owned intent/action step.
+    func authorizeRustOperation(callID: String, name: String, argumentsJSON: Data) -> String? {
+        guard rustLeaseIsValid, !callID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              callID.utf8.count <= 256, argumentsJSON.count <= 16_384, registeredNames.contains(name),
+              let arguments = validatedArguments(name: name, data: argumentsJSON),
+              let canonical = try? JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys]),
+              let decision = rustOperationAuthority?(name, canonical), decision.scopeID == scopeID,
+              decision.worldID == worldID, decision.factsRevision == dispatcher.context.snapshot.revision,
+              !decision.intentID.isEmpty, decision.intentID.utf8.count <= 256,
+              !decision.decisionID.isEmpty, decision.decisionID.utf8.count <= 256 else { return nil }
+        let key = RustBusinessKey(intentID: decision.intentID, decisionID: decision.decisionID)
+        let identity = CallIdentity(name: name, arguments: canonical)
+        if let old = identities[callID], old != identity { return nil }
+        if let old = rustCallIdentities[callID], old.0 != key || old.1 != identity { return nil }
+        if let grant = rustAuthorizations[key] {
+            guard grant.identity == identity, grant.state != .unknown else { return nil }
+            rustCallIdentities[callID] = (key, identity)
+            return grant.operationID
+        }
+        let reserved = rustAuthorizations.values.filter { $0.state == .authorized }.count
+        if let maximumCalls, dispatchedCalls + reserved >= maximumCalls { return nil }
+        // One nonce per trusted business decision, not per model call or revision.
+        let grant = RustAuthorization(operationID: UUID().uuidString, identity: identity)
+        rustAuthorizations[key] = grant
+        rustCallIdentities[callID] = (key, identity)
+        return grant.operationID
+    }
+
+    /// Trusted transport disconnection/cancellation report. No new grant is issued
+    /// for this business decision until the host has independently verified it.
+    func markRustOperationUnknown(operationID: String) {
+        guard let key = rustAuthorizations.first(where: { $0.value.operationID == operationID })?.key else { return }
+        rustAuthorizations[key]?.state = .unknown
+    }
+
+    /// Dispatch only a previously host-authorized operation. Alternate model call
+    /// IDs reuse the original execution/result rather than repeating a write.
+    func callRustOperation(operationID: String, callID: String, name: String, argumentsJSON: Data) async -> RealtimeDJToolResult {
+        guard rustLeaseIsValid, let binding = rustCallIdentities[callID],
+              var grant = rustAuthorizations[binding.0], grant.operationID == operationID,
+              grant.state != .unknown, let arguments = validatedArguments(name: name, data: argumentsJSON),
+              let canonical = try? JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys]),
+              grant.identity == CallIdentity(name: name, arguments: canonical) else {
+            return failure(callID, "rust_operation_not_authorized", "本次空间操作授权无效或结果待核验")
+        }
+        if let result = grant.result {
+            return RealtimeDJToolResult(callID: callID, resultJSON: result.resultJSON, isError: result.isError)
+        }
+        let executionID = grant.executionCallID ?? callID
+        grant.executionCallID = executionID
+        grant.state = .inflight
+        rustAuthorizations[binding.0] = grant
+        let result = await call(requestID: executionID, name: name, argumentsJSON: canonical)
+        guard rustLeaseIsValid, rustAuthorizations[binding.0]?.state != .unknown else {
+            rustAuthorizations[binding.0]?.state = .unknown
+            return failure(callID, "rust_operation_result_unknown", "操作结果待核验，请勿重复执行")
+        }
+        if rustAuthorizations[binding.0]?.state != .unknown {
+            rustAuthorizations[binding.0]?.state = result.isError ? .unknown : .completed
+            rustAuthorizations[binding.0]?.result = result
+        }
+        return RealtimeDJToolResult(callID: callID, resultJSON: result.resultJSON, isError: result.isError)
+    }
+
+    private var rustLeaseIsValid: Bool {
+        !cancelled && !Task.isCancelled && isCurrent() && dispatcher.context.snapshot.worldID == worldID && now() < deadline
     }
 
     func call(requestID: String, name: String, argumentsJSON: Data) async -> RealtimeDJToolResult {

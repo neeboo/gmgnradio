@@ -48,7 +48,7 @@ struct MarbleLivingCabinPresentation {
     let jukeboxPosition: SIMD3<Float>; let jukeboxYaw: Float; let sceneFraming: MarbleSceneFraming
 }
 struct BundledMarbleLivingCabin { let world: MarbleWorld; let presentation: MarbleLivingCabinPresentation; let splatURL: URL; let colliderURL: URL }
-enum LivingWorldBootstrapError: Error { case invalidMarbleCabin(String) }
+enum LivingWorldBootstrapError: Error { case invalidMarbleCabin(String), badCabin(String) }
 struct WorldCapsule {}
 protocol WorldCollisionQuerying: Sendable {
     func canOccupy(_ capsule: WorldCapsule, at position: SIMD3<Float>) -> Bool
@@ -125,10 +125,19 @@ check(!gate.consume(worldID: "w", activityID: "music.listen", startedAt: first, 
 check(!gate.consume(worldID: "w", activityID: "coffee.brew", startedAt: first, phase: "enter"), "other activity cannot start")
 check(gate.consume(worldID: "w", activityID: "music.listen", startedAt: first.addingTimeInterval(1), phase: "loop"), "new activity can play again")
 let valid = """
-{"world":{"id":"w"},"framing":{"origin":[0,-1,0],"scale":2,"minimum":[-4,-1,-4],"maximum":[4,3,4]},"camera":{"position":[0,2,4],"yaw":0,"pitch":-0.2},"jukebox":{"position":[2,0,-1],"yaw":1}}
+{"world":{"world_id":"w","display_name":"w","assets":{"mesh":{"collider_mesh_url":"https://fixture.invalid/collider.glb"},"splats":{"spz_urls":{"500k":"https://fixture.invalid/500.spz"},"semantics_metadata":{"metric_scale_factor":1,"ground_plane_offset":0}}}},"framing":{"origin":[0,-1,0],"scale":2,"minimum":[-4,-1,-4],"maximum":[4,3,4]},"camera":{"position":[0,2,4],"yaw":0,"pitch":-0.2},"jukebox":{"position":[2,0,-1],"yaw":1}}
 """
 let document = try JSONDecoder().decode(MarbleLivingCabinDocument.self, from: Data(valid.utf8))
 check(document.framing.scale == 2 && document.camera.position.value.y == 2, "explicit room scale and camera survive decoding")
+let published = try JSONDecoder().decode(MarbleLivingCabinDocument.self,
+    from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
+check(published.world.id == "84503420-3010-4944-8fde-2f383cd08ebe", "actual published cabin identity survives native asset codec")
+check(published.world.splatFallbacks.map(\.quality) == [.fiveHundredK], "published package binds only its explicit scene-500k resource without provider preference")
+check(published.world.semantics.metricScale == 1.2125813961029053 && published.world.semantics.groundPlaneOffset == 1.7368507385253906, "actual published semantic measurements survive native asset codec")
+do {
+    _ = try JSONDecoder().decode(MarbleLivingCabinDocument.self, from: Data(valid.replacingOccurrences(of: "\"500k\"", with: "\"100k\"").utf8))
+    check(false, "published fixed 500k resource cannot fall back to another provider quality")
+} catch { }
 try Data(valid.utf8).write(to: cabin.appendingPathComponent("marble.json"))
 let package = BundledLivingWorldPackage(manifest: Manifest(worldID: "w"), packageRoot: cabin)
 do {
@@ -139,7 +148,7 @@ try Data([1]).write(to: cabin.appendingPathComponent("scene-500k.spz"))
 try Data([2]).write(to: cabin.appendingPathComponent("collider.glb"))
 let adopted = try Bootstrap.loadMarbleCabin(package: package)!
 check(adopted.world.id == "w" && adopted.presentation.avatarPlacement.scale == 1, "same world ID and meter-scale avatar")
-check(document.world.colliderSourceCoordinates == .glTF, "ordinary API decoder keeps existing behavior")
+check(document.world.colliderSourceCoordinates == .glTF, "local asset metadata preserves its native initial coordinate convention")
 check(adopted.world.colliderSourceCoordinates == .worldLabsOpenCV, "adopted cabin loader explicitly aligns generated GLB with SPZ")
 let adoptedLibrary = Library()
 adoptedLibrary.adoptCachedWorld(adopted.world, splatURL: adopted.splatURL, colliderURL: adopted.colliderURL)
@@ -185,5 +194,5 @@ let program = temp.appendingPathComponent("main.swift")
 try harness.write(to: program, atomically: true, encoding: .utf8)
 let process = Process()
 process.executableURL = URL(fileURLWithPath: "/usr/bin/swift")
-process.arguments = [program.path]
+process.arguments = [program.path, root.appendingPathComponent("apps/macos/Resources/Worlds/marble-living-cabin/marble.json").path]
 try process.run(); process.waitUntilExit(); exit(process.terminationStatus)

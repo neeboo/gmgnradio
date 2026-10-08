@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		B20A5E000000000000000001 /* RustMusicProgramClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20A5E000000000000000002 /* RustMusicProgramClient.swift */; };
+		B20A5E000000000000000003 /* PrivateMusicAuthorityFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20A5E000000000000000004 /* PrivateMusicAuthorityFixture.swift */; };
 		00A6BDE2BE36617F32C7B3A2 /* AgentConversationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17A3DE66E68B4A0E15047818 /* AgentConversationServiceTests.swift */; };
 		0183599BCE0055F20464F7CA /* PropSupportGridPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C764576419E37F7B13BAB58 /* PropSupportGridPicker.swift */; };
 		018756CA17A750BBD061A454 /* YtDlpInvocation.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7B0728F06180B7DF166099 /* YtDlpInvocation.swift */; };
@@ -52,6 +54,8 @@
 		217C5077C6A607B1E7EC9802 /* ProgramPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = E012C530DC089221A1FE34C1 /* ProgramPlanner.swift */; };
 		219F0A54C0FAEC08711AEC73 /* WorldScreenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA93D02588A5BAF9CE9E4AD5 /* WorldScreenStore.swift */; };
 		2236962BAF9ACD7CF6087AA6 /* AgentSpeech.swift in Sources */ = {isa = PBXBuildFile; fileRef = F79B0FAAC220CE9FB6AC6D45 /* AgentSpeech.swift */; };
+		C5EEC4150000000000000001 /* RustSpeechDeliveryClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5EEC4150000000000000002 /* RustSpeechDeliveryClient.swift */; };
+		5C2EE5140000000000000001 /* RustScreenStateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C2EE5140000000000000002 /* RustScreenStateClient.swift */; };
 		229F4A7CA712429732A36EE1 /* WishMachineTaskMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0EFC3C3D2E65D62510E4F0D /* WishMachineTaskMessage.swift */; };
 		24121583DFD834F472556459 /* InterruptionCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B6117A1B853082CD0F65CBD /* InterruptionCoordinatorTests.swift */; };
 		251B4EF8A51EF72D0E814A37 /* LiveCamPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18FEBEBDF5BD28DA798CE26C /* LiveCamPanel.swift */; };
@@ -65,6 +69,23 @@
 		2BA9B1BEE7247E41156D4B53 /* CodexPlanningExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 977A9FD8072469DD8A215BC8 /* CodexPlanningExecutor.swift */; };
 		2C1FEDCF125E3E984445A4AF /* RustVoiceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F219BE73E18D39620ABC253 /* RustVoiceClient.swift */; };
 		2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */; };
+		CA7A10C0A81C4479BA340001 /* RustActivityCatalogClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7A10C0A81C4479BA340002 /* RustActivityCatalogClient.swift */; };
+		CA7A10C0A81C4479BA340003 /* RustResidentSchedulerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7A10C0A81C4479BA340004 /* RustResidentSchedulerClient.swift */; };
+		CA7A10C0A81C4479BA340005 /* RustResidentSchedulerHTTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7A10C0A81C4479BA340006 /* RustResidentSchedulerHTTPClient.swift */; };
+		F6AC17000000000000000001 /* RustResidentToolBindingFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6AC17000000000000000002 /* RustResidentToolBindingFactory.swift */; };
+		C1A0DE000000000000000001 /* RustResidentClaudeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A0DE000000000000000002 /* RustResidentClaudeClient.swift */; };
+		C4A700000000000000000001 /* RustChatClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A700000000000000000002 /* RustChatClient.swift */; };
+		B21A5E000000000000000001 /* RustProductSettingsClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B21A5E000000000000000002 /* RustProductSettingsClient.swift */; };
+		B23A5E000000000000000001 /* RustPresenceSelectionClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23A5E000000000000000002 /* RustPresenceSelectionClient.swift */; };
+		B21A5E000000000000000003 /* ProductSpeechSecretStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B21A5E000000000000000004 /* ProductSpeechSecretStore.swift */; };
+		A77A22000000000000000001 /* RustChatAttachmentClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A77A22000000000000000002 /* RustChatAttachmentClient.swift */; };
+		CA7A10C0A81C4479BA340007 /* RustAgentRuntimeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7A10C0A81C4479BA340008 /* RustAgentRuntimeClient.swift */; };
+		CA7A10C0A81C4479BA340009 /* RustMusicPlaybackClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7A10C0A81C4479BA34000A /* RustMusicPlaybackClient.swift */; };
+		D57A10C0A81C4479BA340003 /* RustCodexSessionClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D57A10C0A81C4479BA340004 /* RustCodexSessionClient.swift */; };
+		D57A10C0A81C4479BA340001 /* RustDSHSessionClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D57A10C0A81C4479BA340002 /* RustDSHSessionClient.swift */; };
+		CA7A10C0A81C4479BA34000B /* RustWorldActivityClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7A10C0A81C4479BA34000C /* RustWorldActivityClient.swift */; };
+		B20F00160000000000000001 /* RustWorldPropClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20F00160000000000000002 /* RustWorldPropClient.swift */; };
+		B20F00160000000000000003 /* RustPropNativeMeshSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20F00160000000000000004 /* RustPropNativeMeshSampler.swift */; };
 		2CAE7AC3DD788FE1CD3D0E59 /* MotionPackageStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 156B582F0FC7CCEDEBF3C16A /* MotionPackageStore.swift */; };
 		2D37209DE2C9436846F79D76 /* ResidentVisionCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEAA3EE93DD1EF8B9F73F37E /* ResidentVisionCapture.swift */; };
 		2D4E0673D2067888218B2BF5 /* DJStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBB583E2AA3BD7F6DA17AED6 /* DJStateTests.swift */; };
@@ -79,6 +100,7 @@
 		36DFD6DCAE62D1F28614ABB0 /* VisualAudioFeatureExtractorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4754EBB9C64ED51C00FF0F3C /* VisualAudioFeatureExtractorTests.swift */; };
 		37055739ADCD272E2CCC6E67 /* ResidentActivityOutcome.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB85763E79F6C8CB7506F99F /* ResidentActivityOutcome.swift */; };
 		377CDFED9B1812290C3CC8E4 /* ResidentWishReferenceTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */; };
+		B25A5E000000000000000001 /* RustWishReferenceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B25A5E000000000000000002 /* RustWishReferenceClient.swift */; };
 		38C2D9D96AF1A847A33F445A /* VMDHumanoidMapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39F7D2B3D3FD4EA49D4B945B /* VMDHumanoidMapTests.swift */; };
 		392D015607812F33D609F32C /* ElevenLabsAudioLevelRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1445F76B4536834CB72C2EE3 /* ElevenLabsAudioLevelRenderer.swift */; };
 		3CA44B7D58C477B0301558E4 /* CNanoem in Frameworks */ = {isa = PBXBuildFile; productRef = 0A7D0BE99A15F950F834FDB4 /* CNanoem */; };
@@ -133,6 +155,18 @@
 		5D57161677518A9A39EAB58C /* StageWindowModeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C0EE40A2A02D7B94512CC74 /* StageWindowModeTests.swift */; };
 		5DE946B4047F5D3C2A625EE1 /* DJAgentToolDispatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE58FD9A6686480F8592B8EF /* DJAgentToolDispatcher.swift */; };
 		5DF23352AF4CE0DD0F99380E /* TrackKnowledge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3023F129331001DBAEBAF6D0 /* TrackKnowledge.swift */; };
+		B27A5E000000000000000001 /* RustMusicKnowledgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B27A5E000000000000000002 /* RustMusicKnowledgeClient.swift */; };
+		B28A5E000000000000000001 /* RustWorldControlClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B28A5E000000000000000002 /* RustWorldControlClient.swift */; };
+		B29A5E000000000000000001 /* RustInboxClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B29A5E000000000000000002 /* RustInboxClient.swift */; };
+		B30A5E000000000000000001 /* RustMarbleControlClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A5E000000000000000002 /* RustMarbleControlClient.swift */; };
+		B30A5E000000000000000009 /* RustMarbleGeometryClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A5E00000000000000000A /* RustMarbleGeometryClient.swift */; };
+		B30A5E000000000000000003 /* MarblePackagePreparation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A5E000000000000000004 /* MarblePackagePreparation.swift */; };
+		B31A5E000000000000000001 /* RustStageVideoClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31A5E000000000000000002 /* RustStageVideoClient.swift */; };
+		B32A5E000000000000000001 /* RustMusicCacheClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B32A5E000000000000000002 /* RustMusicCacheClient.swift */; };
+		B33A5E000000000000000001 /* RustJukeboxClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B33A5E000000000000000002 /* RustJukeboxClient.swift */; };
+		B30A5E000000000000000005 /* UnityMarbleRuntimeDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A5E000000000000000006 /* UnityMarbleRuntimeDocument.swift */; };
+		B30A5E000000000000000007 /* UnityMarbleSPZFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = B30A5E000000000000000008 /* UnityMarbleSPZFormat.swift */; };
+		B28CA5000000000000000001 /* RustPropCapabilityClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B28CA5000000000000000002 /* RustPropCapabilityClient.swift */; };
 		5F77A2799447177EC5EE50C9 /* ResidentWishReferenceDiagnosis.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02D4D4E869781BE7EE9DEACF /* ResidentWishReferenceDiagnosis.swift */; };
 		5F8E787A682533EA402207D8 /* DoubaoRTCEventMapper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9758A4F0754760FA0AB854CA /* DoubaoRTCEventMapper.swift */; };
 		5FFAFEEC33DBC151B36CC48F /* AudioAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28D2705070A09B46791FEE87 /* AudioAnalyzer.swift */; };
@@ -177,6 +211,7 @@
 		81914E27C318E7EA8BFA390B /* MusicProviderWebLoginController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E8EACB41344613111F39DD0 /* MusicProviderWebLoginController.swift */; };
 		82499DDB42EA6A9343435C01 /* NativeLinkPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4841A1C9777A9C01E1242759 /* NativeLinkPlayer.swift */; };
 		E6AA91460EA1144400000005 /* ScreenMediaCacheClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6AA91460EA1144400000006 /* ScreenMediaCacheClient.swift */; };
+		D8B271340CA1144400000001 /* RustScreenPlaybackClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8B271340CA1144400000002 /* RustScreenPlaybackClient.swift */; };
 		8352C05514134BE9053C4B73 /* ResidentImageAttachment.swift in Sources */ = {isa = PBXBuildFile; fileRef = C12A593D2E39AA38BDE94F2C /* ResidentImageAttachment.swift */; };
 		8573E115B6C4C7AB8C10C1B8 /* ElevenLabsSDKConversationTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0F3CB58D63948E17D4EC76C /* ElevenLabsSDKConversationTransport.swift */; };
 		85AA0A77C6D0654E55BB05CE /* WishMachineScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5059330FDA14A7DEE4D57E5 /* WishMachineScene.swift */; };
@@ -260,6 +295,7 @@
 		BE8279BE4B674F79C4B6B749 /* ResidentPropHitTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA90C9153FCCDA6F98E99627 /* ResidentPropHitTest.swift */; };
 		BEB4C8BCA7C17AD706CD5267 /* GLTFMetalKit in Frameworks */ = {isa = PBXBuildFile; productRef = C3FCCC8D1C10983C138146E3 /* GLTFMetalKit */; };
 		C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19678E75760FF52C34D1F4BB /* ResidentStateClient.swift */; };
+		B24A17000000000000000001 /* RustResidentIntentClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24A17000000000000000002 /* RustResidentIntentClient.swift */; };
 		C10827D8D39E84E9E79DFFD9 /* DJProgramStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F0C99CC73DBA693F2E286F1 /* DJProgramStore.swift */; };
 		C291DC6978A8AF9ECE627079 /* StreamingPCMPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AD054DE8DB0A8A99F454434 /* StreamingPCMPlayer.swift */; };
 		C3E9ADA40693BD1AB0C2F219 /* AppleMusicSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 393199081906581B9CC18676 /* AppleMusicSource.swift */; };
@@ -352,6 +388,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		B20A5E000000000000000002 /* RustMusicProgramClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustMusicProgramClient.swift; sourceTree = "<group>"; };
+		B20A5E000000000000000004 /* PrivateMusicAuthorityFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivateMusicAuthorityFixture.swift; sourceTree = "<group>"; };
 		004DBF16E7B8E5F738731129 /* MetalStageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalStageView.swift; sourceTree = "<group>"; };
 		01325CEA7EA9A69A35350874 /* ResidentMemoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentMemoryStore.swift; sourceTree = "<group>"; };
 		015185F407965D5142B0841B /* WorldAgentContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentContext.swift; sourceTree = "<group>"; };
@@ -373,6 +411,23 @@
 		09494436AADC40C3833A6FC5 /* VisualAudioInputPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualAudioInputPolicy.swift; sourceTree = "<group>"; };
 		0B9566EF5419AE430CF03314 /* ResidentMemoryClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentMemoryClient.swift; sourceTree = "<group>"; };
 		0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAuthorityClient.swift; sourceTree = "<group>"; };
+		CA7A10C0A81C4479BA340002 /* RustActivityCatalogClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustActivityCatalogClient.swift; sourceTree = "<group>"; };
+		CA7A10C0A81C4479BA340004 /* RustResidentSchedulerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustResidentSchedulerClient.swift; sourceTree = "<group>"; };
+		CA7A10C0A81C4479BA340006 /* RustResidentSchedulerHTTPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustResidentSchedulerHTTPClient.swift; sourceTree = "<group>"; };
+		F6AC17000000000000000002 /* RustResidentToolBindingFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustResidentToolBindingFactory.swift; sourceTree = "<group>"; };
+		C1A0DE000000000000000002 /* RustResidentClaudeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustResidentClaudeClient.swift; sourceTree = "<group>"; };
+		C4A700000000000000000002 /* RustChatClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustChatClient.swift; sourceTree = "<group>"; };
+		B21A5E000000000000000002 /* RustProductSettingsClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustProductSettingsClient.swift; sourceTree = "<group>"; };
+		B23A5E000000000000000002 /* RustPresenceSelectionClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustPresenceSelectionClient.swift; sourceTree = "<group>"; };
+		B21A5E000000000000000004 /* ProductSpeechSecretStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProductSpeechSecretStore.swift; sourceTree = "<group>"; };
+		A77A22000000000000000002 /* RustChatAttachmentClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustChatAttachmentClient.swift; sourceTree = "<group>"; };
+		CA7A10C0A81C4479BA340008 /* RustAgentRuntimeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustAgentRuntimeClient.swift; sourceTree = "<group>"; };
+		CA7A10C0A81C4479BA34000A /* RustMusicPlaybackClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustMusicPlaybackClient.swift; sourceTree = "<group>"; };
+		D57A10C0A81C4479BA340004 /* RustCodexSessionClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustCodexSessionClient.swift; sourceTree = "<group>"; };
+		D57A10C0A81C4479BA340002 /* RustDSHSessionClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustDSHSessionClient.swift; sourceTree = "<group>"; };
+		CA7A10C0A81C4479BA34000C /* RustWorldActivityClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustWorldActivityClient.swift; sourceTree = "<group>"; };
+		B20F00160000000000000002 /* RustWorldPropClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustWorldPropClient.swift; sourceTree = "<group>"; };
+		B20F00160000000000000004 /* RustPropNativeMeshSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustPropNativeMeshSampler.swift; sourceTree = "<group>"; };
 		0CF4BBDAD919719A1DBF7F9E /* ResidentPropRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropRenderer.swift; sourceTree = "<group>"; };
 		0D14F4B7076E6DE288719ECF /* MusicLibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicLibraryIndex.swift; sourceTree = "<group>"; };
 		0E16B502423D8CB2B119C833 /* RemoteMotionLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMotionLibrary.swift; sourceTree = "<group>"; };
@@ -389,6 +444,7 @@
 		193229015897C584DE49ABC2 /* ResidentPerformanceMotionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPerformanceMotionPolicy.swift; sourceTree = "<group>"; };
 		1952AEC89F2EB509261F9EB9 /* ResidentPropScene.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropScene.swift; sourceTree = "<group>"; };
 		19678E75760FF52C34D1F4BB /* ResidentStateClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentStateClient.swift; sourceTree = "<group>"; };
+		B24A17000000000000000002 /* RustResidentIntentClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustResidentIntentClient.swift; sourceTree = "<group>"; };
 		19D1AC1EED8E537124163209 /* MusicProviderSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicProviderSession.swift; sourceTree = "<group>"; };
 		1A5EDA2BEFBB8C23CC031079 /* VMDToVRMClipAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VMDToVRMClipAdapterTests.swift; sourceTree = "<group>"; };
 		1A6D2B6F929D4352B28477BF /* PMXAvatarMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PMXAvatarMetalView.swift; sourceTree = "<group>"; };
@@ -421,6 +477,18 @@
 		2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWorldToolSession.swift; sourceTree = "<group>"; };
 		2D6999758740371B4CC8758D /* StageWindowControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageWindowControllerTests.swift; sourceTree = "<group>"; };
 		3023F129331001DBAEBAF6D0 /* TrackKnowledge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackKnowledge.swift; sourceTree = "<group>"; };
+		B27A5E000000000000000002 /* RustMusicKnowledgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustMusicKnowledgeClient.swift; sourceTree = "<group>"; };
+		B28A5E000000000000000002 /* RustWorldControlClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustWorldControlClient.swift; sourceTree = "<group>"; };
+		B29A5E000000000000000002 /* RustInboxClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustInboxClient.swift; sourceTree = "<group>"; };
+		B30A5E000000000000000002 /* RustMarbleControlClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustMarbleControlClient.swift; sourceTree = "<group>"; };
+		B30A5E00000000000000000A /* RustMarbleGeometryClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustMarbleGeometryClient.swift; sourceTree = "<group>"; };
+		B30A5E000000000000000004 /* MarblePackagePreparation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarblePackagePreparation.swift; sourceTree = "<group>"; };
+		B31A5E000000000000000002 /* RustStageVideoClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustStageVideoClient.swift; sourceTree = "<group>"; };
+		B32A5E000000000000000002 /* RustMusicCacheClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustMusicCacheClient.swift; sourceTree = "<group>"; };
+		B33A5E000000000000000002 /* RustJukeboxClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustJukeboxClient.swift; sourceTree = "<group>"; };
+		B30A5E000000000000000006 /* UnityMarbleRuntimeDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnityMarbleRuntimeDocument.swift; sourceTree = "<group>"; };
+		B30A5E000000000000000008 /* UnityMarbleSPZFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnityMarbleSPZFormat.swift; sourceTree = "<group>"; };
+		B28CA5000000000000000002 /* RustPropCapabilityClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustPropCapabilityClient.swift; sourceTree = "<group>"; };
 		302784B9AFBD09593A9228E5 /* WorldScreenContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenContent.swift; sourceTree = "<group>"; };
 		30C49D1F8B1D6E86CA04C0B3 /* ResidentLocomotionMotionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentLocomotionMotionPolicy.swift; sourceTree = "<group>"; };
 		31080F189374AC62C63D9FEB /* NanoemCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NanoemCore; path = Packages/NanoemCore; sourceTree = SOURCE_ROOT; };
@@ -456,6 +524,7 @@
 		4800268796D4A3A5E20CB6F8 /* AgentConversationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConversationService.swift; sourceTree = "<group>"; };
 		4841A1C9777A9C01E1242759 /* NativeLinkPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeLinkPlayer.swift; sourceTree = "<group>"; };
 		E6AA91460EA1144400000006 /* ScreenMediaCacheClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenMediaCacheClient.swift; sourceTree = "<group>"; };
+		D8B271340CA1144400000002 /* RustScreenPlaybackClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustScreenPlaybackClient.swift; sourceTree = "<group>"; };
 		49673EC0B6CB3CED267C02E9 /* AgentSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSettingsView.swift; sourceTree = "<group>"; };
 		4979C002BFA7259332C1AF5A /* WorldAgentToolContract.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldAgentToolContract.swift; sourceTree = "<group>"; };
 		4A2303EC6757768CBCDC8C43 /* RemoteMotionLibraryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteMotionLibraryTests.swift; sourceTree = "<group>"; };
@@ -465,6 +534,7 @@
 		4C25006F47A0D72758A7B6B0 /* ProgramVisualDirector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProgramVisualDirector.swift; sourceTree = "<group>"; };
 		4C3161E3B8CFAB319A4547F4 /* StageAvatarActivityExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StageAvatarActivityExecutor.swift; sourceTree = "<group>"; };
 		4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentWishReferenceTools.swift; sourceTree = "<group>"; };
+		B25A5E000000000000000002 /* RustWishReferenceClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustWishReferenceClient.swift; sourceTree = "<group>"; };
 		4CBF097AE70456AFA2E548A3 /* WorldScreenEmbedOrigin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldScreenEmbedOrigin.swift; sourceTree = "<group>"; };
 		4D4B3C1924BD2EFD8C20A529 /* FoliaSceneDetailModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoliaSceneDetailModelsTests.swift; sourceTree = "<group>"; };
 		4DAD314FA946D04CCDC3180A /* SpatialStageStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpatialStageStoreTests.swift; sourceTree = "<group>"; };
@@ -669,6 +739,8 @@
 		F68F9E2DBB4F417C0EABDF49 /* WorldPropCapabilityActivityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorldPropCapabilityActivityTests.swift; sourceTree = "<group>"; };
 		F6D9D44D3F0366183C6571C0 /* ResidentPropPlacementService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentPropPlacementService.swift; sourceTree = "<group>"; };
 		F79B0FAAC220CE9FB6AC6D45 /* AgentSpeech.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSpeech.swift; sourceTree = "<group>"; };
+		C5EEC4150000000000000002 /* RustSpeechDeliveryClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustSpeechDeliveryClient.swift; sourceTree = "<group>"; };
+		5C2EE5140000000000000002 /* RustScreenStateClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustScreenStateClient.swift; sourceTree = "<group>"; };
 		F8D7676CE6E2E2866ECEB0E9 /* ResidentDSHAgentToolBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentDSHAgentToolBridge.swift; sourceTree = "<group>"; };
 		F904758C6A09AFB3E4669F60 /* ResidentMusicToolBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResidentMusicToolBridge.swift; sourceTree = "<group>"; };
 		F934C041C38E2FBEE9EFAEB7 /* OrbMetalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbMetalView.swift; sourceTree = "<group>"; };
@@ -748,6 +820,7 @@
 				D97F73949C67E2C74646A608 /* NeteaseMusicProviderClient.swift */,
 				63B9090B88216BD89FF23432 /* QQMusicProviderClient.swift */,
 				FF4EF80770D71D3EC6B0D33D /* StreamingMusicCache.swift */,
+				B32A5E000000000000000002 /* RustMusicCacheClient.swift */,
 				1F7B6F4B8014DFB9AD76A24A /* SyncedMusicLibraryStore.swift */,
 				E6AA91460EA1144400000002 /* MusicStorageClient.swift */,
 				96E6D962FE7287F48210926F /* UnifiedMusicSearch.swift */,
@@ -766,6 +839,10 @@
 				64AD6CEA51CDFB9A0C88D625 /* MarbleWorldCache.swift */,
 				044DFDC6F60021056335F218 /* MarbleWorldClient.swift */,
 				C2722FAA85733F1B941608F1 /* MarbleWorldLibrary.swift */,
+				B30A5E000000000000000004 /* MarblePackagePreparation.swift */,
+				B31A5E000000000000000002 /* RustStageVideoClient.swift */,
+				B30A5E000000000000000006 /* UnityMarbleRuntimeDocument.swift */,
+				B30A5E000000000000000008 /* UnityMarbleSPZFormat.swift */,
 				6B4ECE2281E5829AE3E02FE3 /* OrbAppearance.swift */,
 				07DE01676AC401339B9DCC2F /* OrbMotionModel.swift */,
 				32A231638291FF4F5DA2F049 /* ProgramVisualCue.swift */,
@@ -833,6 +910,7 @@
 			children = (
 				4800268796D4A3A5E20CB6F8 /* AgentConversationService.swift */,
 				F79B0FAAC220CE9FB6AC6D45 /* AgentSpeech.swift */,
+				C5EEC4150000000000000002 /* RustSpeechDeliveryClient.swift */,
 				A961113D1516220877214877 /* CodexAgentAccountService.swift */,
 				EDA99A24B1CD267A7C6DBEDA /* CodexCLI.swift */,
 				977A9FD8072469DD8A215BC8 /* CodexPlanningExecutor.swift */,
@@ -858,12 +936,14 @@
 				F904758C6A09AFB3E4669F60 /* ResidentMusicToolBridge.swift */,
 				F3FA60E1D76F4C57DECBCC1A /* ResidentPropToolBridge.swift */,
 				19678E75760FF52C34D1F4BB /* ResidentStateClient.swift */,
+				B24A17000000000000000002 /* RustResidentIntentClient.swift */,
 				39BB89FADC25283E21D9FC6A /* ResidentSteeringDelivery.swift */,
 				1BB8EACB340657AF2516A624 /* ResidentVisionImageBox.swift */,
 				3F6DF0E5038DD4BDC58A0D55 /* ResidentVisionTools.swift */,
 				C7335B9B5827729339174B18 /* ResidentWishMachineTools.swift */,
 				02D4D4E869781BE7EE9DEACF /* ResidentWishReferenceDiagnosis.swift */,
 				4C7A2D03F5D5146ABBED6DBA /* ResidentWishReferenceTools.swift */,
+				B25A5E000000000000000002 /* RustWishReferenceClient.swift */,
 				ABAA7C464C8C13EA57082B04 /* ResidentWorldObservation.swift */,
 				2B3D886F759F9B2EBE61D14B /* ResidentWorldToolSession.swift */,
 				9F219BE73E18D39620ABC253 /* RustVoiceClient.swift */,
@@ -879,6 +959,7 @@
 		32F1150EE079C474581520FB /* DJCore */ = {
 			isa = PBXGroup;
 			children = (
+				B20A5E000000000000000004 /* PrivateMusicAuthorityFixture.swift */,
 				05E0E7A7D738D3198909C409 /* AgentProgramPlannerTests.swift */,
 				C4FC3D3A978408326F9837DA /* CodexPlanningExecutorTests.swift */,
 				1F341732E30CC1C3F05A7532 /* CodexTrackRankingAgentTests.swift */,
@@ -1061,6 +1142,7 @@
 				6140AFA7ADC6446BA3A1508C /* CandidatePoolBuilder.swift */,
 				0D14F4B7076E6DE288719ECF /* MusicLibraryIndex.swift */,
 				3023F129331001DBAEBAF6D0 /* TrackKnowledge.swift */,
+				B27A5E000000000000000002 /* RustMusicKnowledgeClient.swift */,
 			);
 			path = MusicKnowledge;
 			sourceTree = "<group>";
@@ -1119,6 +1201,29 @@
 				A0EFC3C3D2E65D62510E4F0D /* WishMachineTaskMessage.swift */,
 				A6BB37F2A8F0EA85DC0BB42E /* WishMachineTaskPresentation.swift */,
 				0CD6F11948A8443229AD4E83 /* WorldAuthorityClient.swift */,
+				CA7A10C0A81C4479BA340002 /* RustActivityCatalogClient.swift */,
+				CA7A10C0A81C4479BA340004 /* RustResidentSchedulerClient.swift */,
+				CA7A10C0A81C4479BA340006 /* RustResidentSchedulerHTTPClient.swift */,
+				F6AC17000000000000000002 /* RustResidentToolBindingFactory.swift */,
+				C1A0DE000000000000000002 /* RustResidentClaudeClient.swift */,
+				C4A700000000000000000002 /* RustChatClient.swift */,
+				B21A5E000000000000000002 /* RustProductSettingsClient.swift */,
+				B23A5E000000000000000002 /* RustPresenceSelectionClient.swift */,
+				B21A5E000000000000000004 /* ProductSpeechSecretStore.swift */,
+				A77A22000000000000000002 /* RustChatAttachmentClient.swift */,
+				CA7A10C0A81C4479BA340008 /* RustAgentRuntimeClient.swift */,
+				CA7A10C0A81C4479BA34000A /* RustMusicPlaybackClient.swift */,
+				D57A10C0A81C4479BA340004 /* RustCodexSessionClient.swift */,
+				D57A10C0A81C4479BA340002 /* RustDSHSessionClient.swift */,
+				CA7A10C0A81C4479BA34000C /* RustWorldActivityClient.swift */,
+				B20F00160000000000000002 /* RustWorldPropClient.swift */,
+				B28A5E000000000000000002 /* RustWorldControlClient.swift */,
+				B33A5E000000000000000002 /* RustJukeboxClient.swift */,
+				B29A5E000000000000000002 /* RustInboxClient.swift */,
+				B30A5E000000000000000002 /* RustMarbleControlClient.swift */,
+				B30A5E00000000000000000A /* RustMarbleGeometryClient.swift */,
+				B28CA5000000000000000002 /* RustPropCapabilityClient.swift */,
+				B20F00160000000000000004 /* RustPropNativeMeshSampler.swift */,
 			);
 			path = Presence;
 			sourceTree = "<group>";
@@ -1217,6 +1322,7 @@
 			children = (
 				4841A1C9777A9C01E1242759 /* NativeLinkPlayer.swift */,
 				E6AA91460EA1144400000006 /* ScreenMediaCacheClient.swift */,
+				D8B271340CA1144400000002 /* RustScreenPlaybackClient.swift */,
 				9306F9AD136568C9974B38D2 /* NativeScreenMediaDescriptor.swift */,
 				94EF8BBDE34F3EEC8C7BB951 /* NativeScreenPlaybackCoordinator.swift */,
 				83913B862F16163BD66685A7 /* ScreenLinkAssetLoader.swift */,
@@ -1228,6 +1334,7 @@
 		B30B7EC3E55C63F8C198A5A8 /* DJCore */ = {
 			isa = PBXGroup;
 			children = (
+				B20A5E000000000000000002 /* RustMusicProgramClient.swift */,
 				91AE9B5CC47487FE7A0A86CE /* AgentProgramPlanner.swift */,
 				06098ED46674F874E30028A5 /* AgentShowProposal.swift */,
 				5A7A40B5A72B6307E9BA3877 /* CodexTrackRankingAgent.swift */,
@@ -1250,6 +1357,7 @@
 				79A4BDD205AF80A18FA23331 /* WorldScreenOcclusion.swift */,
 				C0AE9BABDBADF3D475A635E0 /* WorldScreenOverlayController.swift */,
 				C7BFF374061DC4179B540556 /* WorldScreenPersistence.swift */,
+				5C2EE5140000000000000002 /* RustScreenStateClient.swift */,
 				FD53CFC01FF713A675960925 /* WorldScreenProjection.swift */,
 				85490E20953D777A44BAF5D8 /* WorldScreenState.swift */,
 				CA93D02588A5BAF9CE9E4AD5 /* WorldScreenStore.swift */,
@@ -1519,6 +1627,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B20A5E000000000000000003 /* PrivateMusicAuthorityFixture.swift in Sources */,
 				80AC6AC25FAE9E0FBCB11CDF /* AccountMusicSourceTests.swift in Sources */,
 				F2B90F7075546203D861C121 /* AcousticTrackAnalyzerTests.swift in Sources */,
 				00A6BDE2BE36617F32C7B3A2 /* AgentConversationServiceTests.swift in Sources */,
@@ -1605,6 +1714,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B20A5E000000000000000001 /* RustMusicProgramClient.swift in Sources */,
 				B6FFE9B34760DB9760F6F035 /* AccountMusicSource.swift in Sources */,
 				92BE917E053A2C7267FF1CB3 /* AcousticTrackAnalyzer.swift in Sources */,
 				8165062A44C13B7D0CC9C197 /* AgentConversationService.swift in Sources */,
@@ -1613,6 +1723,7 @@
 				42E713B2D9B7289E6E4E31AC /* AgentSettingsView.swift in Sources */,
 				945D31BFE773D529707B7F9E /* AgentShowProposal.swift in Sources */,
 				2236962BAF9ACD7CF6087AA6 /* AgentSpeech.swift in Sources */,
+				C5EEC4150000000000000001 /* RustSpeechDeliveryClient.swift in Sources */,
 				C3E9ADA40693BD1AB0C2F219 /* AppleMusicSource.swift in Sources */,
 				5FFAFEEC33DBC151B36CC48F /* AudioAnalyzer.swift in Sources */,
 				F9E9274E334132FE64AFC6B0 /* AudioDeviceMonitor.swift in Sources */,
@@ -1677,6 +1788,7 @@
 				93C46E6E2725D1F073DE8E8E /* NanoemVMDLoader.swift in Sources */,
 				82499DDB42EA6A9343435C01 /* NativeLinkPlayer.swift in Sources */,
 				E6AA91460EA1144400000005 /* ScreenMediaCacheClient.swift in Sources */,
+				D8B271340CA1144400000001 /* RustScreenPlaybackClient.swift in Sources */,
 				61ABC189E9DBDC3215A809C3 /* NativeScreenMediaDescriptor.swift in Sources */,
 				A887E479D3C4F5AE4084CF2C /* NativeScreenPlaybackCoordinator.swift in Sources */,
 				0A096E97516270FB01A843FE /* NeteaseMusicProviderClient.swift in Sources */,
@@ -1759,6 +1871,7 @@
 				91B55E583C0A274F29063E6F /* ResidentPropToolBridge.swift in Sources */,
 				D9CC285664E137376A3F8CCD /* ResidentScreenTools.swift in Sources */,
 				C04254A6FF945016763D8B48 /* ResidentStateClient.swift in Sources */,
+				B24A17000000000000000001 /* RustResidentIntentClient.swift in Sources */,
 				124DE75B028E61EFAFDC5712 /* ResidentStatusBadge.swift in Sources */,
 				E6EB719F55B52F1FE142E026 /* ResidentSteeringDelivery.swift in Sources */,
 				5802934BD03181448678449E /* ResidentSystemInbox.swift in Sources */,
@@ -1773,6 +1886,7 @@
 				9D020777B554187459EA6617 /* ResidentWishMachineTools.swift in Sources */,
 				5F77A2799447177EC5EE50C9 /* ResidentWishReferenceDiagnosis.swift in Sources */,
 				377CDFED9B1812290C3CC8E4 /* ResidentWishReferenceTools.swift in Sources */,
+				B25A5E000000000000000001 /* RustWishReferenceClient.swift in Sources */,
 				285A92ABFCB741A3A097E4F0 /* ResidentWorldObservation.swift in Sources */,
 				B38CAD275CF9668811068E88 /* ResidentWorldToolSession.swift in Sources */,
 				2E832C415DE812A98AA914DB /* RetryBackoff.swift in Sources */,
@@ -1809,6 +1923,18 @@
 				DDDEBAB15217CC1A60061CDE /* SyncedMusicLibraryStore.swift in Sources */,
 				E6AA91460EA1144400000001 /* MusicStorageClient.swift in Sources */,
 				5DF23352AF4CE0DD0F99380E /* TrackKnowledge.swift in Sources */,
+				B27A5E000000000000000001 /* RustMusicKnowledgeClient.swift in Sources */,
+				B28A5E000000000000000001 /* RustWorldControlClient.swift in Sources */,
+				B29A5E000000000000000001 /* RustInboxClient.swift in Sources */,
+				B30A5E000000000000000001 /* RustMarbleControlClient.swift in Sources */,
+				B30A5E000000000000000009 /* RustMarbleGeometryClient.swift in Sources */,
+				B30A5E000000000000000003 /* MarblePackagePreparation.swift in Sources */,
+				B31A5E000000000000000001 /* RustStageVideoClient.swift in Sources */,
+				B32A5E000000000000000001 /* RustMusicCacheClient.swift in Sources */,
+				B33A5E000000000000000001 /* RustJukeboxClient.swift in Sources */,
+				B30A5E000000000000000005 /* UnityMarbleRuntimeDocument.swift in Sources */,
+				B30A5E000000000000000007 /* UnityMarbleSPZFormat.swift in Sources */,
+				B28CA5000000000000000001 /* RustPropCapabilityClient.swift in Sources */,
 				583709DB2BCEF0293ECDCD8B /* UnifiedMusicSearch.swift in Sources */,
 				DD0E1B235354B4FFCA244364 /* VMDBezierSampler.swift in Sources */,
 				C8B225A7F271ACEB26A2CAB1 /* VMDHumanoidMap.swift in Sources */,
@@ -1829,6 +1955,23 @@
 				7B5FE2C2BD09CA693E0FE5D3 /* WorldAgentToolContract.swift in Sources */,
 				FE33D1065264BA512AC4078F /* WorldAgentToolDispatcher.swift in Sources */,
 				2C9AEFE80D992E7CDBDA41B5 /* WorldAuthorityClient.swift in Sources */,
+				CA7A10C0A81C4479BA340001 /* RustActivityCatalogClient.swift in Sources */,
+				CA7A10C0A81C4479BA340003 /* RustResidentSchedulerClient.swift in Sources */,
+				CA7A10C0A81C4479BA340005 /* RustResidentSchedulerHTTPClient.swift in Sources */,
+				F6AC17000000000000000001 /* RustResidentToolBindingFactory.swift in Sources */,
+				C1A0DE000000000000000001 /* RustResidentClaudeClient.swift in Sources */,
+				C4A700000000000000000001 /* RustChatClient.swift in Sources */,
+				B21A5E000000000000000001 /* RustProductSettingsClient.swift in Sources */,
+				B23A5E000000000000000001 /* RustPresenceSelectionClient.swift in Sources */,
+				B21A5E000000000000000003 /* ProductSpeechSecretStore.swift in Sources */,
+				A77A22000000000000000001 /* RustChatAttachmentClient.swift in Sources */,
+				CA7A10C0A81C4479BA340007 /* RustAgentRuntimeClient.swift in Sources */,
+				CA7A10C0A81C4479BA340009 /* RustMusicPlaybackClient.swift in Sources */,
+				D57A10C0A81C4479BA340003 /* RustCodexSessionClient.swift in Sources */,
+				D57A10C0A81C4479BA340001 /* RustDSHSessionClient.swift in Sources */,
+				CA7A10C0A81C4479BA34000B /* RustWorldActivityClient.swift in Sources */,
+				B20F00160000000000000001 /* RustWorldPropClient.swift in Sources */,
+				B20F00160000000000000003 /* RustPropNativeMeshSampler.swift in Sources */,
 				F29D9CA04913442E4A025EF1 /* WorldScreenContent.swift in Sources */,
 				E1D5853C54083F03BAB5FE42 /* WorldScreenEmbedOrigin.swift in Sources */,
 				CFA73B9B441C3D01031ACB5D /* WorldScreenGeometry.swift in Sources */,
@@ -1838,6 +1981,7 @@
 				429262DD9808149129C8FF52 /* WorldScreenOcclusion.swift in Sources */,
 				C5B456BB3F40EBD534A86A28 /* WorldScreenOverlayController.swift in Sources */,
 				E1DECE1291EDCCF05CEAC03B /* WorldScreenPersistence.swift in Sources */,
+				5C2EE5140000000000000001 /* RustScreenStateClient.swift in Sources */,
 				798F3E554E519E59B853D0F4 /* WorldScreenProjection.swift in Sources */,
 				9BE7615CA02A72040F6D0947 /* WorldScreenState.swift in Sources */,
 				219F0A54C0FAEC08711AEC73 /* WorldScreenStore.swift in Sources */,

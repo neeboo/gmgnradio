@@ -49,26 +49,22 @@ struct InstalledPublishedMotion: Equatable, Sendable {
 }
 
 struct MotionPackageStore: Sendable {
-    private static let selectionVersion = 3
     static let naturalIdleID = "builtin.motion.natural-idle"
     static let studioGrooveID = "builtin.motion.studio-groove"
     static let iluvSlapBassID = "builtin.motion.iluvslapbass"
     static let iluvSlapBassVRMID = "builtin.motion.iluvslapbass-vrm"
-    private static let retiredBuiltInMotionIDs: Set<String> = [
-        studioGrooveID,
-        "builtin.motion.2b-full",
-        "builtin.motion.2b-hand",
-        "builtin.motion.2b-hand-short",
-    ]
 
     let rootURL: URL
     let builtInMotions: [BuiltInMotionResource]
+    let selectionAuthority: RustPresenceSelectionClient
 
     init(
         rootURL: URL,
-        builtInMotions: [BuiltInMotionResource]
+        builtInMotions: [BuiltInMotionResource],
+        selectionAuthority: RustPresenceSelectionClient? = nil
     ) {
         self.rootURL = rootURL.standardizedFileURL
+        self.selectionAuthority = selectionAuthority ?? .forCatalogRoot(rootURL.deletingLastPathComponent())
         self.builtInMotions = builtInMotions.map {
             BuiltInMotionResource(
                 id: $0.id,
@@ -405,40 +401,10 @@ struct MotionPackageStore: Sendable {
         return try decodeAndValidateMotion(at: destination, fileManager: fileManager)
     }
 
-    func activate(
-        id: String,
-        fileManager: FileManager = .default
-    ) throws {
-        try ensureRootExists(fileManager: fileManager)
-        guard try listMotions(fileManager: fileManager).contains(where: { $0.id == id }) else {
-            throw MotionPackageError.motionNotFound
-        }
-        try JSONEncoder().encode(
-            MotionSelection(
-                activeID: id,
-                version: Self.selectionVersion
-            )
-        ).write(
-            to: selectionURL,
-            options: .atomic
-        )
-    }
+    func activateAsync(id: String) async throws { _ = try await selectionAuthority.event("select_motion", id: id) }
 
-    func remove(
-        id: String,
-        fileManager: FileManager = .default
-    ) throws {
-        guard !builtInIDs.contains(id) else {
-            throw MotionPackageError.cannotRemoveBuiltIn
-        }
-        let destination = rootURL.appending(path: id, directoryHint: .isDirectory)
-        guard fileManager.fileExists(atPath: destination.path) else {
-            throw MotionPackageError.motionNotFound
-        }
-        try fileManager.removeItem(at: destination)
-        if try readActiveID(fileManager: fileManager) == id {
-            try activate(id: Self.naturalIdleID, fileManager: fileManager)
-        }
+    func removeAsync(id: String) async throws {
+        try await selectionAuthority.remove(kind: "motions", id: id, root: rootURL)
     }
 
     private var naturalIdle: StageMotionAsset {
@@ -454,36 +420,13 @@ struct MotionPackageStore: Sendable {
         Set([Self.naturalIdleID] + builtInMotions.map(\.id))
     }
 
-    private var selectionURL: URL {
-        rootURL.appending(path: ".selection.json")
-    }
 
     private func ensureRootExists(fileManager: FileManager) throws {
         try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
     }
 
     private func readActiveID(fileManager: FileManager) throws -> String {
-        try ensureRootExists(fileManager: fileManager)
-        guard fileManager.fileExists(atPath: selectionURL.path) else {
-            return Self.naturalIdleID
-        }
-        let selection = try? JSONDecoder().decode(
-            MotionSelection.self,
-            from: Data(contentsOf: selectionURL)
-        )
-        let selected = selection?.activeID ?? Self.naturalIdleID
-        let requiresLegacyDefaultMigration = Self.retiredBuiltInMotionIDs
-            .contains(selected)
-        if requiresLegacyDefaultMigration {
-            try JSONEncoder().encode(
-                MotionSelection(
-                    activeID: Self.naturalIdleID,
-                    version: Self.selectionVersion
-                )
-            ).write(to: selectionURL, options: .atomic)
-            return Self.naturalIdleID
-        }
-        return selected
+        selectionAuthority.confirmed?.motionID ?? Self.naturalIdleID
     }
 
     private func decodeAndValidateMotion(
@@ -654,9 +597,4 @@ private struct MotionManifest: Codable {
         self.playbackRate = playbackRate
         self.inPlace = inPlace
     }
-}
-
-private struct MotionSelection: Codable {
-    let activeID: String
-    let version: Int?
 }

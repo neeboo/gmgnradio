@@ -1,9 +1,24 @@
 import Foundation
 
-let production = ["AgentSpeech.swift", "RustVoiceClient.swift", "StreamingPCMPlayer.swift", "../Presence/TaskdHTTPTransport.swift"].map {
+let production = ["AgentSpeech.swift", "RustVoiceClient.swift", "StreamingPCMPlayer.swift", "../Presence/TaskdHTTPTransport.swift", "RustSpeechDeliveryClient.swift"].map {
     "apps/macos/Sources/GMGNRadio/Agent/\($0)"
 }
 let playerSource = try String(contentsOfFile: production[2], encoding: .utf8)
+let productSettingsSource = try String(contentsOfFile: "apps/macos/UnityHost/UnityProductSettings.swift", encoding: .utf8)
+let actualReplySpeechDeclaration = productSettingsSource.components(separatedBy: .newlines).first { $0.contains("private var replySpeech:") }!
+let replySpeechDeclaration = ProcessInfo.processInfo.environment["GMGN_ISSUED_TYPE_NEGATIVE"] == "1"
+    ? actualReplySpeechDeclaration.replacingOccurrences(of: "RustSpeechSynthesizer?", with: "(any SpeechSynthesizing)?")
+    : actualReplySpeechDeclaration
+// Compile the real Host declaration against the real issued-ticket implementation.
+let hostTypeProbe = """
+@MainActor final class UnityReplyIssuedTypeProbe {
+\(replySpeechDeclaration)
+    func consume(_ dispatch: RustSpeechDeliveryClient.ChatDispatch, _ view: RustSpeechDeliveryClient.View) async {
+        await replySpeech?.applyIssuedSpeechView(view)
+        await replySpeech?.speakIssued(dispatch)
+    }
+}
+"""
 func audioCallbacksAreNonisolated(_ source: String) -> Bool {
     source.contains("block: StreamingPCMCallbacks.tap(onLevel: onLevel)")
         && source.contains("completionHandler: StreamingPCMCallbacks.played(onPlayed: onPlayed)")
@@ -18,6 +33,7 @@ guard audioCallbacksAreNonisolated(playerSource),
 let program = #"""
 import Foundation
 import AVFoundation
+import CryptoKit
 
 final class CallbackState: @unchecked Sendable {
     private let lock = NSLock()
@@ -57,6 +73,21 @@ final class CallbackState: @unchecked Sendable {
         events.append(.init(sessionID: sessionID, type: "audio", audioBase64: bytes.base64EncodedString(), sampleRate: rate, channels: 1, encoding: "pcm16le", text: nil, code: nil))
     }
     func end() { events.append(.init(sessionID: sessionID, type: "finished", audioBase64: nil, sampleRate: nil, channels: nil, encoding: nil, text: nil, code: nil)) }
+}
+
+@MainActor final class DeliveryStream: RustVoiceStreaming {
+    let sessionID = UUID().uuidString
+    let identity: RustSpeechDeliveryClient.Identity
+    var index = 0
+    init(identity: RustSpeechDeliveryClient.Identity) { self.identity = identity }
+    func nextEvent() async throws -> RustVoiceEvent {
+        index += 1
+        if index == 1 { return .init(sessionID: sessionID, type: "audio", audioBase64: Data([0, 0]).base64EncodedString(), sampleRate: 24000, channels: 1, encoding: "pcm16le", text: nil, code: nil, delivery: identity, sequence: 0, frameCount: 1) }
+        if index == 2 { return .init(sessionID: sessionID, type: "input_finished", audioBase64: nil, sampleRate: nil, channels: nil, encoding: nil, text: nil, code: nil, delivery: identity) }
+        try await Task.sleep(for: .seconds(5)); throw CancellationError()
+    }
+    func cancel() {}
+    func close() {}
 }
 
 @main struct Checks {
@@ -164,6 +195,95 @@ final class CallbackState: @unchecked Sendable {
         _ = reject.speak("wrong format", completion: { failed.append($0) })
         try await until("invalid format") { failed == [.failed] }
         check(malformed.closed, "invalid stream closes without fallback")
+        // Authoritative delivery fixture: provider EOF cannot finish native playback.
+        var revision: UInt64 = 0
+        var deliveryIdentity: RustSpeechDeliveryClient.Identity?
+        var deliveryStatus = "queued"
+        var receiptKinds: [String] = []
+        var deliveryOutcomes: [AgentSpeechOutcome] = []
+        var enqueueCalls = 0
+        let deliveryDevice = Device()
+        func deliveryView(ticket: Bool = false) throws -> Data {
+            let identity = try JSONSerialization.jsonObject(with: JSONEncoder().encode(deliveryIdentity!))
+            var view: [String: Any] = ["revision": revision, "states": [["identity": identity, "status": deliveryStatus]], "stopCommands": []]
+            if deliveryStatus == "stopping" { view["stopCommands"] = [["identity": identity, "stopRequestID": "trusted-stop"]] }
+            if ticket { view["ticket"] = ["identity": identity, "textSHA256": SHA256.hash(data: Data("delivery".utf8)).map { String(format: "%02x", $0) }.joined(), "textBytes": 8] }
+            return try JSONSerialization.data(withJSONObject: view)
+        }
+        let deliveryAuthority = RustSpeechDeliveryClient(scopeID: "fixture", hostSessionID: "host", call: { method, bytes in
+            let p = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+            if method == "speech_delivery_enqueue" {
+                enqueueCalls += 1
+                deliveryIdentity = .init(scopeID: "fixture", hostSessionID: "host", utteranceID: p["utteranceID"] as! String, generation: 1, provenance: nil)
+                revision += 1
+                return try deliveryView(ticket: true)
+            }
+            if method == "speech_delivery_wait" {
+                try await Task.sleep(for: .milliseconds(10))
+                return try deliveryView()
+            }
+            if method == "speech_delivery_cancel" {
+                let old = deliveryIdentity!
+                deliveryIdentity = .init(scopeID: old.scopeID, hostSessionID: old.hostSessionID, utteranceID: old.utteranceID, generation: 2, provenance: nil)
+                deliveryStatus = "stopping"; revision += 1
+                return try deliveryView()
+            }
+            let kind = p["kind"] as? String ?? "read"
+            receiptKinds.append(kind); revision += 1
+            if kind == "played" { deliveryStatus = "delivered" }
+            if kind == "stopped" {
+                let stopped = p["identity"] as! [String: Any]
+                precondition(stopped["generation"] as? Int == 2 && p["stopRequestID"] as? String == "trusted-stop")
+                deliveryStatus = "cancelled"
+            }
+            return try deliveryView()
+        })
+        let delivery = RustSpeechDeliveryPlayback(authority: deliveryAuthority,
+            player: StreamingPCMPlayer(makeDevice: { deliveryDevice }),
+            start: { _, _, ticket in
+                let stream = DeliveryStream(identity: ticket.identity)
+                return stream
+            }, onPlaybackChanged: { _ in }, onPendingChanged: { _ in }, onFailure: { _ in fatalError("delivery fixture failure") })
+        delivery.submit(text: "delivery", configuration: .init(apiKey: "fixture"), mode: "fifo", completion: { deliveryOutcomes.append($0) })
+        try await until("scheduled receipt") { receiptKinds.contains("scheduled") }
+        check(deliveryOutcomes.isEmpty, "provider EOF is not native delivered")
+        check(!receiptKinds.contains("played"), "played is not fabricated at schedule")
+        deliveryDevice.drain()
+        try await until("delivery played receipt") { deliveryOutcomes == [.finished] }
+        check(receiptKinds.prefix(3).elementsEqual(["device_started", "scheduled", "played"]), "native schedule and played acknowledgements ordered")
+        deliveryStatus = "queued"; receiptKinds.removeAll(); deliveryOutcomes.removeAll()
+        delivery.submit(text: "delivery", configuration: .init(apiKey: "fixture"), mode: "fifo", completion: { deliveryOutcomes.append($0) })
+        try await until("cancel delivery schedule") { receiptKinds.contains("scheduled") }
+        delivery.cancel()
+        try await until("real delivery stopped") { deliveryOutcomes == [.cancelled] }
+        check(deliveryDevice.stopped && receiptKinds.contains("stopped"), "authority new generation stop command receives real native stop ACK")
+        deliveryDevice.drain()
+        try await Task.sleep(for: .milliseconds(20))
+        check(!receiptKinds.contains("played"), "old device callback cannot ACK new generation")
+        // An issued chat ticket must enter the native player without a second enqueue.
+        let priorEnqueues = enqueueCalls
+        deliveryIdentity = .init(scopeID: "fixture", hostSessionID: "host", utteranceID: "issued-chat", generation: 3, provenance: nil)
+        deliveryStatus = "queued"; revision += 1; receiptKinds.removeAll()
+        let issuedView = try JSONDecoder().decode(RustSpeechDeliveryClient.View.self, from: deliveryView(ticket: true))
+        await delivery.submitIssued(utteranceID: "issued-chat", text: "delivery", configuration: .init(apiKey: "fixture"), view: issuedView)
+        await delivery.submitIssued(utteranceID: "issued-chat", text: "delivery", configuration: .init(apiKey: "fixture"), view: issuedView)
+        try await until("issued chat schedules real mock device") { receiptKinds.contains("scheduled") }
+        check(enqueueCalls == priorEnqueues, "issued ticket never re-enqueues or invents another utterance")
+        check(receiptKinds.filter { $0 == "scheduled" }.count == 1, "duplicate issued ticket starts exactly once")
+        deliveryDevice.drain()
+        try await until("issued chat played acknowledgement") { deliveryStatus == "delivered" }
+        await delivery.submitIssued(utteranceID: "issued-chat", text: "delivery", configuration: .init(apiKey: "fixture"), view: issuedView)
+        check(enqueueCalls == priorEnqueues, "delivered issued ticket never replays")
+        var chatInput: [String: Any] = [:]
+        let chatAuthority = RustSpeechDeliveryClient(scopeID: "fixture", hostSessionID: "host", call: { method, bytes in
+            check(method == "chat_speech_event", "chat selection uses Rust raw event route")
+            chatInput = try JSONSerialization.jsonObject(with: bytes) as! [String: Any]
+            return Data("{\"duplicate\":false,\"dispatch\":null,\"delivery\":null}".utf8)
+        })
+        let source: [String: Any] = ["kind":"chat", "backend":"codex", "scopeID":"chat", "hostSessionID":"model-host", "requestID":"model-request"]
+        _ = try await chatAuthority.chatEvent(requestID: "ui-request", kind: "reply", source: source, testMuted: true)
+        check(chatInput["text"] == nil && chatInput["testMuted"] as? Bool == true, "native sends source identity and mute fact without selecting reply text")
+        check((chatInput["source"] as? [String: Any])?["requestID"] as? String == "model-request", "actual model request identity preserved")
         if ProcessInfo.processInfo.environment["GMGN_PCM_ACTUAL_SILENT"] == "1" {
             check(ProcessInfo.processInfo.environment["GMGN_UNITY_TEST_MUTED"] == "1",
                   "real output test requires per-app mute")
@@ -194,7 +314,7 @@ let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("gmg
 try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: scratch) }
 let driver = scratch.appendingPathComponent("main.swift"), binary = scratch.appendingPathComponent("checks")
-try program.write(to: driver, atomically: true, encoding: .utf8)
+try (program + "\n" + hostTypeProbe).write(to: driver, atomically: true, encoding: .utf8)
 let compiler = Process(); compiler.executableURL = URL(fileURLWithPath: "/usr/bin/env")
 compiler.arguments = ["swiftc", "-j1", "-swift-version", "6", "-parse-as-library"] + production + [driver.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit(); guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }

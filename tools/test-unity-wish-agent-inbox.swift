@@ -33,10 +33,14 @@ struct WishEvent {
     let autoContinuationPaused: Bool? = nil; let continuationResumeAuthorizationID: UUID? = nil
 }
 @MainActor final class WishMachineCoordinator {
+    var continuationIDs: Set<UUID>?
+    func waitUntilReady() async throws {}
     var jobs: [Job] = []; var events: [WishEvent] = []; var acked: [UUID] = []; var published: [UUID] = []; var failPersist = false; var failPersistAfter: Int? = nil
     func residentJobs(worldID: String, residentScope: String) -> [Job] { jobs }
     func unpublishedEvents(worldID: String, residentScope: String) -> [WishEvent] { [] }
-    func automaticContinuationEvents(worldID: String, residentScope: String) -> [WishEvent] { events }
+    func automaticContinuationEvents(worldID: String, residentScope: String) -> [WishEvent] {
+        events.filter { continuationIDs?.contains($0.id) ?? true }
+    }
     func markEventPublished(id: UUID) throws { published.append(id) }
     func acknowledgeEvent(id: UUID, worldID: String, residentScope: String) throws {
         guard worldID == "world.origin", residentScope == "resident.origin", events.contains(where: { $0.id == id }), !failPersist else { throw PropTaskDaemonError.invalidFrame }
@@ -110,7 +114,8 @@ struct WishEvent {
         _ = try await notifications.synchronize(rows: [], tasks: [], coordinator: coordinator, store: store, outputIsRendered: { _ in true })
         check(received.count == 2 && store.acked.isEmpty, "failed conversation releases admission for bounded scheduler retry")
         coordinator.failPersist = true
-        do { try notifications.didConsume([received[0].0], coordinator: coordinator); check(false, "persist failure must surface") } catch {}
+        try notifications.didConsume([received[0].0], coordinator: coordinator)
+        do { _ = try await notifications.synchronize(rows: [], tasks: [], coordinator: coordinator, store: store, outputIsRendered: { _ in true }); check(false, "persist failure must surface") } catch {}
         check(coordinator.acked.isEmpty && notifications.snapshot()["awaitingAcknowledgement"] as? Int == 1, "persist failure retains completed model receipt for retry")
         notifications.didNotConsume([received[0].0])
         do { _ = try await notifications.synchronize(rows: [], tasks: [], coordinator: coordinator, store: store, outputIsRendered: { _ in true }); check(false, "unpersisted receipt must surface") } catch {}
@@ -143,12 +148,55 @@ struct WishEvent {
         }
         _ = try await batch.synchronize(rows: [], tasks: [], coordinator: batchCoordinator, store: batchStore, outputIsRendered: { _ in true })
         batchCoordinator.failPersistAfter = 1
-        do { try batch.didConsume(batchEvents, coordinator: batchCoordinator); check(false, "partial batch persist failure surfaces") } catch {}
+        try batch.didConsume(batchEvents, coordinator: batchCoordinator)
+        do { _ = try await batch.synchronize(rows: [], tasks: [], coordinator: batchCoordinator, store: batchStore, outputIsRendered: { _ in true }); check(false, "partial batch persist failure surfaces") } catch {}
         batch.didNotConsume(batchEvents)
         do { _ = try await batch.synchronize(rows: [], tasks: [], coordinator: batchCoordinator, store: batchStore, outputIsRendered: { _ in true }) } catch {}
         check(batchCoordinator.acked.count == 1 && batchEvents.count == 3, "partial receipt batch never reruns completed tail events")
         check(batchStore.acked.allSatisfy(batchCoordinator.acked.contains), "only committed receipt can ACK daemon")
         check(batch.snapshot()["pendingDurableWrites"] as? Int == 2, "diagnostics expose unconfirmed durable receipt writes")
+        let deniedCoordinator = WishMachineCoordinator(), deniedStore = PropGenerationStore()
+        deniedCoordinator.jobs = coordinator.jobs; deniedStore.jobs = store.jobs
+        deniedCoordinator.continuationIDs = []
+        let denied = UnityWorldNotifications(worldID: "world.origin", residentScope: "resident.origin", inbox: UnityInboxBridge())
+        var deniedEvents: [(ResidentAgentLoop.Event, Bool)] = []
+        denied.onAgentEvent = { deniedEvents.append(($0, $1)); return true }
+        for (sequence, kind) in ["wish.failed", "wish.cancelled", "wish.interrupted", "wish.placed", "wish.stateChanged"].enumerated() {
+            let id = UUID()
+            deniedCoordinator.events.append(.init(id: id, wishID: wishID, objectID: "prop.output", kind: .outputReady))
+            var payload = message.payload
+            payload["resume_authorization_id"] = .string(UUID().uuidString)
+            _ = denied.receive(consumer: "agent", message: .init(id: id, taskId: taskID, worldID: "world.origin", residentScope: "resident.origin", kind: kind, payload: payload, sequence: sequence))
+        }
+        _ = try await denied.synchronize(rows: [], tasks: [], coordinator: deniedCoordinator, store: deniedStore, outputIsRendered: { _ in true })
+        check(deniedEvents.count == 5 && deniedEvents.allSatisfy { !$0.1 }, "native terminal kinds and resume-looking payloads cannot replace denied Rust continuation membership")
+        check(deniedStore.acked.isEmpty && deniedCoordinator.acked.isEmpty, "ordinary delivery does not acknowledge denied continuation facts")
+        _ = try await denied.synchronize(rows: [], tasks: [], coordinator: deniedCoordinator, store: deniedStore, outputIsRendered: { _ in true })
+        check(deniedEvents.count == 5, "same receipt/event identities do not duplicate queued observations")
+        if let raw = ProcessInfo.processInfo.environment["GMGN_CONTINUATION_RECEIPT"] {
+            let receipt = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as! [String: Any]
+            let archive = receipt["archive"] as! [String: Any]
+            let views = receipt["views"] as! [String: Any]
+            let actual = WishMachineCoordinator(), actualStore = PropGenerationStore()
+            actual.jobs = coordinator.jobs; actualStore.jobs = store.jobs
+            actual.continuationIDs = Set((views["continuationEvents"] as! [[String: Any]]).map { UUID(uuidString: $0["id"] as! String)! })
+            let owner = UnityWorldNotifications(worldID: "world.origin", residentScope: "resident.origin", inbox: UnityInboxBridge())
+            var classified: [String: Bool] = [:]
+            var actualDeliveries = 0
+            owner.onAgentEvent = { actualDeliveries += 1; classified[$0.id] = $1; return true }
+            for (sequence, row) in (archive["events"] as! [[String: Any]]).enumerated() {
+                let id = UUID(uuidString: row["id"] as! String)!
+                actual.events.append(.init(id: id, wishID: wishID, objectID: "prop.output", kind: .outputReady))
+                _ = owner.receive(consumer: "agent", message: .init(id: id, taskId: taskID, worldID: "world.origin", residentScope: "resident.origin", kind: "wish." + (row["kind"] as! String), payload: message.payload, sequence: sequence))
+            }
+            _ = try await owner.synchronize(rows: [], tasks: [], coordinator: actual, store: actualStore, outputIsRendered: { _ in true })
+            let expected = Set(ProcessInfo.processInfo.environment["GMGN_EXPECTED_CONTINUATION_IDS"]!.split(separator: ",").map(String.init))
+            check(classified.count == (archive["events"] as! [Any]).count, "actual private RPC receipt delivers every pending fact")
+            check(classified.allSatisfy { expected.contains(String($0.key.dropFirst(5))) == $0.value }, "production Unity consumer uses exact Rust RPC continuation membership")
+            check(actualStore.acked.isEmpty && actual.acked.isEmpty, "actual RPC projection is not a completion ACK")
+            _ = try await owner.synchronize(rows: [], tasks: [], coordinator: actual, store: actualStore, outputIsRendered: { _ in true })
+            check(actualDeliveries == (archive["events"] as! [Any]).count, "actual RPC receipt replay preserves one admission per event")
+        }
         print("PASS: \(checks) production Unity wish notification policy checks (transport/UI doubles)")
     }
 }

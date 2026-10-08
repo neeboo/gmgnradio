@@ -4,6 +4,21 @@ import simd
 import Testing
 @testable import GMGNRadio
 
+// These window/layout tests do not exercise Marble business operations.
+// Their explicit transport rejects every authority request and package action.
+@MainActor
+func stageMarbleLibraryForUI(spatialStage: SpatialStageStore) -> MarbleWorldLibrary {
+    let privateRoot = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-stage-ui-" + UUID().uuidString)
+    return MarbleWorldLibrary(
+        client: MarbleWorldClient(baseURL: URL(string: "http://127.0.0.1:9")!,
+            apiKeyProvider: MarbleAPIKeyProvider(fileURL: privateRoot.appendingPathComponent("absent-key"))),
+        cache: MarbleWorldCache(rootURL: privateRoot.appendingPathComponent("cache")),
+        spatialStage: spatialStage,
+        authority: RustMarbleControlClient(call: { _, _ in throw RustMarbleControlError.unavailable }, hostSessionID: UUID().uuidString),
+        preparePackage: { _ in throw RustMarbleControlError.unavailable }
+    )
+}
+
 @Test
 func marbleViewportUsesTheActualDrawableSizeBeforeItsResizeCallback() {
     let resolved = MarbleViewportMetrics.resolve(
@@ -430,8 +445,11 @@ func macOSAppBuildEnablesSigningForMicrophoneEntitlements() throws {
 @Test
 @MainActor
 func stageWindowControllerReusesTheOpenWindowAndCanReopen() {
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
-        audioFeatures: VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -457,9 +475,12 @@ func stageWindowControllerReusesTheOpenWindowAndCanReopen() {
 @MainActor
 func stageWindowControllerRunsAudioMonitoringOnlyWhilePresented() {
     let monitor = StageAudioMonitorSpy()
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        audioMonitor: monitor
+        audioMonitor: monitor,
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -477,7 +498,8 @@ func openingThePlayerDoesNotStartAFullSpaceTransition() {
     let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        spatialStage: spatialStage
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
     var fullSpaceTransitionCount = 0
     controller.setOnWillPresentSpaceHandler {
@@ -496,7 +518,8 @@ func showingTheStageInPlayerModeDoesNotPresentTheLiveCamByItself() {
     let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        spatialStage: spatialStage
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
     var playerPresentationCount = 0
     controller.setOnShowPlayerHandler {
@@ -517,7 +540,8 @@ func enteringSpaceFromThePlayerStartsAFullSpaceTransition() throws {
     let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        spatialStage: spatialStage
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
     var fullSpaceTransitionCount = 0
     controller.setOnWillPresentSpaceHandler {
@@ -547,7 +571,8 @@ func switchingFromSpaceToPlayerRestoresTheLiveCamCompanion() throws {
     spatialStage.requestWorldPresentation()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        spatialStage: spatialStage
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
     var playerPresentationCount = 0
     controller.setOnShowPlayerHandler {
@@ -571,9 +596,18 @@ func switchingFromSpaceToPlayerRestoresTheLiveCamCompanion() throws {
 
 @Test
 @MainActor
-func playerKeepsTheSharedAvatarSurfaceInLiveCamUntilSpaceStarts() throws {
+func playerKeepsTheSharedAvatarSurfaceInLiveCamUntilSpaceStarts() async throws {
     let spatialStage = SpatialStageStore()
-    let marbleLibrary = MarbleWorldLibrary(spatialStage: spatialStage)
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(fixture) {} }
+    let binary = try #require(ProcessInfo.processInfo.environment["GMGN_TASKD_TEST_BINARY"] ?? ProcessInfo.processInfo.environment["TASKD_BIN"])
+    let marbleLibrary = MarbleWorldLibrary(
+        client: MarbleWorldClient(baseURL: URL(string: "http://127.0.0.1:9")!, apiKeyProvider: MarbleAPIKeyProvider(fileURL: fixture.root.appendingPathComponent("absent-key"))),
+        cache: MarbleWorldCache(rootURL: fixture.root.appendingPathComponent("cache")),
+        spatialStage: spatialStage,
+        authority: RustMarbleControlClient(root: fixture.root, helperPath: binary, allowsLaunching: false, hostSessionID: UUID().uuidString),
+        preparePackage: { _ in throw RustMarbleControlError.unavailable }
+    )
     let renderSurfaceController = StageRenderSurfaceController(
         spatialStage: spatialStage,
         library: marbleLibrary
@@ -607,9 +641,18 @@ func playerKeepsTheSharedAvatarSurfaceInLiveCamUntilSpaceStarts() throws {
 
 @Test
 @MainActor
-func localLivingPodSelectionSuspendsMarbleWorldPreparation() async {
+func localLivingPodSelectionSuspendsMarbleWorldPreparation() async throws {
     let spatialStage = SpatialStageStore()
-    let marbleLibrary = MarbleWorldLibrary(spatialStage: spatialStage)
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(fixture) {} }
+    let binary = try #require(ProcessInfo.processInfo.environment["GMGN_TASKD_TEST_BINARY"] ?? ProcessInfo.processInfo.environment["TASKD_BIN"])
+    let marbleLibrary = MarbleWorldLibrary(
+        client: MarbleWorldClient(baseURL: URL(string: "http://127.0.0.1:9")!, apiKeyProvider: MarbleAPIKeyProvider(fileURL: fixture.root.appendingPathComponent("absent-key"))),
+        cache: MarbleWorldCache(rootURL: fixture.root.appendingPathComponent("cache")),
+        spatialStage: spatialStage,
+        authority: RustMarbleControlClient(root: fixture.root, helperPath: binary, allowsLaunching: false, hostSessionID: UUID().uuidString),
+        preparePackage: { _ in throw RustMarbleControlError.unavailable }
+    )
 
     marbleLibrary.selectLocalWorld(
         id: LivingPodScene.worldID,
@@ -624,13 +667,20 @@ func localLivingPodSelectionSuspendsMarbleWorldPreparation() async {
 }
 
 @Test
-func defaultSpacePreferenceStartsWithTheLivingPod() throws {
+@MainActor
+func defaultSpacePreferenceStartsWithTheLivingPod() async throws {
     let suiteName = "DefaultSpacePreferenceTests-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
+    let settings = RustProductSettingsClient(root: authority.root)
+    settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
+    try await settings.ensureLoaded()
+    let confirmed = try #require(settings.confirmed)
 
     #expect(
-        DefaultSpacePreference.load(defaults: defaults) == .livingPod
+        DefaultSpacePreference(rawValue: confirmed.values.defaultSpace) == .livingPod
     )
     #expect(
         DefaultSpacePreference.allCases.map(\.title) == [
@@ -644,15 +694,24 @@ func defaultSpacePreferenceStartsWithTheLivingPod() throws {
 }
 
 @Test
-func defaultSpacePreferencePersistsTheLastMarbleChoice() throws {
+@MainActor
+func defaultSpacePreferencePersistsTheLastMarbleChoice() async throws {
     let suiteName = "DefaultSpacePreferencePersistence-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defer { defaults.removePersistentDomain(forName: suiteName) }
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
+    let settings = RustProductSettingsClient(root: authority.root)
+    settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
+    try await settings.ensureLoaded()
 
-    DefaultSpacePreference.lastMarbleWorld.save(defaults: defaults)
+    _ = try await settings.apply(["defaultSpace": DefaultSpacePreference.lastMarbleWorld.rawValue])
+    let restored = RustProductSettingsClient(root: authority.root)
+    try await restored.reload()
+    let confirmed = try #require(restored.confirmed)
 
     #expect(
-        DefaultSpacePreference.load(defaults: defaults)
+        DefaultSpacePreference(rawValue: confirmed.values.defaultSpace)
             == .lastMarbleWorld
     )
 }
@@ -660,8 +719,11 @@ func defaultSpacePreferencePersistsTheLastMarbleChoice() throws {
 @Test
 @MainActor
 func stageWindowControllerIncludesAWindowModeButton() {
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
-        audioFeatures: VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -681,8 +743,11 @@ func stageWindowControllerIncludesAWindowModeButton() {
 @Test
 @MainActor
 func stageWindowIncludesAnExpandableVisualPicker() {
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
-        audioFeatures: VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -708,8 +773,11 @@ func stageWindowIncludesAnExpandableVisualPicker() {
 @Test
 @MainActor
 func stageComposesVideoBelowTheTransparentMetalParticles() throws {
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
-        audioFeatures: VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -740,7 +808,8 @@ func stageComposesTheSpatialWorldAboveParticlesWithoutCapturingInput() throws {
     spatialStage.requestWorldPresentation()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        spatialStage: spatialStage
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -867,7 +936,8 @@ func stageDestinationButtonStaysAvailableAcrossStageModes() throws {
     let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
-        spatialStage: spatialStage
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
 
     controller.show()
@@ -946,8 +1016,11 @@ func stagePointCloudPickerIncludesTheMineradioDerivedCorePresets() {
 @MainActor
 func stagePlaybackButtonControlsAndReflectsTheRealPlayerState() {
     var toggleCount = 0
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage),
         playbackState: .paused,
         onTogglePlayback: { toggleCount += 1 }
     )
@@ -976,8 +1049,11 @@ func stagePlaybackButtonControlsAndReflectsTheRealPlayerState() {
 @Test
 @MainActor
 func stageTransportActionsLiveInOneCompactControlIsland() {
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage),
         playbackState: .playing
     )
 
@@ -1038,8 +1114,11 @@ func stageTransportActionsLiveInOneCompactControlIsland() {
 @MainActor
 func stageVoiceButtonStartsConversationAndReflectsLiveActivity() {
     var toggleCount = 0
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage),
         voiceState: .disconnected,
         onToggleVoice: { toggleCount += 1 }
     )
@@ -1097,8 +1176,11 @@ func stageVoiceButtonStartsConversationAndReflectsLiveActivity() {
 func stagePreviousAndNextButtonsCallTheProgramNavigationActions() {
     var previousCount = 0
     var nextCount = 0
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage),
         playbackState: .playing,
         onPreviousTrack: { previousCount += 1 },
         onNextTrack: { nextCount += 1 }
@@ -1143,13 +1225,18 @@ func stagePreviousAndNextButtonsCallTheProgramNavigationActions() {
 
 @Test
 @MainActor
-func stageProgramButtonRevealsAndHidesTheSpatialProgramRail() {
-    let store = DJProgramStore()
-    store.publish(stageProgramPlan(trackCount: 6))
-    store.activateSlot(at: 1)
+func stageProgramButtonRevealsAndHidesTheSpatialProgramRail() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let store = DJProgramStore(client: fixture.client)
+    let plan = try await fixture.seed(stageProgramPlan(trackCount: 6))
+    try await store.publish(plan)
+    try await store.activateSlot(at: 1)
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
         audioFeatures: VisualAudioFeatureStore(),
         programStore: store,
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage),
         playbackState: .playing
     )
 
@@ -1328,7 +1415,7 @@ func worldCameraDragUsesWindowLocationsWhenEventDeltasAreZero() {
 
 @Test
 @MainActor
-func programRailOpensAndPlaysASyncedMusicPlaylist() {
+func programRailOpensAndPlaysASyncedMusicPlaylist() async throws {
     let playlist = MusicPlaylistSnapshot(
         id: "netease:playlist:liked",
         providerID: .netease,
@@ -1339,8 +1426,15 @@ func programRailOpensAndPlaysASyncedMusicPlaylist() {
             stageCandidate(index: 1),
         ]
     )
-    let libraryStore = SyncedMusicLibraryStore()
+    let encoded = try JSONDecoder().decode(PropTaskJSON.self, from: JSONEncoder().encode([playlist]))
+    let storage = MusicStorageClient(includeDefaultLegacy: false, call: { method, _ in
+        #expect(method == "music_library_edit" || method == "music_library_read")
+        // A fixed confirmed authority projection; this UI test never reduces edits.
+        return ["playlists": encoded, "revision": .number(1)]
+    })
+    let libraryStore = SyncedMusicLibraryStore(storage: storage)
     libraryStore.merge(playlists: [playlist])
+    try await libraryStore.flush()
     var playedSelections: [String] = []
     let selection = StageProgramRailSelection(
         onPlayPlaylist: { playlistID, trackIndex in
@@ -1363,7 +1457,8 @@ func programRailOpensAndPlaysASyncedMusicPlaylist() {
 }
 
 @Test
-func syncedPlaylistProgramKeepsTheProviderTrackOrder() {
+@MainActor
+func syncedPlaylistProgramKeepsTheProviderTrackOrder() async throws {
     let playlist = MusicPlaylistSnapshot(
         id: "netease:playlist:liked",
         providerID: .netease,
@@ -1372,9 +1467,11 @@ func syncedPlaylistProgramKeepsTheProviderTrackOrder() {
         tracks: (0 ..< 12).map(stageCandidate(index:))
     )
 
-    let plan = SyncedPlaylistProgramBuilder.makePlan(
-        from: playlist,
-        generatedAt: Date(timeIntervalSince1970: 100)
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
+    _ = try await authority.storage.edit(.merge([playlist], batchID: UUID().uuidString), requestID: UUID().uuidString)
+    let plan = try await SyncedPlaylistProgramBuilder.makePlan(
+        from: playlist, client: authority.client
     )
 
     #expect(plan.brief.id == playlist.id)
@@ -1384,7 +1481,8 @@ func syncedPlaylistProgramKeepsTheProviderTrackOrder() {
 }
 
 @Test
-func syncedPlaylistDoesNotAppearTwiceAfterItStartsPlaying() {
+@MainActor
+func syncedPlaylistDoesNotAppearTwiceAfterItStartsPlaying() async throws {
     let playlist = MusicPlaylistSnapshot(
         id: "netease:playlist:liked",
         providerID: .netease,
@@ -1392,7 +1490,10 @@ func syncedPlaylistDoesNotAppearTwiceAfterItStartsPlaying() {
         artworkURL: nil,
         tracks: [stageCandidate(index: 0)]
     )
-    let plan = SyncedPlaylistProgramBuilder.makePlan(from: playlist)
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
+    _ = try await authority.storage.edit(.merge([playlist], batchID: UUID().uuidString), requestID: UUID().uuidString)
+    let plan = try await SyncedPlaylistProgramBuilder.makePlan(from: playlist, client: authority.client)
     let visible = StageProgramRailCatalog.visiblePrograms(
         [
             SavedDJProgram(

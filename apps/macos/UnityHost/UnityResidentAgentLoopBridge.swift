@@ -7,6 +7,8 @@ final class UnityResidentAgentLoopBridge {
     static let enabledKey = "resident.autonomous.enabled.v1"
     let context: WorldAgentContext
     private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
+    var ambientEnabled: Bool { settings.confirmed?.values.autonomyEnabled ?? false }
     private let now: @MainActor () -> Date
     private let available: @MainActor () -> Bool
     private let run: @MainActor (ResidentAgentLoop.Input) async throws -> String
@@ -19,28 +21,41 @@ final class UnityResidentAgentLoopBridge {
     private var pausedForEditing = false
     private var started = false
     private var backgroundOwner: UUID?
-    private(set) lazy var loop = ResidentAgentLoop(
+    private var rustScheduler: RustResidentSchedulerClient?
+    private var schedulerBackend: String?
+    var humanRun: (@MainActor (ResidentAgentLoop.Input) async throws -> String)?
+    var humanCancel: (@MainActor () -> Void)?
+    var usesRustScheduler: Bool { rustScheduler != nil }
+    private(set) lazy var loop: ResidentAgentLoop = ResidentAgentLoop(
         now: now,
         run: { [weak self] input in
-            guard let self, !self.closed, !self.humanTurn, !self.pausedForEditing,
-                  self.available(), input.isBackground, !input.isHumanOrderedTurn else {
+            guard let self, !self.closed, !self.pausedForEditing, self.available() else {
                 throw CancellationError()
             }
+            if !input.isBackground, let humanRun = self.humanRun {
+                return try await humanRun(input)
+            }
+            guard !self.humanTurn, input.isBackground, !input.isHumanOrderedTurn else { throw CancellationError() }
             self.backgroundOwner = input.runID
             defer {
                 if self.backgroundOwner == input.runID { self.backgroundOwner = nil }
             }
             return try await self.run(input)
         },
-        onReply: { [weak self] text in self?.reply(text) },
+        onReply: { [weak self] text in
+            guard let self else { return }
+            if self.usesRustScheduler && !self.loop.lastFinishedRunWasBackground { return }
+            self.reply(text)
+        },
         onChange: { [weak self] in self?.changed() },
         onCancel: { [weak self] in
-            guard let self, self.backgroundOwner != nil else { return }
+            guard let self else { return }
+            guard self.backgroundOwner != nil else { self.humanCancel?(); return }
             self.backgroundOwner = nil
             self.cancelRun()
         })
 
-    init(context: WorldAgentContext, defaults: UserDefaults,
+    init(context: WorldAgentContext, defaults: UserDefaults, settings: RustProductSettingsClient = .shared,
          now: @escaping @MainActor () -> Date = { Date() },
          available: @escaping @MainActor () -> Bool,
          run: @escaping @MainActor (ResidentAgentLoop.Input) async throws -> String,
@@ -49,6 +64,8 @@ final class UnityResidentAgentLoopBridge {
          onChange: @escaping @MainActor () -> Void = {}) {
         self.context = context
         self.defaults = defaults
+        self.settings = settings
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
         self.now = now
         self.available = available
         self.run = run
@@ -70,16 +87,27 @@ final class UnityResidentAgentLoopBridge {
         }
     }
 
+    /// Explicit migration binding. The model owner remains the selected chat
+    /// backend; Rust alone grants scheduling leases in this mode.
+    func bindScheduler(_ scheduler: RustResidentSchedulerClient?, backend: String) {
+        guard schedulerBackend != backend || rustScheduler !== scheduler else { return }
+        schedulerBackend = backend
+        rustScheduler = scheduler
+        loop.bindRustScheduler(scheduler, availability: { [weak self] in
+            guard let self else { return false }
+            return !self.closed && !self.pausedForEditing && self.available()
+        })
+    }
+
     func refresh() {
         guard !closed else { return }
         if (!available() || humanTurn || pausedForEditing) && loop.snapshot.isBackgroundRun {
             loop.cancel()
         }
-        let enabled = defaults.object(forKey: Self.enabledKey) == nil
-            || defaults.bool(forKey: Self.enabledKey)
-        loop.setBackgroundTurnsPerHour(ResidentPreferences(defaults: defaults).backgroundTurnsPerHour)
+        let enabled = ambientEnabled
+        loop.setBackgroundTurnsPerHour(ResidentPreferences(defaults: defaults, settings: settings).backgroundTurnsPerHour)
         loop.setBackgroundEnabled(started && enabled && available() && !humanTurn && !pausedForEditing)
-        if started && available() && !humanTurn && !pausedForEditing { loop.tick() }
+        if started && available() && !pausedForEditing && (!humanTurn || usesRustScheduler) { loop.tick() }
     }
 
     /// Call before chat.send, after validating the draft. Cancel only the background
@@ -97,16 +125,24 @@ final class UnityResidentAgentLoopBridge {
 
     func pauseByUser() {
         guard !closed else { return }
-        defaults.set(false, forKey: Self.enabledKey)
         loop.stop()
-        refresh()
+        Task { [weak self] in
+            guard let self, !closed else { return }
+            _ = try? await settings.apply(["autonomyEnabled": false])
+            guard !closed else { return }; refresh(); changed()
+        }
     }
 
     func resumeByUser() {
         guard !closed else { return }
-        defaults.set(true, forKey: Self.enabledKey)
-        _ = loop.resumeAutonomyByUser()
-        refresh()
+        Task { [weak self] in
+            guard let self, !closed else { return }
+            do {
+                _ = try await settings.apply(["autonomyEnabled": true])
+                guard !closed else { return }
+                _ = loop.resumeAutonomyByUser(); refresh(); changed()
+            } catch { /* Keep the confirmed stop when the authority rejects resume. */ }
+        }
     }
 
     func receive(_ event: ResidentAgentLoop.Event) {

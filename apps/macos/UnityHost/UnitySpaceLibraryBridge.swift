@@ -18,6 +18,7 @@ import WorldRuntime
     private var roots: [URL]
     private let marble: (any UnityMarbleWorldCommands)?
     private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
     private let productDefaults: UserDefaults?
     private let livingPodWorldID: String?
     private let selectedWorldID: @MainActor () -> String?
@@ -38,20 +39,20 @@ import WorldRuntime
          requestSelection: @escaping @MainActor (BundledLivingWorldPackage, UInt64) -> Bool,
          loadMarbleWorlds: (@MainActor () async throws -> [MarbleWorld])? = nil,
          productDefaults: UserDefaults? = nil, livingPodWorldID: String? = nil,
-         marble: (any UnityMarbleWorldCommands)? = nil) {
+         marble: (any UnityMarbleWorldCommands)? = nil,
+         settings: RustProductSettingsClient = .shared) {
         roots = registeredPackageRoots; self.defaults = defaults
+        self.settings = settings
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
         self.marble = marble
         self.productDefaults = productDefaults; self.livingPodWorldID = livingPodWorldID
         self.selectedWorldID = selectedWorldID; self.requestSelection = requestSelection
         self.loadMarbleWorlds = loadMarbleWorlds
         reload()
     }
-    var savedSelectionID: String? { defaults.string(forKey: "unity.space.selectedWorldID") }
+    var savedSelectionID: String? { settings.confirmed?.values.selectedWorldID }
     private var defaultSpace: DefaultSpacePreference {
-        // An explicit Unity choice wins; absence inherits the original product
-        // preference without modifying its separate defaults domain.
-        DefaultSpacePreference.load(defaults: defaults.object(forKey: DefaultSpacePreference.defaultsKey) == nil
-            ? productDefaults ?? defaults : defaults)
+        settings.confirmed.flatMap { DefaultSpacePreference(rawValue: $0.values.defaultSpace) } ?? .livingPod
     }
     var defaultSpaceSnapshot: [String: Any] {
         ["defaultSpace": defaultSpace.rawValue,
@@ -63,8 +64,7 @@ import WorldRuntime
         switch defaultSpace {
         case .livingPod: return livingPodWorldID.map { [$0] } ?? []
         case .lastMarbleWorld:
-            return [defaults.string(forKey: "marble.selected-world-id"), savedSelectionID,
-                    productDefaults?.string(forKey: "marble.selected-world-id")].compactMap { $0 }
+            return savedSelectionID.map { [$0] } ?? []
         }
     }
     var snapshot: [String: Any] {
@@ -96,7 +96,11 @@ import WorldRuntime
         case _ where op.hasPrefix("space.marble."): return marble?.command(value) ?? false
         case "space.default":
             guard let raw = value["value"] as? String, let preference = DefaultSpacePreference(rawValue: raw) else { return false }
-            preference.save(defaults: defaults); return true
+            Task { [weak self] in
+                do { _ = try await self?.settings.apply(["defaultSpace": preference.rawValue]) }
+                catch { self?.noticeCode = "space_library_save_failed" }
+            }
+            return true
         case "space.library.load": guard pending == nil else { return false }; reload(); refreshMarble(); return true
         case "space.library.select":
             guard pending == nil, let id = value["id"] as? String,
@@ -118,9 +122,18 @@ import WorldRuntime
               let current = try? validated(entry.package.packageRoot), current.manifestHash == pending.hash else {
             noticeCode = "space_library_switch_failed"; return false
         }
-        defaults.set(worldID, forKey: "unity.space.selectedWorldID")
-        defaults.set(worldID, forKey: "marble.selected-world-id")
-        noticeCode = "space_library_selected"; return true
+        noticeCode = "space_library_saving"
+        let ids = entries.keys.sorted()
+        Task { [weak self] in
+            do {
+                guard let self, !closed else { return }
+                try await settings.bindWorldCatalog(ids)
+                try await settings.selectWorld(worldID)
+                guard !closed, self.revision == revision else { return }
+                noticeCode = "space_library_selected"
+            } catch { self?.noticeCode = "space_library_save_failed" }
+        }
+        return true
     }
     @discardableResult func registerPackage(_ package: BundledLivingWorldPackage) -> Bool {
         guard !closed, let entry = try? validated(package.packageRoot),

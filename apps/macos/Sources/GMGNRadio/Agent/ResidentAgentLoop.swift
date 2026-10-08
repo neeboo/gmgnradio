@@ -1,5 +1,6 @@
 import Foundation
 import os
+import CryptoKit
 
 /// 宿主**没有**把这一轮发给居民时的具名拒绝（例如"摆放面板正开着，这一条没有发出去"）。
 ///
@@ -744,6 +745,27 @@ final class ResidentAgentLoop {
     private var lastTurnEndedAt: Date?
     private var backgroundTurnDates: [Date] = []
     private var backgroundEnabled = false
+    // Explicit migration injection only. Its presence disables the old tick dispatcher.
+    private var rustScheduler: RustResidentSchedulerClient?
+    private var rustSchedulerAvailability: (@MainActor () -> Bool)?
+    private var rustSteer: (@MainActor (RustResidentSchedulerClient.SteeringInput) async -> ResidentSteeringDelivery)?
+    private var rustScheduleTask: Task<Void, Never>?
+    private var rustNextPollAt: Date?
+    private var rustOpportunityInput: Data?
+    private var rustOpportunityID = UUID().uuidString
+    private var rustTicket: RustResidentSchedulerClient.Ticket?
+    /// Read-only binding for the already persisted execution lease. Hosts must
+    /// never fabricate a run/event identity when constructing Rust CLI tools.
+    func claimedRustBinding(runID: UUID) -> (scheduler: RustResidentSchedulerClient, ticket: RustResidentSchedulerClient.Ticket)? {
+        guard activeRunID == runID, let scheduler = rustScheduler,
+              let ticket = rustTicket, ticket.runID == runID else { return nil }
+        return (scheduler, ticket)
+    }
+    private var rustHumanScheduleTask: Task<Void, Never>?
+    private var rustHumanBatch: [Message]?
+    private var rustHumanEventID: String?
+    private var rustHumanRetryAt: Date?
+    private var rustCancelledSteering: [UUID: Task<Void, Never>] = [:]
     private var stopped = false
     private var invalidated = false
     private var lastFailure: String?
@@ -783,6 +805,7 @@ final class ResidentAgentLoop {
     private var restUntilTrigger = false
     private var runStartIntent: Intent?
     private var memory: ResidentMemoryStore?
+    private var intentPauseTask: Task<Void, Never>?
     private var memoryScope: ResidentStateScope?
     private var memoryBindGeneration = 0
     /// 恢复状态机：只有 restored/empty 才放行自主；failed 保留失败并等待节流重试；
@@ -820,7 +843,10 @@ final class ResidentAgentLoop {
         onInterruption: @escaping @MainActor ([UUID], ResidentChatTurn.Interruption) -> Void = { _, _ in },
         onChange: @escaping @MainActor () -> Void = {},
         onCancel: @escaping @MainActor () -> Void = {},
-        onUserStop: @escaping @MainActor () -> Void = {}
+        onUserStop: @escaping @MainActor () -> Void = {},
+        rustScheduler: RustResidentSchedulerClient? = nil,
+        rustSchedulerAvailability: (@MainActor () -> Bool)? = nil,
+        rustSteer: (@MainActor (RustResidentSchedulerClient.SteeringInput) async -> ResidentSteeringDelivery)? = nil
     ) {
         self.now = now
         self.configuration = configuration
@@ -833,6 +859,9 @@ final class ResidentAgentLoop {
         self.onChange = onChange
         self.onCancel = onCancel
         self.onUserStop = onUserStop
+        self.rustScheduler = rustScheduler
+        self.rustSchedulerAvailability = rustSchedulerAvailability
+        self.rustSteer = rustSteer
     }
 
     var snapshot: Snapshot {
@@ -900,6 +929,13 @@ final class ResidentAgentLoop {
             }
             return
         }
+        if rustScheduler != nil, let submissionID,
+           let previous = (messages + activeRunMessages).first(where: { $0.submissionID == submissionID }) {
+            if previous.text != text || previous.imageURLs != imageURLs {
+                onFailure("同一提交身份对应了不同输入，未重复发送")
+            }
+            return
+        }
         stopped = false
         noteMutation()
         if !imageURLs.isEmpty {
@@ -934,6 +970,9 @@ final class ResidentAgentLoop {
 
     func receiveEvent(_ event: Event) {
         guard !invalidated, !activeRunEventIDs.contains(event.id), !seenEventIDs.contains(event.id) else { return }
+        // A new host fact invalidates the previous denied opportunity, while
+        // ordinary render ticks retain the existing transport cadence.
+        rustNextPollAt = nil
         seenEventIDs.append(event.id)
         let limit = max(1, configuration.maximumQueuedEvents)
         seenEventIDs = Array(seenEventIDs.suffix(limit * 4))
@@ -966,6 +1005,7 @@ final class ResidentAgentLoop {
               !pendingContinuationIDs.contains(event.id), !activeRunContinuationIDs.contains(event.id),
               pendingContinuationIDs.count < max(1, configuration.maximumQueuedEvents) else { return }
         pendingContinuationIDs.insert(event.id)
+        rustNextPollAt = nil
         // A previously observed event may now carry the host's continuation
         // grant. Promote a pending observation without adding it twice.
         if pendingEvents.contains(where: { $0.id == event.id }) { return }
@@ -976,6 +1016,7 @@ final class ResidentAgentLoop {
     func setBackgroundEnabled(_ enabled: Bool) {
         guard backgroundEnabled != enabled else { return }
         backgroundEnabled = enabled
+        rustNextPollAt = nil
         if !enabled && activeRunID != nil && activeRunIsBackground && activeRunContinuationIDs.isEmpty {
             // 自主可用性回收不是用户停止：它取消本轮，但不写"用户停止过"。
             cancelCurrentRun(reason: .system)
@@ -992,87 +1033,128 @@ final class ResidentAgentLoop {
         let clamped = min(6, max(0, limit))
         guard clamped != backgroundTurnsPerHour else { return }
         backgroundTurnsPerHour = clamped
+        rustNextPollAt = nil
         onChange()
     }
 
     func tick() {
-        guard backgroundEnabled || !pendingContinuationIDs.isEmpty,
-              !invalidated, !stopped, !intentPausedByUser, activeRunID == nil, messages.isEmpty,
-              !memoryRestoreBlocksAutonomy else { return }
-        let date = now()
-        guard lastWakeAt.map({ date.timeIntervalSince($0) >= max(1, configuration.minimumWakeInterval) }) ?? true else { return }
-        backgroundTurnDates.removeAll { date.timeIntervalSince($0) >= 3600 }
-        guard backgroundTurnDates.count < max(0, backgroundTurnsPerHour) else { return }
-        switch intent?.status {
-        case .waitingUser:
-            // An outstanding decision blocks ambient activity, but does not
-            // revoke an existing task's authorization to report its outcome.
-            guard !pendingContinuationIDs.isEmpty else { return }
-        case .waitingEvent:
-            // Queued facts wake a wait. An elapsed self-scheduled deadline is a single
-            // opportunity: after the resident declines it (no event, same plan) it rests
-            // instead of re-firing the stale or renewed deadline on every later tick.
-            guard !pendingEvents.isEmpty
-                || (!restUntilTrigger && intent?.wakeAt.map({ date >= $0 }) == true) else { return }
-        case .completed:
-            let idleReviewDue = (lastTurnEndedAt ?? lastWakeAt).map {
-                date.timeIntervalSince($0) >= max(configuration.minimumWakeInterval, configuration.idleReviewInterval)
-            } ?? false
-            // A resting resident already declined the periodic opportunity: only a queued
-            // event or human input (or its own intent update) may wake it again.
-            guard !pendingEvents.isEmpty || (!restUntilTrigger && idleReviewDue) else { return }
-        case .active:
-            if let wakeAt = intent?.wakeAt, pendingEvents.isEmpty, date < wakeAt { return }
-            // 计划型意图由真实结果/事件推进：定时器只检查推进条件与安排到期。
-            // 条件未满足时不得重新规划，也不能凭计时认定任务成功。
-            if intent?.advanceWhen != nil, intent?.wakeAt == nil, pendingEvents.isEmpty { return }
-            // A declined opportunity rests completely: queued events already cleared
-            // restUntilTrigger on arrival, so a resting resident never re-fires the same
-            // plan's free cadence or renewed self-scheduled deadline.
-            guard !restUntilTrigger else { return }
-        case nil:
-            // No standing plan: an enabled idle tick may invite one new plan, but a resident
-            // that repeatedly leaves no plan is resting, not waiting for more pings.
-            guard !pendingEvents.isEmpty || !restUntilTrigger else { return }
+        if completedResult != nil, activeRunID != nil {
+            reconcileFinishedRun()
+            return
         }
-        beginRun(userMessages: [], isBackground: true)
+        if let rustScheduler {
+            if activeRunID == nil, !messages.isEmpty {
+                if rustHumanRetryAt.map({ now() >= $0 }) ?? true { drainUserMessages() }
+                return
+            }
+            tickRustScheduler(rustScheduler)
+            return
+        }
+        // No authority is available: keep queued facts and never grant a native turn.
+    }
+
+    /// The host supplies facts and executes a claimed turn; Rust alone grants the
+    /// wake and charges the durable budget. No failure falls back to Swift tick.
+    private func tickRustScheduler(_ scheduler: RustResidentSchedulerClient) {
+        guard rustScheduleTask == nil, rustHumanScheduleTask == nil, activeRunID == nil, messages.isEmpty,
+              !invalidated, !stopped, !intentPausedByUser, !memoryRestoreBlocksAutonomy,
+              rustSchedulerAvailability?() == true,
+              memoryScope.map({ $0.worldID == scheduler.worldID && $0.residentScope == scheduler.residentScope }) ?? true else { return }
+        let date = now()
+        if let next = rustNextPollAt, date < next { return }
+        // A render-driven caller must not turn a denied wake into per-frame RPC/SQLite work.
+        rustNextPollAt = date.addingTimeInterval(1)
+        var opportunity: [String: Any] = [
+            "intentID": "resident-standing-intent", "kind": pendingContinuationIDs.isEmpty ? "background" : "continuation",
+            "intentState": intent?.status.rawValue ?? "active", "hasPendingEvent": !pendingEvents.isEmpty,
+            "restUntilTrigger": restUntilTrigger,
+            "advanceConditionPending": intent?.advanceWhen != nil]
+        if let wake = intent?.wakeAt { opportunity["wakeAtMillis"] = Int64(wake.timeIntervalSince1970 * 1000) }
+        if intent?.status == .completed, let last = lastTurnEndedAt ?? lastWakeAt {
+            opportunity["wakeAtMillis"] = Int64((last.timeIntervalSince1970 + max(configuration.minimumWakeInterval, configuration.idleReviewInterval)) * 1000)
+        }
+        opportunity["eventIDs"] = pendingEvents.map(\.id).sorted()
+        opportunity["continuationIDs"] = pendingContinuationIDs.sorted()
+        opportunity["intentSummary"] = intent?.summary ?? ""
+        guard let encoded = try? JSONSerialization.data(withJSONObject: opportunity, options: [.sortedKeys]) else { return }
+        if encoded != rustOpportunityInput { rustOpportunityInput = encoded; rustOpportunityID = UUID().uuidString }
+        let eventID = rustOpportunityID
+        let generation = mutationGeneration
+        let expectedIntent = intent
+        let expectedEvents = pendingEvents.map(\.id).sorted()
+        let expectedContinuations = pendingContinuationIDs
+        let expectedLimit = backgroundTurnsPerHour
+        let config: [String: Any] = ["hourlyLimit": min(6, max(0, backgroundTurnsPerHour)),
+            "minimumWakeIntervalSeconds": min(86400, max(1, Int(configuration.minimumWakeInterval))),
+            "backgroundEnabled": backgroundEnabled, "userStopped": stopped || intentPausedByUser,
+            "humanTurn": !messages.isEmpty, "available": rustSchedulerAvailability?() == true]
+        rustScheduleTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.rustScheduleTask = nil
+                if !self.messages.isEmpty { self.drainUserMessages() }
+            }
+            do {
+                guard let ticket = try await scheduler.claim(eventID: eventID, configuration: config,
+                    opportunity: opportunity, nowMillis: Int64(date.timeIntervalSince1970 * 1000)) else { return }
+                guard self.rustScheduler === scheduler, self.mutationGeneration == generation,
+                      !self.invalidated, !self.stopped, !self.intentPausedByUser,
+                      self.rustSchedulerAvailability?() == true,
+                      self.intent == expectedIntent,
+                      self.pendingEvents.map(\.id).sorted() == expectedEvents,
+                      self.pendingContinuationIDs == expectedContinuations,
+                      self.backgroundTurnsPerHour == expectedLimit,
+                      self.activeRunID == nil, self.messages.isEmpty,
+                      self.memoryScope.map({ $0.worldID == scheduler.worldID && $0.residentScope == scheduler.residentScope }) ?? true,
+                      self.backgroundEnabled || !self.pendingContinuationIDs.isEmpty else {
+                    try await scheduler.finish(ticket, outcome: "cancelled", invocationStarted: false)
+                    return
+                }
+                self.rustTicket = ticket
+                self.rustOpportunityInput = nil
+                self.beginRun(userMessages: [], isBackground: true, claimedRunID: ticket.runID)
+            } catch {
+                // No raw HTTP payloads, credentials or user text in a scheduler diagnostic.
+                if self.rustScheduler === scheduler, self.mutationGeneration == generation {
+                    self.lastFailure = "Rust 居民调度尚未完成，等待核验或重试"
+                    self.onChange()
+                }
+            }
+        }
+    }
+
+    /// A scope/session switch never transfers an old claim to the new authority.
+    /// Formal bootstraps do not call this until the migration runtime gate passes.
+    func bindRustScheduler(_ scheduler: RustResidentSchedulerClient?, availability: @escaping @MainActor () -> Bool,
+                           steering: (@MainActor (RustResidentSchedulerClient.SteeringInput) async -> ResidentSteeringDelivery)? = nil) {
+        if rustScheduler === scheduler { return }
+        cancelCurrentRun(reason: .system)
+        rustScheduler = scheduler
+        rustSchedulerAvailability = availability
+        rustSteer = steering
+        rustTicket = nil
+        rustHumanBatch = nil
+        rustHumanEventID = nil
+        rustHumanRetryAt = nil
+        rustOpportunityInput = nil
+        rustNextPollAt = nil
+        rustOpportunityID = UUID().uuidString
     }
 
     func updateIntent(summary: String, status: IntentStatus, wakeAfterSeconds: Double?, runID: UUID? = nil,
-                      resumePausedIntent: Bool = false, plan: IntentPlanRevision? = nil) throws {
+                      resumePausedIntent: Bool = false, plan: IntentPlanRevision? = nil) async throws {
         guard let current = activeRunID, isCurrent(runID: current), runID == nil || current == runID else {
             throw ControlError.inactiveRun
         }
-        if resumePausedIntent && !activeRunHasHumanInput { throw ControlError.missingHumanGuidance }
-        if intentPausedByUser && !resumePausedIntent { throw ControlError.pausedIntent }
-        let summary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !summary.isEmpty, summary.count <= 2000 else { throw ControlError.invalidSummary }
-        if let delay = wakeAfterSeconds {
-            guard delay.isFinite, delay >= 1, delay <= 86400,
-                  status == .active || status == .waitingEvent else { throw ControlError.invalidWake }
-        }
-        // 计划字段缺省保持旧值；显式空串清除。来源缺省继承，首轮按本轮是否有
-        // 人类输入判定。计划只能引用当前可用活动与对象，执行仍通过正式工具。
-        let previous = intent
-        func resolved(_ fresh: String?, _ old: String?) -> String? {
-            guard let fresh else { return old }
-            let trimmed = fresh.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : String(trimmed.prefix(500))
-        }
-        intent = Intent(
-            summary: summary, status: status, wakeAt: wakeAfterSeconds.map { now().addingTimeInterval($0) },
-            goal: resolved(plan?.goal, previous?.goal),
-            currentStep: resolved(plan?.currentStep, previous?.currentStep),
-            nextSteps: plan?.nextSteps.map { steps in
-                steps.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }.prefix(8).map { String($0.prefix(500)) }
-            } ?? previous?.nextSteps,
-            advanceWhen: resolved(plan?.advanceWhen, previous?.advanceWhen),
-            lastOutcome: previous?.lastOutcome,
-            adjustReason: resolved(plan?.adjustReason, previous?.adjustReason),
-            source: plan?.source ?? previous?.source
-                ?? (activeRunHasHumanInput ? .userDelegated : .autonomous))
-        if resumePausedIntent { intentPausedByUser = false }
+        guard let memory, let scope = memoryScope, let ticket = rustTicket,
+              ticket.runID == current else { throw ControlError.inactiveRun }
+        let generation = memoryBindGeneration
+        let value = try await memory.update(scope: scope, runID: current, hostSessionID: ticket.hostSessionID,
+            summary: summary, status: status, wakeAfterSeconds: wakeAfterSeconds,
+            resumePausedIntent: resumePausedIntent, plan: plan, now: now())
+        guard isCurrent(runID: current), memoryScope == scope, memoryBindGeneration == generation else { throw ControlError.inactiveRun }
+        intent = value.intent
+        intentPausedByUser = value.intentPausedByUser
         controlledRunID = current
         noteMutation()
         onChange()
@@ -1129,19 +1211,50 @@ final class ResidentAgentLoop {
     @discardableResult
     func resumeAutonomyByUser() -> Bool {
         guard !invalidated else { return false }
-        var changed = false
-        if intentPausedByUser { intentPausedByUser = false; changed = true }
-        // 只有在没有进行中轮次、也没有排队消息时才清 stopped：
-        // 人类的一次"恢复"绝不能把已被停止或尚未交接的 run 复活。
-        if stopped, activeRunID == nil, messages.isEmpty { stopped = false; changed = true }
-        guard changed else { return false }
-        noteMutation()
-        onChange()
-        persistMemorySnapshot()
+        guard intentPausedByUser || stopped else { return false }
+        requestIntentPause("resumeUser")
+        // Accepted UI request only. The paused projection changes after receipt.
         return true
+    }
+    private func requestIntentPause(_ action: String) {
+        guard let memory, let scope = memoryScope else { return }
+        let generation = memoryBindGeneration
+        let previous = intentPauseTask
+        intentPauseTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            do {
+                let value = try await memory.pause(scope: scope, action: action)
+                guard self.memoryScope == scope, self.memoryBindGeneration == generation else { return }
+                self.intent = value.intent; self.intentPausedByUser = value.intentPausedByUser
+                if action == "resumeUser", self.activeRunID == nil, self.messages.isEmpty { self.stopped = false }
+                self.noteMutation(); self.onChange()
+            } catch {
+                guard self.memoryScope == scope, self.memoryBindGeneration == generation else { return }
+                self.lastFailure = error.localizedDescription; self.onChange()
+            }
+        }
     }
 
     private func cancelCurrentRun(reason: CancellationReason) {
+        if let eventID = rustHumanEventID, let scheduler = rustScheduler {
+            Task { try? await scheduler.cancelPending(eventID: eventID) }
+        }
+        rustHumanBatch = nil; rustHumanEventID = nil; rustHumanRetryAt = nil
+        if let ticket = rustTicket, let scheduler = rustScheduler {
+            if let steeringTask { rustCancelledSteering[ticket.runID] = steeringTask }
+            if let result = completedResult {
+                let outstanding = steeringTask
+                let outcome = rustOutcome(result, silentAllowed: controlledRunID == ticket.runID)
+                Task {
+                    await outstanding?.value
+                    try? await scheduler.finish(ticket, outcome: outcome, invocationStarted: true)
+                    self.rustCancelledSteering.removeValue(forKey: ticket.runID)
+                }
+            }
+            Task { try? await scheduler.requestCancellation(ticket) }
+            // Do not confirm stopping here. The invocation's actual return owns its receipt.
+        }
         let stopAutonomy = reason == .userStop
         // 循环自己回收的这一轮**不会**经过 `finishIfReady`（`activeRunID` 立刻清零），
         // 所以宿主写下的"为什么停下"在这里也必须丢掉，免得留给以后某一轮。
@@ -1151,7 +1264,7 @@ final class ResidentAgentLoop {
         // （"取消这一轮"从来不等于"恢复自主"）。
         if stopAutonomy {
             stopped = true
-            intentPausedByUser = true
+            requestIntentPause("userStop")
         }
         noteMutation()
         // 取消一次仍在进行、尚未产出结果的模型轮次只记一次取消；迟到结果因 run
@@ -1341,19 +1454,80 @@ final class ResidentAgentLoop {
             }
             return
         }
-        let batch = messages
-        let images = messages.flatMap(\.imageURLs)
-        messages.removeAll()
-        if !images.isEmpty {
-            ResidentImageChainLog.note(
-                "居民图片链[3] 出队成轮 消息=\(batch.count) 图片=\(images.count) 文件=[\(images.map(\.lastPathComponent).joined(separator: ","))]"
-            )
+        if let scheduler = rustScheduler {
+            drainRustHumanMessages(scheduler)
+            return
         }
-        beginRun(userMessages: batch.map(\.text), imageURLs: images, isBackground: false, submissions: batch)
+        // Preserve submissions until the genuine Rust scheduler is bound.
     }
 
-    private func beginRun(userMessages: [String], imageURLs: [URL] = [], isBackground: Bool, submissions: [Message] = []) {
-        let id = UUID()
+    private func rustMessageID(_ message: Message) -> String { (message.submissionID ?? message.id).uuidString }
+    private func rustInputRef(_ message: Message) -> [String: Any] {
+        let data = Data(message.text.utf8)
+        return ["submissionID": rustMessageID(message),
+            "inputSHA256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
+            "imageReferences": message.imageURLs.map(\.absoluteString)]
+    }
+    private func drainRustHumanMessages(_ scheduler: RustResidentSchedulerClient) {
+        guard rustHumanScheduleTask == nil, rustScheduleTask == nil,
+              rustSchedulerAvailability?() == true,
+              memoryScope.map({ $0.worldID == scheduler.worldID && $0.residentScope == scheduler.residentScope }) ?? true else { return }
+        if rustHumanBatch == nil { rustHumanBatch = messages; rustHumanEventID = "human." + UUID().uuidString }
+        guard let batch = rustHumanBatch, let eventID = rustHumanEventID else { return }
+        let ids = batch.map(rustMessageID)
+        let refs = Dictionary(uniqueKeysWithValues: batch.map { (rustMessageID($0), rustInputRef($0)) })
+        let config: [String: Any] = ["hourlyLimit": min(6, max(0, backgroundTurnsPerHour)),
+            "minimumWakeIntervalSeconds": min(86400, max(1, Int(configuration.minimumWakeInterval))),
+            "backgroundEnabled": backgroundEnabled, "userStopped": stopped || intentPausedByUser,
+            "available": rustSchedulerAvailability?() == true]
+        let date = now()
+        rustHumanRetryAt = date.addingTimeInterval(1)
+        rustHumanScheduleTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.rustHumanScheduleTask = nil }
+            do {
+                let ticket = try await scheduler.claimHuman(eventID: eventID, messageIDs: ids, inputRefs: refs,
+                    configuration: config, nowMillis: Int64(date.timeIntervalSince1970 * 1000))
+                guard self.rustScheduler === scheduler, !self.invalidated, !self.stopped,
+                      self.rustHumanEventID == eventID, self.activeRunID == nil,
+                      self.rustSchedulerAvailability?() == true,
+                      self.memoryScope.map({ $0.worldID == scheduler.worldID && $0.residentScope == scheduler.residentScope }) ?? true else {
+                    if let ticket { try await scheduler.finish(ticket, outcome: "cancelled", invocationStarted: false) }
+                    else { try? await scheduler.cancelPending(eventID: eventID) }
+                    return
+                }
+                guard let ticket else { return }
+                let batchIDs = Set(batch.map(\.id))
+                guard batch.allSatisfy({ item in self.messages.contains(where: { $0.id == item.id }) }) else {
+                    try await scheduler.finish(ticket, outcome: "cancelled", invocationStarted: false); return
+                }
+                self.messages.removeAll { batchIDs.contains($0.id) }
+                self.rustHumanBatch = nil; self.rustHumanEventID = nil; self.rustHumanRetryAt = nil
+                self.rustTicket = ticket
+                self.beginRun(userMessages: batch.map(\.text), imageURLs: batch.flatMap(\.imageURLs),
+                    isBackground: false, submissions: batch, claimedRunID: ticket.runID)
+                if !self.messages.isEmpty { self.beginSteering() }
+            } catch {
+                if self.rustScheduler === scheduler, !self.invalidated, !self.stopped {
+                    self.lastFailure = "Rust 人类轮次调度待核验，消息未重复发送"
+                    self.onChange()
+                }
+            }
+        }
+    }
+
+    private func rustOutcome(_ result: Result<String, Error>, silentAllowed: Bool) -> String {
+        switch result {
+        case .success(let reply): return reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !silentAllowed ? "failed" : "completed"
+        case .failure(let error): return error is CancellationError ? "cancelled" : "failed"
+        }
+    }
+
+    private func beginRun(userMessages: [String], imageURLs: [URL] = [], isBackground: Bool, submissions: [Message] = [], claimedRunID: UUID? = nil) {
+        let id = claimedRunID ?? UUID()
+        let scheduler = claimedRunID == nil ? nil : rustScheduler
+        let ticket = claimedRunID == nil ? nil : rustTicket
+        let invocationBindGeneration = memoryBindGeneration
         noteMutation()
         // 轮次开始数不在此计：调度出的轮次可能被停止/取消而从未真正调用模型。
         let input = Input(runID: id, userMessages: userMessages, imageURLs: imageURLs, events: pendingEvents,
@@ -1387,11 +1561,15 @@ final class ResidentAgentLoop {
             )
         }
         task = Task { @MainActor [weak self] in
-            guard let self, self.isCurrent(runID: id), !Task.isCancelled else { return }
+            guard let self else { return }
+            guard self.isCurrent(runID: id), !Task.isCancelled else {
+                if let scheduler, let ticket { try? await scheduler.finish(ticket, outcome: "cancelled", invocationStarted: false) }
+                return
+            }
             // 调度出轮次不等于真正调用：后台轮次在越过守卫、即将调用前必须按运行时
             // 预算（含刚被下调、已经把既有用量算满的情形）重核一次。预算不允许时
             // 只回滚这次尚未开始的调度，不取消任何已经开始或已有结果的调用。
-            if isBackground, !self.backgroundBudgetAllows(self.now()) {
+            if isBackground, claimedRunID == nil, !self.backgroundBudgetAllows(self.now()) {
                 self.discardUnstartedBackgroundSchedule(runID: id)
                 return
             }
@@ -1415,7 +1593,32 @@ final class ResidentAgentLoop {
                 }
                 result = .failure(error)
             }
-            guard self.isCurrent(runID: id) else { return }
+            guard self.isCurrent(runID: id) else {
+                if let scheduler, let ticket {
+                    await self.rustCancelledSteering[ticket.runID]?.value
+                    let receipt = try? await scheduler.finish(ticket, outcome: self.rustOutcome(result, silentAllowed: false), invocationStarted: true)
+                    self.rustCancelledSteering.removeValue(forKey: ticket.runID)
+                    if case .terminal? = receipt {
+                        // Let a claim issued while the old slot was busy finish
+                        // before scheduling the receipt-driven retry.
+                        await self.rustHumanScheduleTask?.value
+                    }
+                    if case .terminal? = receipt,
+                       self.rustScheduler === scheduler,
+                       self.memoryBindGeneration == invocationBindGeneration,
+                       self.memoryScope.map({ $0.worldID == scheduler.worldID && $0.residentScope == scheduler.residentScope }) ?? true,
+                       !self.invalidated, self.activeRunID == nil,
+                       self.rustTicket == nil || self.rustTicket?.runID == ticket.runID {
+                        if self.rustTicket?.runID == ticket.runID { self.rustTicket = nil }
+                        // The genuine terminal receipt releases the old slot.
+                        // Retry queued input now instead of waiting for a prior
+                        // busy response's business-clock backoff.
+                        self.rustHumanRetryAt = nil
+                        self.drainUserMessages()
+                    }
+                }
+                return
+            }
             // 提供方失败/取消是本轮真实终态：一旦当前轮接受结果就立即计数，不能等
             // finishIfReady——等待中的引导会推迟完成，而 stop 会丢弃 completedResult，
             // 从而漏记。失败与取消互斥且只在此处或空回复完成路径计一次，finish 侧不重复。
@@ -1446,10 +1649,37 @@ final class ResidentAgentLoop {
         // remaining ordered batch for the next turn once this turn rejected its head.
         messages[0].attemptedRunID = id
         let message = messages[0]
+        let scheduler = rustScheduler
+        let ticket = rustTicket
         steeringMessageID = message.id
         steeringTask = Task { @MainActor [weak self] in
             guard let self, self.isCurrent(runID: id), !Task.isCancelled else { return }
-            let delivery = await self.steer(message.text)
+            let delivery: ResidentSteeringDelivery
+            if let scheduler {
+                guard let ticket, ticket.runID == id else { return }
+                do {
+                    let admission = try await scheduler.admitSteering(ticket, messageID: self.rustMessageID(message), inputRef: self.rustInputRef(message))
+                    if admission.0 {
+                        if self.isCurrent(runID: id), !Task.isCancelled {
+                            let input = RustResidentSchedulerClient.SteeringInput(ticket: ticket,
+                                messageID: self.rustMessageID(message),
+                                inputSHA256: self.rustInputRef(message)["inputSHA256"] as! String,
+                                text: message.text)
+                            // Migration mode never routes an admitted guide through the
+                            // legacy callback lacking its durable identity.
+                            let actual = await self.rustSteer?(input) ?? .notDelivered
+                            try await scheduler.finishSteering(ticket, messageID: self.rustMessageID(message), delivery: actual)
+                            delivery = actual
+                        } else {
+                            try await scheduler.finishSteering(ticket, messageID: self.rustMessageID(message), delivery: .notDelivered)
+                            delivery = .notDelivered
+                        }
+                    } else { delivery = admission.1 }
+                } catch {
+                    // No uncertain admission/provider write is retried with a fresh ID.
+                    delivery = .unknown
+                }
+            } else { delivery = await self.steer(message.text) }
             guard self.isCurrent(runID: id) else { return }
             self.steeringTask = nil
             self.steeringMessageID = nil
@@ -1471,8 +1701,57 @@ final class ResidentAgentLoop {
         }
     }
 
+    private var rustFinishingRunID: UUID?
+    private var rustFinishAttemptRunID: UUID?
+    private var rustFinishRetryUptime: TimeInterval = 0
+
+    /// Notification after a trusted native terminal receipt; the scheduler is
+    /// queried again and this notification never supplies completion evidence.
+    func reconcileFinishedRun() {
+        guard let runID = activeRunID, completedResult != nil else { return }
+        finishIfReady(runID: runID)
+    }
+
     private func finishIfReady(runID: UUID) {
         guard isCurrent(runID: runID), steeringTask == nil, let result = completedResult else { return }
+        guard rustFinishingRunID == nil else { return }
+        // Transport polling uses monotonic real time, independently of the
+        // resident's business clock. The render tick cannot issue per-frame RPCs.
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard rustFinishAttemptRunID != runID || uptime >= rustFinishRetryUptime else { return }
+        guard let scheduler = rustScheduler, let ticket = rustTicket, ticket.runID == runID else {
+            lastFailure = "Rust 轮次完成权威缺失，结果待核验"
+            onChange()
+            return
+        }
+        let outcome = rustOutcome(result, silentAllowed: controlledRunID == runID)
+        rustFinishAttemptRunID = runID
+        rustFinishRetryUptime = uptime + 1
+        rustFinishingRunID = runID
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.rustFinishingRunID == runID { self.rustFinishingRunID = nil } }
+            do {
+                let receipt = try await scheduler.finish(ticket, outcome: outcome, invocationStarted: true)
+                guard self.rustScheduler === scheduler, self.isCurrent(runID: runID),
+                      self.rustTicket?.runID == runID else { return }
+                guard case .terminal = receipt else {
+                    self.lastFailure = "Rust 取消执行尚未确认，后续消息未发送"
+                    self.onChange()
+                    return
+                }
+                self.rustTicket = nil
+                self.finishConfirmedRun(runID: runID, result: result)
+            } catch {
+                guard self.rustScheduler === scheduler, self.isCurrent(runID: runID) else { return }
+                self.lastFailure = "Rust 轮次完成回执待核验，后续消息未发送"
+                self.onChange()
+            }
+        }
+    }
+
+    private func finishConfirmedRun(runID: UUID, result: Result<String, Error>) {
+        guard isCurrent(runID: runID) else { return }
         let wasBackground = activeRunIsBackground
         // 回调（onReply/onFailure）里 activeRunIsBackground 已清零，先把本轮归属
         // 留给宿主读取，后台回合才不会在回调里被误当成用户回合抢开聊天。

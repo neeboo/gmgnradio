@@ -1559,6 +1559,13 @@ impl Render for AgentSettingsPane {
                     .child(self.command_button("unity-video-choose", "导入视频", json!({"op":"video.choose"}), cx))
                     .child(Button::new("unity-video-play").small().label(settings_copy(locale, if video["playing"].as_bool()==Some(true) { "暂停" } else { "播放" })).disabled(video["selectedID"].is_null() && video["activeID"].is_null()).on_click(cx.listener(|this,_,_,cx|{this.commands.push(json!({"op":if this.snapshot["video"]["playing"].as_bool()==Some(true) { "video.pause" } else { "video.play" }}));cx.notify();})))
                     .child(self.command_button("unity-video-stop", "停止", json!({"op":"video.stop"}), cx)));
+            if let Some(notice)=video["notice"].as_str().filter(|s|!s.trim().is_empty()) {
+                videos=videos.child(div().id("unity-video-authority-notice").text_xs()
+                    .text_color(cx.theme().danger).child(notice.to_owned()));
+            }
+            if video["canRecoverStop"].as_bool()==Some(true) {
+                videos=videos.child(self.command_button("unity-video-recover-stop","停止并核验",json!({"op":"video.recoverStop"}),cx));
+            }
             if let Some(title) = video["currentTrackTitle"].as_str() {
                 videos = videos.child(div().text_color(cx.theme().muted_foreground)
                     .child(format!("{}: {}", settings_copy(locale, "当前歌曲"), title)));

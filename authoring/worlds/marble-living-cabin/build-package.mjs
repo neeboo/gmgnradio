@@ -117,7 +117,7 @@ const writeResource=async (file,data,kind,id)=>{
 };
 // 场景配置只留视觉放置：功能点**不进** marble.json，避免同一件事有第二份真相。
 await writeResource('marble.json',{world,framing:layout.framing,camera:layout.camera,jukebox:{position:jukebox.position,yaw:jukebox.yaw}},'scene.configuration','scene.configuration');
-await writeResource('jukebox.json',{id:'prop.jukebox',kind:'prop.procedural',renderer:'builtin.jukebox',position:jukebox.position,yaw:jukebox.yaw,activityID:'music.listen',effect:'player.resume',functionPoints:jukebox.functionPoints},'prop.procedural','prop.jukebox');
-await writeResource('wish-machine.json',{id:'wish_machine.device',kind:'prop.procedural',renderer:'builtin.wish_machine',position:wish.position,yaw:wish.yaw,size:wish.size,activityID:'wish_machine.collect',functionPoints:wish.functionPoints},'prop.procedural','wish_machine.device');
+await writeResource('jukebox.json',{id:'prop.jukebox',kind:'prop.procedural',renderer:'builtin.jukebox',position:jukebox.position,yaw:jukebox.yaw,activityID:'music.listen',effect:'player.resume',functionPoints:jukebox.functionPoints,placeBindings:jukebox.placeBindings},'prop.procedural','prop.jukebox');
+await writeResource('wish-machine.json',{id:'wish_machine.device',kind:'prop.procedural',renderer:'builtin.wish_machine',position:wish.position,yaw:wish.yaw,size:wish.size,activityID:'wish_machine.collect',functionPoints:wish.functionPoints,placeBindings:wish.placeBindings},'prop.procedural','wish_machine.device');
 await writeFile(join(destination,'world.json'),JSON.stringify(manifest,null,2)+'\n');
 console.log(JSON.stringify({worldID,destination,resources:manifest.resources.length,activities:manifest.activities.map(a=>a.id)},null,2));

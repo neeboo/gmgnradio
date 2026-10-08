@@ -92,6 +92,17 @@ private final class PCMLevelGate: @unchecked Sendable {
     /// Input is over; completion waits for the device's dataPlayedBack callbacks.
     func finish() async throws
     func stop()
+    /// Rust has already reserved this packet's playback window. Return once the
+    /// native device scheduled it; completion reports the real dataPlayedBack.
+    func schedulePacket(_ pcm16LE: Data, frameCount: Int,
+                        onPlayed: @escaping @MainActor @Sendable () -> Void) throws
+}
+
+extension StreamingPCMPlaying {
+    func schedulePacket(_ pcm16LE: Data, frameCount: Int,
+                        onPlayed: @escaping @MainActor @Sendable () -> Void) throws {
+        throw RustVoiceError.rejected("delivery_device_unavailable")
+    }
 }
 
 @MainActor protocol StreamingPCMDevice: AnyObject {
@@ -214,6 +225,25 @@ enum StreamingPCMCallbacks {
             } catch { queuedFrames -= count; throw error }
             offset = end
         }
+    }
+    func schedulePacket(_ pcm16LE: Data, frameCount: Int,
+                        onPlayed: @escaping @MainActor @Sendable () -> Void) throws {
+        guard let identity = generation, let device else { throw CancellationError() }
+        guard (1...4096).contains(frameCount), pcm16LE.count == frameCount * 2 else { throw RustVoiceError.invalidFrame }
+        let samples = decoder.decode(pcm16LE)
+        guard samples.count == frameCount, decoder.trailingByte == nil else { throw RustVoiceError.invalidFrame }
+        queuedFrames += frameCount; receivedFrames += frameCount
+        peakQueuedFrames = max(peakQueuedFrames, queuedFrames)
+        do {
+            try device.schedule(samples) { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.generation == identity else { return }
+                    self.queuedFrames -= frameCount
+                    if self.queuedFrames == 0 { self.observer?(.idle) }
+                    onPlayed()
+                }
+            }
+        } catch { queuedFrames -= frameCount; throw error }
     }
     func finish() async throws {
         guard let identity = generation else { throw CancellationError() }

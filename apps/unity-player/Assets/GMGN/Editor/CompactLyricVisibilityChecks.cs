@@ -31,9 +31,6 @@ namespace GMGN.UnityPlayer.Editor
                 bool Shown() => (bool)typeof(GpuLyricsView).GetField("shown", flags).GetValue(gpu);
                 Set("root", root); Set("compactWindow", compact); Set("gpuLyrics", gpu);
                 Set("lyric", root.Q<Label>("lyric")); Set("translation", root.Q<Label>("translation"));
-                Set("status", root.Q<Label>("status")); Set("chatPanel", root.Q("chatPanel"));
-                Set("volume", root.Q<Slider>("volume")); Set("play", root.Q<Button>("play"));
-                Set("playIcon", new PlayerScreen.ToolbarIcon("play")); Set("livecamPlayIcon", new PlayerScreen.ToolbarIcon("play"));
                 Set("sculpture", go.AddComponent<AudioSculpture>());
                 var snapshot = new PlayerSnapshot { locale = UiLocalization.LocaleCode, lyric = "Hello", translation = "こんにちは", lyricVisual = new LyricVisualSnapshot { mode = "monet_poster" } };
                 Call("OnSnapshot", snapshot); Require(Shown(), "Normal mode must show selected GPU lyrics");

@@ -28279,13 +28279,13 @@
       "id": "prop.jukebox",
       "path": "jukebox.json",
       "kind": "prop.procedural",
-      "sha256": "db0d9de732fe237ef01baaab9e1d9be7bd8b5d16f59991574e2f6db79b2f429e"
+      "sha256": "129342e5e1d008ce72ee62937fdd2d31b6a55c3a32cbd3ab65edcc88854293e0"
     },
     {
       "id": "wish_machine.device",
       "path": "wish-machine.json",
       "kind": "prop.procedural",
-      "sha256": "191aa91e8a722be0201060336cb46aeb01bd0d42c6feece0caa2c87e9af7e21b"
+      "sha256": "a00781fa2162ccb80ac2d64b8f6c09ab5efef6e893941bb58fd0c89ab409930e"
     }
   ]
 }

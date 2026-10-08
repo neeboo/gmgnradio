@@ -40,11 +40,18 @@ final class PresenceSettingsModel {
     private let motionStore: MotionPackageStore?
     private let motionStartupError: Error?
     private let defaults: UserDefaults
+    private let orbSettings: RustProductSettingsClient
+    private var orbSaveTask: Task<Void, Never>?
+    private var pendingOrbChanges: [String: Any] = [:]
     private let avatarRuntime: StageAvatarRuntimeStore
     private let onWillActivateMotion: (String) -> Void
     private let playbackCompatibility: (PresenceEngine?, StageMotionFormat) -> MotionCompatibility
     private var remoteMotionLibrary: RemoteMotionLibrary?
     private var importPanel: NSOpenPanel?
+    var onSelectionChanged: (() -> Void)?
+    private let renderPolicy: String
+    private let supportedEngines: Set<String>
+    private var selectionTask: Task<Void, Never>?
 
     private enum MotionPreferenceKey {
         static let vrm = "gmgn.presence.motion.preferred.vrm"
@@ -58,7 +65,10 @@ final class PresenceSettingsModel {
         avatarRuntime: StageAvatarRuntimeStore = .shared,
         presenceStore: PresencePackageStore? = nil,
         motionStore: MotionPackageStore? = nil,
+        productSettings: RustProductSettingsClient = .shared,
         remoteMotionLibrary: RemoteMotionLibrary? = nil,
+        renderPolicy: String = "native",
+        supportedEngines: Set<String> = ["orb", "vrm", "pmx", "live2d"],
         playbackCompatibility: ((PresenceEngine?, StageMotionFormat) -> MotionCompatibility)? = nil,
         onWillActivateMotion: @escaping (String) -> Void = { motionID in
             NotificationCenter.default.post(
@@ -68,6 +78,8 @@ final class PresenceSettingsModel {
         }
     ) {
         self.defaults = defaults
+        orbSettings = productSettings
+        self.renderPolicy = renderPolicy; self.supportedEngines = supportedEngines
         self.avatarRuntime = avatarRuntime
         self.onWillActivateMotion = onWillActivateMotion
         self.playbackCompatibility = playbackCompatibility ?? {
@@ -75,10 +87,8 @@ final class PresenceSettingsModel {
         }
         self.remoteMotionLibrary = remoteMotionLibrary
         remoteMotionCatalogURL = remoteMotionLibrary?.catalogURL.absoluteString
-            ?? MotionServiceConfiguration.resolvedCatalogURLString(
-                persisted: defaults.string(forKey: Self.motionCatalogURLKey)
-            )
-        orbAppearance = OrbAppearance.load(from: defaults)
+            ?? productSettings.confirmed?.values.remoteMotionCatalogURL ?? ""
+        orbAppearance = OrbAppearance.load(from: defaults, settings: productSettings)
         do {
             service = PresenceCommandService(
                 store: try presenceStore ?? PresencePackageStore.liveStore()
@@ -98,31 +108,55 @@ final class PresenceSettingsModel {
     }
 
     func setOrbColor(red: Float, green: Float, blue: Float) {
-        orbAppearance.red = red
-        orbAppearance.green = green
-        orbAppearance.blue = blue
-        orbAppearance.save(to: defaults)
-        orbAppearance = OrbAppearance.load(from: defaults)
+        scheduleOrbChanges(["orbRed": red, "orbGreen": green, "orbBlue": blue])
     }
 
     func setOrbFlowIntensity(_ value: Float) {
-        orbAppearance.flowIntensity = value
-        orbAppearance.save(to: defaults)
-        orbAppearance = OrbAppearance.load(from: defaults)
+        scheduleOrbChanges(["orbFlowIntensity": value])
+    }
+
+    private func scheduleOrbChanges(_ changes: [String: Any]) {
+        pendingOrbChanges.merge(changes) { _, newest in newest }
+        orbSaveTask?.cancel()
+        orbSaveTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            guard let self else { return }
+            let changes = pendingOrbChanges; pendingOrbChanges = [:]
+            do {
+                _ = try await orbSettings.apply(changes)
+                orbAppearance = OrbAppearance.load(from: defaults, settings: orbSettings)
+                NotificationCenter.default.post(name: .orbAppearanceDidChange, object: defaults)
+                message = "外观已保存。"; hasError = false
+            } catch { message = "外观未保存，请检查后台连接。"; hasError = true }
+        }
     }
 
     func load() {
-        guard let service, let motionStore else {
-            show(error: startupError ?? motionStartupError)
-            return
-        }
-        do {
-            packages = try service.list()
-            motions = try motionStore.listMotions()
-            activeMotionID = try motionStore.activeMotion().id
-            try refreshEffectiveMotionForActiveAvatar()
-        } catch {
-            show(error: error)
+        runSelection { try await self.loadConfirmed() }
+    }
+
+    func loadConfirmed() async throws {
+        try await orbSettings.ensureLoaded()
+        orbAppearance = OrbAppearance.load(from: defaults, settings: orbSettings)
+        if remoteMotionLibrary == nil { remoteMotionCatalogURL = orbSettings.confirmed?.values.remoteMotionCatalogURL ?? "" }
+        let service = try requireService(), motionStore = try requireMotionStore()
+        let catalog = try service.list(), clips = try motionStore.listMotions()
+        _ = try await service.store.selectionAuthority.bind(packages: catalog, motions: clips,
+            packageRoot: service.store.rootURL, motionRoot: motionStore.rootURL,
+            policy: renderPolicy, supportedEngines: supportedEngines,
+            builtInMotionIDs: Set(motionStore.builtInMotions.map(\.id)).union([MotionPackageStore.naturalIdleID]),
+            legacyPreferences: ["vrm": defaults.string(forKey: MotionPreferenceKey.vrm),
+                                "pmx": defaults.string(forKey: MotionPreferenceKey.pmx)].compactMapValues { $0 })
+        try refreshEffectiveMotionForActiveAvatar()
+        onSelectionChanged?()
+    }
+    private func runSelection(_ body: @escaping @MainActor () async throws -> Void) {
+        guard selectionTask == nil else { return }
+        isWorking = true
+        selectionTask = Task { [weak self] in
+            guard let self else { return }
+            defer { isWorking = false; selectionTask = nil }
+            do { try await body() } catch { show(error: error) }
         }
     }
 
@@ -250,31 +284,21 @@ final class PresenceSettingsModel {
     }
 
     func activateMotion(_ motion: StageMotionAsset) {
-        guard motionCompatibility(motion) == .compatible else { return }
-        do {
-            let store = try requireMotionStore()
-            onWillActivateMotion(motion.id)
-            savePreferredMotion(motion.id, for: activeAvatarEngine)
-            try store.activate(id: motion.id)
-            motions = try store.listMotions()
-            activeMotionID = motion.id
-            avatarRuntime.refresh()
-            show(message: "已切换为 \(motion.name)。")
-        } catch {
-            show(error: error)
-        }
+        runSelection { try await self.activateMotionConfirmed(motion) }
+    }
+    func activateMotionConfirmed(_ motion: StageMotionAsset) async throws {
+        onWillActivateMotion(motion.id)
+        try await requireMotionStore().activateAsync(id: motion.id)
+        try refreshEffectiveMotionForActiveAvatar(); onSelectionChanged?()
+        show(message: "正在载入 \(motion.name)…")
     }
 
     func removeMotion(_ motion: StageMotionAsset) {
-        do {
+        runSelection { [self] in
             let store = try requireMotionStore()
-            clearPreferredMotionReferences(to: motion.id)
-            try store.remove(id: motion.id)
-            motions = try store.listMotions()
-            try refreshEffectiveMotionForActiveAvatar()
+            try await store.removeAsync(id: motion.id)
+            try await loadConfirmed()
             show(message: "已移除 \(motion.name)。")
-        } catch {
-            show(error: error)
         }
     }
 
@@ -286,7 +310,8 @@ final class PresenceSettingsModel {
             publishedMotions = Self.latestPublishedMotions(
                 from: try await library.refresh()
             )
-            defaults.set(remoteMotionCatalogURL, forKey: Self.motionCatalogURLKey)
+            let confirmed = try await orbSettings.apply(["remoteMotionCatalogURL": library.catalogURL.absoluteString])
+            remoteMotionCatalogURL = confirmed.values.remoteMotionCatalogURL
             show(message: publishedMotions.isEmpty
                 ? "动作库当前没有可下载动作。"
                 : "已找到 \(publishedMotions.count) 个动作。")
@@ -302,13 +327,12 @@ final class PresenceSettingsModel {
             let store = try requireMotionStore()
             let installed = try await requireRemoteMotionLibrary().install(published)
             motions = try store.listMotions()
+            try await loadConfirmed()
             if motionCompatibility(installed) == .compatible {
                 onWillActivateMotion(installed.id)
-                savePreferredMotion(installed.id, for: activeAvatarEngine)
-                try store.activate(id: installed.id)
-                activeMotionID = installed.id
-                avatarRuntime.refresh()
-                show(message: "已安装并启用 \(installed.name)。")
+                try await store.activateAsync(id: installed.id)
+                try refreshEffectiveMotionForActiveAvatar(); onSelectionChanged?()
+                show(message: "已安装，正在载入 \(installed.name)。")
             } else {
                 activeMotionID = try store.activeMotion().id
                 show(message: published.format == "vmd"
@@ -383,25 +407,20 @@ final class PresenceSettingsModel {
     }
 
     private func installMotion(from sourceURL: URL) {
-        isWorking = true
-        defer { isWorking = false }
-        do {
+        runSelection { [self] in
             let store = try requireMotionStore()
             let installed = try store.installMotion(from: sourceURL)
             motions = try store.listMotions()
+            try await loadConfirmed()
             if motionCompatibility(installed) == .compatible {
                 onWillActivateMotion(installed.id)
-                savePreferredMotion(installed.id, for: activeAvatarEngine)
-                try store.activate(id: installed.id)
-                activeMotionID = installed.id
-                avatarRuntime.refresh()
-                show(message: "动作已安装并启用。")
+                try await store.activateAsync(id: installed.id)
+                try refreshEffectiveMotionForActiveAvatar(); onSelectionChanged?()
+                show(message: "动作已安装，正在载入。")
             } else {
                 activeMotionID = try store.activeMotion().id
                 show(message: "动作已安装；切换到兼容角色后即可使用。")
             }
-        } catch {
-            show(error: error)
         }
     }
 
@@ -439,9 +458,8 @@ final class PresenceSettingsModel {
             defer { try? FileManager.default.removeItem(at: localURL) }
 
             let installed = try service.store.installPackage(from: localURL)
-            try activateInstalledIfPossible(installed, using: service)
-            packages = try service.list()
-            try refreshEffectiveMotionForActiveAvatar()
+            try await loadConfirmed()
+            try await activateConfirmed(installed)
             downloadURL = ""
             show(message: "模型已安装。")
         } catch {
@@ -450,40 +468,29 @@ final class PresenceSettingsModel {
     }
 
     func activate(_ package: PresencePackage) {
-        guard package.rendererAvailable else { return }
-        do {
-            try requireService().store.activate(id: package.manifest.id)
-            packages = try requireService().list()
-            try refreshEffectiveMotionForActiveAvatar()
-            show(message: "已切换为 \(package.manifest.name)。")
-        } catch {
-            show(error: error)
-        }
+        runSelection { try await self.activateConfirmed(package) }
+    }
+    func activateConfirmed(_ package: PresencePackage) async throws {
+        try await requireService().store.activateAsync(id: package.manifest.id)
+        try refreshEffectiveMotionForActiveAvatar(); onSelectionChanged?()
+        show(message: "正在载入 \(package.manifest.name)…")
     }
 
     func remove(_ package: PresencePackage) {
-        do {
-            try requireService().store.remove(id: package.manifest.id)
-            packages = try requireService().list()
-            try refreshEffectiveMotionForActiveAvatar()
+        runSelection { [self] in
+            try await requireService().store.removeAsync(id: package.manifest.id)
+            try await loadConfirmed()
             show(message: "已移除 \(package.manifest.name)。")
-        } catch {
-            show(error: error)
         }
     }
 
     private func install(from sourceURL: URL) {
-        isWorking = true
-        defer { isWorking = false }
-        do {
+        runSelection { [self] in
             let service = try requireService()
             let installed = try service.store.installPackage(from: sourceURL)
-            try activateInstalledIfPossible(installed, using: service)
-            packages = try service.list()
-            try refreshEffectiveMotionForActiveAvatar()
+            try await loadConfirmed()
+            try await activateConfirmed(installed)
             show(message: "模型已安装。")
-        } catch {
-            show(error: error)
         }
     }
 
@@ -504,93 +511,12 @@ final class PresenceSettingsModel {
     func refreshEffectiveMotionForActiveAvatar() throws {
         let store = try requireMotionStore()
         motions = try store.listMotions()
-        let current = try store.activeMotion()
-        migrateUnambiguousPreference(from: current)
-
-        let effective: StageMotionAsset
-        if
-            let engine = activeAvatarEngine,
-            let preferenceKey = preferenceKey(for: engine)
-        {
-            if
-                let preferredID = defaults.string(forKey: preferenceKey),
-                let preferred = motions.first(where: { $0.id == preferredID }),
-                playbackCompatibility(engine, preferred.format) == .compatible
-            {
-                effective = preferred
-            } else if playbackCompatibility(engine, current.format) == .compatible {
-                effective = current
-                defaults.set(current.id, forKey: preferenceKey)
-            } else {
-                effective = try naturalIdle(in: motions)
-                defaults.set(effective.id, forKey: preferenceKey)
-            }
-        } else {
-            effective = try naturalIdle(in: motions)
+        packages = try requireService().list()
+        guard let selection = store.selectionAuthority.confirmed else {
+            throw RustPresenceSelectionClient.SelectionError.unavailable
         }
-
-        if current.id != effective.id {
-            try store.activate(id: effective.id)
-        }
-        activeMotionID = effective.id
+        activeMotionID = selection.motionID
         avatarRuntime.refresh()
-    }
-
-    private func naturalIdle(
-        in motions: [StageMotionAsset]
-    ) throws -> StageMotionAsset {
-        guard let naturalIdle = motions.first(where: {
-            $0.id == MotionPackageStore.naturalIdleID
-        }) else {
-            throw MotionPackageError.motionNotFound
-        }
-        return naturalIdle
-    }
-
-    private func savePreferredMotion(
-        _ motionID: String,
-        for engine: PresenceEngine?
-    ) {
-        guard let preferenceKey = preferenceKey(for: engine) else { return }
-        defaults.set(motionID, forKey: preferenceKey)
-    }
-
-    private func preferenceKey(for engine: PresenceEngine?) -> String? {
-        switch engine {
-        case .vrm:
-            MotionPreferenceKey.vrm
-        case .pmx:
-            MotionPreferenceKey.pmx
-        case .orb, .live2D, nil:
-            nil
-        }
-    }
-
-    private func clearPreferredMotionReferences(to motionID: String) {
-        for key in [MotionPreferenceKey.vrm, MotionPreferenceKey.pmx]
-        where defaults.string(forKey: key) == motionID {
-            defaults.removeObject(forKey: key)
-        }
-    }
-
-    private func migrateUnambiguousPreference(
-        from motion: StageMotionAsset
-    ) {
-        guard
-            motion.format == .vrma,
-            defaults.string(forKey: MotionPreferenceKey.vrm) == nil
-        else {
-            return
-        }
-        defaults.set(motion.id, forKey: MotionPreferenceKey.vrm)
-    }
-
-    private func activateInstalledIfPossible(
-        _ package: PresencePackage,
-        using service: PresenceCommandService
-    ) throws {
-        guard package.rendererAvailable else { return }
-        try service.store.activate(id: package.manifest.id)
     }
 
     private func show(message: String) {

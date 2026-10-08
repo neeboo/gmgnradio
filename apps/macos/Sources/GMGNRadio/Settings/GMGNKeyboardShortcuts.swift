@@ -288,17 +288,16 @@ struct GMGNShortcutTarget: Equatable, Sendable {
 final class GMGNShortcutSettingsStore: ObservableObject {
     @Published private(set) var assignments: [GMGNShortcutAssignment]
     @Published private(set) var recordingTarget: GMGNShortcutTarget?
-    @Published var globalEnabled: Bool {
-        didSet {
-            defaults.set(globalEnabled, forKey: Self.globalEnabledKey)
-            onChange?()
-        }
+    @Published private var confirmedGlobalEnabled = false
+    @Published private var confirmedMediaKeysEnabled = false
+    @Published private(set) var settingsError: String?
+    var globalEnabled: Bool {
+        get { confirmedGlobalEnabled }
+        set { submit(["kind":"globalEnabled", "enabled":newValue]) }
     }
-    @Published var mediaKeysEnabled: Bool {
-        didSet {
-            defaults.set(mediaKeysEnabled, forKey: Self.mediaKeysEnabledKey)
-            onChange?()
-        }
+    var mediaKeysEnabled: Bool {
+        get { confirmedMediaKeysEnabled }
+        set { submit(["kind":"mediaKeysEnabled", "enabled":newValue]) }
     }
 
     var onChange: (() -> Void)?
@@ -308,31 +307,36 @@ final class GMGNShortcutSettingsStore: ObservableObject {
         "gmgn.keyboardShortcuts.globalEnabled"
     private static let mediaKeysEnabledKey =
         "gmgn.keyboardShortcuts.mediaKeysEnabled"
-    private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
+    // Only initialized on MainActor; deinit removes the immutable Foundation token.
+    nonisolated(unsafe) private var settingsObserver: NSObjectProtocol?
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-        if
-            let data = defaults.data(forKey: Self.assignmentsKey),
-            let decoded = try? JSONDecoder().decode(
-                [GMGNShortcutAssignment].self,
-                from: data
-            ),
-            Set(decoded.map(\.action)) == Set(GMGNShortcutAction.allCases)
-        {
-            assignments = decoded
-        } else {
-            assignments = GMGNShortcutAssignment.defaults
+    init(defaults: UserDefaults = .standard, settings: RustProductSettingsClient = .shared) {
+        self.settings = settings; assignments = []
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
+        settingsObserver = NotificationCenter.default.addObserver(forName: .init("gmgnProductSettingsConfirmed"), object: settings, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.projectConfirmed() }
         }
-        if defaults.object(forKey: Self.globalEnabledKey) == nil {
-            globalEnabled = true
-        } else {
-            globalEnabled = defaults.bool(forKey: Self.globalEnabledKey)
+        projectConfirmed()
+        Task { [weak self] in
+            guard let self else { return }
+            do { try await settings.ensureLoaded(); projectConfirmed() }
+            catch { settingsError = "快捷键设置暂时不可用。" }
         }
-        if defaults.object(forKey: Self.mediaKeysEnabledKey) == nil {
-            mediaKeysEnabled = true
-        } else {
-            mediaKeysEnabled = defaults.bool(forKey: Self.mediaKeysEnabledKey)
+    }
+    deinit { if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) } }
+    private func projectConfirmed() {
+        guard let value = settings.confirmed?.values,
+              let data = try? JSONEncoder().encode(value.shortcutAssignments),
+              let decoded = try? JSONDecoder().decode([GMGNShortcutAssignment].self, from: data) else { return }
+        assignments = decoded; confirmedGlobalEnabled = value.globalShortcutsEnabled
+        confirmedMediaKeysEnabled = value.mediaKeysEnabled; settingsError = nil; onChange?()
+    }
+    private func submit(_ event: [String: Any]) {
+        Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await settings.shortcutEvent(event); projectConfirmed(); recordingTarget = nil }
+            catch { settingsError = "快捷键设置保存失败。"; onChange?() }
         }
     }
 
@@ -366,33 +370,13 @@ final class GMGNShortcutSettingsStore: ObservableObject {
         to action: GMGNShortcutAction,
         scope: GMGNShortcutScope
     ) {
-        guard let targetIndex = assignments.firstIndex(
-            where: { $0.action == action }
-        ) else {
-            return
-        }
-        let previous = combination(
-            for: assignments[targetIndex],
-            scope: scope
-        )
-        if let conflictIndex = assignments.firstIndex(where: {
-            $0.action != action
-                && combination(for: $0, scope: scope).keyCode == newCombination.keyCode
-                && combination(for: $0, scope: scope).modifiers == newCombination.modifiers
-        }) {
-            setCombination(previous, at: conflictIndex, scope: scope)
-        }
-        setCombination(newCombination, at: targetIndex, scope: scope)
-        recordingTarget = nil
-        persistAssignments()
-        onChange?()
+        guard let data = try? JSONEncoder().encode(newCombination),
+              let combination = try? JSONSerialization.jsonObject(with: data) else { return }
+        submit(["kind":"assign", "action":action.rawValue, "scope":scope.rawValue, "combination":combination])
     }
 
     func reset() {
-        assignments = GMGNShortcutAssignment.defaults
-        recordingTarget = nil
-        persistAssignments()
-        onChange?()
+        submit(["kind":"reset"])
     }
 
     func action(
@@ -412,25 +396,6 @@ final class GMGNShortcutSettingsStore: ObservableObject {
         scope == .local ? assignment.local : assignment.global
     }
 
-    private func setCombination(
-        _ combination: GMGNKeyCombination,
-        at index: Int,
-        scope: GMGNShortcutScope
-    ) {
-        switch scope {
-        case .local:
-            assignments[index].local = combination
-        case .global:
-            assignments[index].global = combination
-        }
-    }
-
-    private func persistAssignments() {
-        guard let data = try? JSONEncoder().encode(assignments) else {
-            return
-        }
-        defaults.set(data, forKey: Self.assignmentsKey)
-    }
 }
 
 private let gmgnGlobalHotKeySignature: OSType = 0x474D474E

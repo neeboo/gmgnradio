@@ -33,6 +33,8 @@ func backgroundCredentialReadsCanNeverShowAKeychainPasswordPrompt() throws {
     let sourceFiles = [
         "Sources/GMGNRadio/MusicSources/KeychainMusicProviderSessionStore.swift",
         "Sources/GMGNRadio/Settings/AgentSettingsModel.swift",
+        "Sources/GMGNRadio/Presence/ProductSpeechSecretStore.swift",
+        "UnityHost/UnityProductSettings.swift",
     ]
 
     for relativePath in sourceFiles {
@@ -40,7 +42,8 @@ func backgroundCredentialReadsCanNeverShowAKeychainPasswordPrompt() throws {
             contentsOf: macOSRoot.appendingPathComponent(relativePath),
             encoding: .utf8
         )
-        #expect(source.contains("kSecUseAuthenticationContext"))
-        #expect(source.contains("interactionNotAllowed = true"))
+        for forbidden in ["SecItemCopyMatching", "SecItemAdd", "SecItemUpdate", "SecItemDelete", "KeychainSpeechSecretStore(", "find-generic-password", "add-generic-password"] {
+            #expect(!source.contains(forbidden))
+        }
     }
 }

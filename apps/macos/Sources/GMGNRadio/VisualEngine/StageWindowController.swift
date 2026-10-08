@@ -206,7 +206,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
     }
     private var playbackState: LocalMusicPlaybackState
     private var voiceState: RealtimeVoiceConnectionState
-    private weak var stageContentView: StageContentView?
+    private weak var stageContentView: StageControllerContentView?
     private var onWillPresentSpaceHandler: (@MainActor () -> Void)?
     private var onShowPlayerHandler: (@MainActor () -> Void)?
     private var onCloseHandler: (@MainActor () -> Void)?
@@ -223,7 +223,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         libraryStore: SyncedMusicLibraryStore = .shared,
         lyrics: StageLyricsStore = .shared,
         spatialStage: SpatialStageStore = SpatialStageStore(),
-        marbleLibrary: MarbleWorldLibrary? = nil,
+        marbleLibrary: MarbleWorldLibrary,
         avatarRuntime: StageAvatarRuntimeStore = .shared,
         renderSurfaceController: StageRenderSurfaceController? = nil,
         cameraCoordinator: StageCameraCoordinator? = nil,
@@ -262,7 +262,6 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         self.lyrics = lyrics
         self.spatialStage = spatialStage
         let resolvedMarbleLibrary = marbleLibrary
-            ?? MarbleWorldLibrary(spatialStage: spatialStage)
         self.marbleLibrary = resolvedMarbleLibrary
         self.avatarRuntime = avatarRuntime
         self.renderSurfaceController = renderSurfaceController
@@ -501,6 +500,9 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         residentChat.restore(submission, notice: notice)
         stageContentView?.showResidentChat()
     }
+    func finishResidentAttachments(ids: [UUID]) {
+        Task { [self] in for id in ids {await residentChat.images.finishSubmission(id:id)} }
+    }
 
     func setVoiceLevel(_ level: Float) {
         avatarRuntime.setVoiceLevel(level)
@@ -653,6 +655,15 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
         window.collectionBehavior = [.fullScreenPrimary]
         window.isReleasedWhenClosed = false
         window.delegate = self
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        let contentView = GPUIStageRenderInputHost(
+            frame: CGRect(origin: .zero, size: contentSize),
+            audioFeatures: audioFeatures, artwork: artwork,
+            visualDirections: visualDirections, videos: videos,
+            spatialStage: spatialStage, renderSurfaceController: renderSurfaceController,
+            residentPropEditor: residentPropEditor
+        )
+#else
         let contentView = StageContentView(
             frame: CGRect(origin: .zero, size: contentSize),
             audioFeatures: audioFeatures,
@@ -699,6 +710,7 @@ final class StageWindowController: NSWindowController, NSWindowDelegate {
                 window?.toggleFullScreen(nil)
             }
         )
+#endif
         stageContentView = contentView
         // 四条场景回调是**窗口存在之前**赋到控制器上的（`configureStage()` 先建控制器、再赋回调，
         // 而窗口要到 `show()` 才建），那时 `stageContentView` 还是 nil，`?.` 会把赋值静默丢掉且
@@ -867,6 +879,159 @@ enum ResidentPropRotationHandleAnchor {
         )
     }
 }
+
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+private typealias StageControllerContentView = GPUIStageRenderInputHost
+
+/// Native device/input leaves only. GPUI owns every business panel and control;
+/// its mount must not construct the hidden legacy SwiftUI hierarchy.
+@MainActor
+private final class GPUIStageRenderInputHost: NSView {
+    private let spatialStage: SpatialStageStore
+    private let renderSurfaceController: StageRenderSurfaceController
+    private let propEditor: ResidentPropEditorState
+    private let renderSurfaceContainer = StageRenderSurfaceHostingView()
+    private let worldInteractionView: StageWorldInteractionView
+    private let screenOverlayContainer = WorldScreenOverlayContainer()
+    private let metalView: MetalStageView
+    private var visibilityObserver: UUID?
+
+    var onGridCursor: ((SIMD2<Float>) -> Void)? {
+        get { worldInteractionView.onGridCursor }
+        set { worldInteractionView.onGridCursor = newValue }
+    }
+    var onGridCommit: ((SIMD2<Float>) -> Void)? {
+        get { worldInteractionView.onGridCommit }
+        set { worldInteractionView.onGridCommit = newValue }
+    }
+    var onGridRotate: ((Int) -> Void)? {
+        get { worldInteractionView.onGridRotate }
+        set { worldInteractionView.onGridRotate = newValue }
+    }
+    var onScenePick: ((SIMD2<Float>, Int) -> Void)? {
+        get { worldInteractionView.onScenePick }
+        set { worldInteractionView.onScenePick = newValue }
+    }
+    var onToggleScreenOperation: (@MainActor () -> Void)?
+    var screenOverlayHostView: NSView { screenOverlayContainer }
+
+    init(frame: NSRect, audioFeatures: VisualAudioFeatureStore, artwork: StageArtworkStore,
+         visualDirections: StageVisualDirectionStore, videos: StageVideoPlaybackStore,
+         spatialStage: SpatialStageStore, renderSurfaceController: StageRenderSurfaceController,
+         residentPropEditor: ResidentPropEditorState) {
+        self.spatialStage = spatialStage
+        self.renderSurfaceController = renderSurfaceController
+        propEditor = residentPropEditor
+        worldInteractionView = StageWorldInteractionView(spatialStage: spatialStage, propEditor: residentPropEditor)
+        metalView = MetalStageView(frame: frame, audioFeatures: audioFeatures, artwork: artwork,
+            visualDirections: visualDirections, videos: videos, spatialStage: spatialStage)
+        super.init(frame: frame)
+        for view in [metalView, renderSurfaceContainer, worldInteractionView, screenOverlayContainer] as [NSView] {
+            view.frame = bounds
+            view.autoresizingMask = [.width, .height]
+            view.wantsLayer = true
+            addSubview(view)
+        }
+        metalView.identifier = NSUserInterfaceItemIdentifier("stage.metal-particles")
+        metalView.layer?.zPosition = 1
+        renderSurfaceContainer.identifier = NSUserInterfaceItemIdentifier("stage.shared-render-surface-container")
+        renderSurfaceContainer.layer?.zPosition = 1.5
+        screenOverlayContainer.identifier = NSUserInterfaceItemIdentifier("stage.screen-overlay-host")
+        screenOverlayContainer.layer?.zPosition = 1.6
+        worldInteractionView.identifier = NSUserInterfaceItemIdentifier("stage.world-interaction")
+        worldInteractionView.layer?.zPosition = 6
+        // No hidden native composer exists. Preserve the platform text-editor
+        // gate; GPUI's own overlay hit testing continues to exclude scene input.
+        worldInteractionView.isTextInputFocused = { [weak worldInteractionView] in
+            worldInteractionView?.window?.firstResponder is NSTextView
+        }
+        residentPropEditor.onSceneFocusRequested = { [weak worldInteractionView] _ in
+            guard let view = worldInteractionView else { return }
+            view.window?.makeFirstResponder(view)
+        }
+        startObserving()
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            spatialStage.removeWorldVisibilityObserver(visibilityObserver)
+            visibilityObserver = nil
+        } else { startObserving() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+    private func startObserving() {
+        guard visibilityObserver == nil else { return }
+        visibilityObserver = spatialStage.observeWorldVisibility { [weak self] _ in self?.applyPresentation() }
+        applyPresentation()
+    }
+    private func applyPresentation() {
+        if !spatialStage.isWorldPresentationRequested { propEditor.close() }
+        if spatialStage.isWorldPresentationRequested { attachRenderSurface() }
+        let state = StageSurfacePresentationState.resolve(
+            isWorldPresentationRequested: spatialStage.isWorldPresentationRequested,
+            isWorldVisible: spatialStage.isWorldVisible)
+        renderSurfaceContainer.isHidden = state.isSpatialWorldHidden
+        metalView.isHidden = state.isPointCloudHidden
+        worldInteractionView.isHidden = state.isWorldInteractionHidden
+        renderSurfaceController.setWorldPresentationVisible(spatialStage.isWorldVisible)
+    }
+    func attachRenderSurface() {
+        guard worldInteractionView.superview === self,
+              renderSurfaceController.owner != .gpuiFullStage,
+              renderSurfaceController.owner != .gpuiLiveCam else { return }
+        renderSurfaceController.attachToFullStage(renderSurfaceContainer)
+    }
+    func attachGPUIWorldInteraction(to container: NSView) {
+        restoreNativePlayerSurface()
+        move(worldInteractionView, to: container)
+        move(screenOverlayContainer, to: container)
+        container.window?.acceptsMouseMovedEvents = true
+        applyPresentation()
+    }
+    func restoreNativeWorldInteraction() {
+        restoreNativePlayerSurface()
+        if worldInteractionView.superview !== self { move(worldInteractionView, to: self) }
+        if screenOverlayContainer.superview !== self { move(screenOverlayContainer, to: self) }
+    }
+    func attachGPUIPlayerSurface(to container: NSView) -> Bool {
+        restoreNativeWorldInteraction()
+        move(metalView, to: container)
+        metalView.isHidden = false
+        return true
+    }
+    private func restoreNativePlayerSurface() {
+        if metalView.superview !== self {
+            metalView.removeFromSuperview()
+            metalView.frame = bounds
+            addSubview(metalView, positioned: .below, relativeTo: renderSurfaceContainer)
+        }
+    }
+    private func move(_ view: NSView, to container: NSView) {
+        view.removeFromSuperview()
+        view.frame = container.bounds
+        view.autoresizingMask = [.width, .height]
+        container.addSubview(view)
+    }
+    func noteScenePickUp() { worldInteractionView.noteResidentPropScenePickUp() }
+    func toggleDecorationEditor() {
+        guard spatialStage.isWorldPresentationRequested else { return }
+        if propEditor.isOpen { propEditor.close() } else { propEditor.open() }
+    }
+    // These setters exclusively updated legacy controls. Their state is already
+    // published by the controller/store and rendered by GPUI snapshots.
+    func setWindowMode(_ mode: StageWindowMode) {}
+    func setPlaybackState(_ state: LocalMusicPlaybackState) {}
+    func setVoiceState(_ state: RealtimeVoiceConnectionState) {}
+    func setProgramNavigation(canGoPrevious: Bool, canGoNext: Bool) {}
+    func setSystemInboxUnread(_ count: Int) {}
+    func setScreenOperationAvailable(_ available: Bool) {}
+    func setScreenOperationActive(_ active: Bool) {}
+    func showResidentChat() {}
+}
+#else
+private typealias StageControllerContentView = StageContentView
+#endif
 
 @MainActor
 private final class StageContentView: NSView {

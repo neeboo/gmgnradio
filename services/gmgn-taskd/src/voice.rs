@@ -2,6 +2,7 @@
 use crate::{
     daemon::{write, Writer},
     model::Result,
+    speech_delivery::{Identity, SpeechDeliveryService},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use gmgn_protocol::failure;
@@ -19,6 +20,11 @@ use std::sync::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 const PACKET: usize = 32_768;
+
+// Explicit constructor-only provider seam. EOF is represented by channel closure;
+// failures remain errors and still pass through the real delivery lifecycle.
+#[cfg(test)]
+pub(crate) type TestTtsFactory = Arc<dyn Fn(String) -> mpsc::Receiver<Result<Vec<u8>>> + Send + Sync>;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -41,6 +47,8 @@ struct Start {
     text: String,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    delivery: Option<Identity>,
 }
 enum Command {
     Audio(Vec<u8>),
@@ -60,6 +68,9 @@ impl Drop for Active {
 #[derive(Default)]
 pub struct Connection {
     active: Option<Active>,
+    delivery: Option<Arc<SpeechDeliveryService>>,
+    #[cfg(test)]
+    test_tts_factory: Option<TestTtsFactory>,
 }
 
 pub fn capabilities() -> Value {
@@ -74,8 +85,10 @@ pub fn capabilities() -> Value {
         let id = provider["id"].as_str().unwrap().to_owned();
         provider["ttsModels"] = gmgn_voice_core::model_catalog::describe(&id, false);
         provider["asrModels"] = gmgn_voice_core::model_catalog::describe(&id, true);
-        provider["defaultTTSModel"] = json!(gmgn_voice_core::model_catalog::default_model(&id, false));
-        provider["defaultASRModel"] = json!(gmgn_voice_core::model_catalog::default_model(&id, true));
+        provider["defaultTTSModel"] =
+            json!(gmgn_voice_core::model_catalog::default_model(&id, false));
+        provider["defaultASRModel"] =
+            json!(gmgn_voice_core::model_catalog::default_model(&id, true));
     }
     value
 }
@@ -99,8 +112,15 @@ fn validate(start: &Start, asr: bool) -> Result<()> {
     if !asr
         && start.provider == "bailian"
         && !gmgn_voice_core::model_catalog::bailian_voice_supported(
-            start.model.as_deref().unwrap_or(gmgn_voice_core::model_catalog::BAILIAN_TTS),
-            if start.voice_id.is_empty() { "Cherry" } else { &start.voice_id },
+            start
+                .model
+                .as_deref()
+                .unwrap_or(gmgn_voice_core::model_catalog::BAILIAN_TTS),
+            if start.voice_id.is_empty() {
+                "Cherry"
+            } else {
+                &start.voice_id
+            },
         )
     {
         return Err("invalid_voice_input");
@@ -124,6 +144,20 @@ fn validate(start: &Start, asr: bool) -> Result<()> {
     Ok(())
 }
 impl Connection {
+    #[cfg(test)]
+    pub(crate) fn with_test_tts_factory(delivery: Arc<SpeechDeliveryService>, factory: TestTtsFactory) -> Self {
+        let mut connection = Self::with_delivery(delivery);
+        connection.test_tts_factory = Some(factory);
+        connection
+    }
+    pub fn with_delivery(delivery: Arc<SpeechDeliveryService>) -> Self {
+        Self {
+            active: None,
+            delivery: Some(delivery),
+            #[cfg(test)]
+            test_tts_factory: None,
+        }
+    }
     pub async fn handle(
         &mut self,
         method: &str,
@@ -146,15 +180,19 @@ impl Connection {
     ) -> Result<()> {
         match method {
             "voice_list" => {
-                let list: List = serde_json::from_value(params).map_err(|_| "invalid_voice_input")?;
+                let list: List =
+                    serde_json::from_value(params).map_err(|_| "invalid_voice_input")?;
                 if !matches!(list.provider.as_str(), "bailian" | "elevenlabs" | "fish") {
                     return Err("unsupported_voice_provider");
                 }
-                if list.api_key.len() > 8192 || (list.provider != "bailian" && list.api_key.trim().is_empty()) {
+                if list.api_key.len() > 8192
+                    || (list.provider != "bailian" && list.api_key.trim().is_empty())
+                {
                     return Err("invalid_voice_input");
                 }
                 let result = gmgn_voice_core::voice_catalog::list(&list.provider, &list.api_key)
-                    .await.map_err(|_| "voice_provider_error")?;
+                    .await
+                    .map_err(|_| "voice_provider_error")?;
                 write(writer, &json!({"id":id,"result":result})).await
             }
             "voice_capabilities" => write(writer, &json!({"id":id,"result":capabilities()})).await,
@@ -163,6 +201,9 @@ impl Connection {
                     serde_json::from_value(params).map_err(|_| "invalid_voice_input")?;
                 let asr = method == "voice_asr_start";
                 validate(&start, asr)?;
+                if asr && start.delivery.is_some() {
+                    return Err("invalid_voice_input");
+                }
                 if self
                     .active
                     .as_ref()
@@ -170,6 +211,20 @@ impl Connection {
                 {
                     return Err("invalid_voice_input");
                 }
+                let delivery = if let Some(identity) = &start.delivery {
+                    if self.active.is_some() {
+                        return Err("speech_delivery_start_rejected");
+                    }
+                    let service = self.delivery.clone().ok_or("speech_delivery_unavailable")?;
+                    service.bind(identity, &start.text).await?;
+                    Some(service)
+                } else {
+                    None
+                };
+                let delivery_guard = DeliveryGuard {
+                    service: delivery.clone(),
+                    identity: start.delivery.clone(),
+                };
                 // Abort the previous generation before acknowledging this one.
                 self.active.take();
                 write(
@@ -193,8 +248,11 @@ impl Connection {
                         ready,
                     });
                 } else {
+                    #[cfg(test)]
+                    let test_tts_factory = self.test_tts_factory.clone();
                     let task = tokio::spawn(async move {
-                        run_tts(start, writer).await;
+                        let _delivery_guard = delivery_guard;
+                        run_tts(start, writer, delivery, #[cfg(test)] test_tts_factory).await;
                     });
                     self.active = Some(Active {
                         id: session_id,
@@ -268,12 +326,33 @@ async fn audio(writer: &Writer, sid: &str, bytes: &[u8], sample_rate: u32) -> Re
     }
     Ok(())
 }
-async fn run_tts(start: Start, writer: Writer) {
+async fn run_tts(start: Start, writer: Writer, delivery: Option<Arc<SpeechDeliveryService>>, #[cfg(test)] test_tts_factory: Option<TestTtsFactory>) {
     let sid = start.session_id.clone();
+    let identity = start.delivery.clone();
+    let mut emitter = DeliveryEmitter {
+        service: delivery,
+        identity,
+        trailing: None,
+    };
     let result = async {
+        #[cfg(test)]
+        if let Some(factory) = test_tts_factory {
+            let mut source = factory(start.text.clone());
+            while let Some(packet) = source.recv().await {
+                emitter.audio(&writer, &sid, &packet?, 24_000).await?;
+            }
+            return emitter.finish(&writer, &sid).await;
+        }
         if start.provider == "bailian" {
-            let model = start.model.as_deref().unwrap_or(gmgn_voice_core::model_catalog::BAILIAN_TTS);
-            let voice = if start.voice_id.is_empty() { "Cherry" } else { &start.voice_id };
+            let model = start
+                .model
+                .as_deref()
+                .unwrap_or(gmgn_voice_core::model_catalog::BAILIAN_TTS);
+            let voice = if start.voice_id.is_empty() {
+                "Cherry"
+            } else {
+                &start.voice_id
+            };
             let config = BailianConfig::with_model_voice(start.api_key, model, voice)
                 .map_err(|_| "voice_provider_error")?;
             let mut stream = TtsStream::connect(config)
@@ -291,10 +370,8 @@ async fn run_tts(start: Start, writer: Writer) {
                 match next.map_err(|_| "voice_provider_error")? {
                     TtsStreamEvent::Audio {
                         pcm, sample_rate, ..
-                    } => audio(&writer, &sid, &pcm, sample_rate).await?,
-                    TtsStreamEvent::Finished { .. } => {
-                        return event(&writer, &sid, json!({"type":"finished"})).await
-                    }
+                    } => emitter.audio(&writer, &sid, &pcm, sample_rate).await?,
+                    TtsStreamEvent::Finished { .. } => return emitter.finish(&writer, &sid).await,
                 }
             }
         } else {
@@ -321,10 +398,8 @@ async fn run_tts(start: Start, writer: Writer) {
                 match next.map_err(|_| "voice_provider_error")? {
                     AudioEvent::Chunk {
                         bytes, sample_rate, ..
-                    } => audio(&writer, &sid, &bytes, sample_rate).await?,
-                    AudioEvent::Finished { .. } => {
-                        return event(&writer, &sid, json!({"type":"finished"})).await
-                    }
+                    } => emitter.audio(&writer, &sid, &bytes, sample_rate).await?,
+                    AudioEvent::Finished { .. } => return emitter.finish(&writer, &sid).await,
                 }
             }
         }
@@ -332,7 +407,76 @@ async fn run_tts(start: Start, writer: Writer) {
     }
     .await;
     if let Err(code) = result {
+        if let (Some(service), Some(identity)) = (&emitter.service, &emitter.identity) {
+            let _ = service
+                .request(
+                    "speech_delivery_receipt",
+                    json!({"identity":identity,"kind":"failed"}),
+                )
+                .await;
+        }
         let _ = event(&writer, &sid, json!({"type":"error","code":code})).await;
+    }
+}
+
+struct DeliveryEmitter {
+    service: Option<Arc<SpeechDeliveryService>>,
+    identity: Option<Identity>,
+    trailing: Option<u8>,
+}
+// Connection loss/cancellation must fence pending device output, even while a
+// provider is blocked on the Rust PCM window. A terminal delivery is unchanged.
+struct DeliveryGuard {
+    service: Option<Arc<SpeechDeliveryService>>,
+    identity: Option<Identity>,
+}
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        if let (Some(service), Some(identity)) = (self.service.take(), self.identity.take()) {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = service
+                        .request(
+                            "speech_delivery_receipt",
+                            json!({"identity":identity,"kind":"failed"}),
+                        )
+                        .await;
+                });
+            }
+        }
+    }
+}
+impl DeliveryEmitter {
+    async fn audio(&mut self, writer: &Writer, sid: &str, bytes: &[u8], rate: u32) -> Result<()> {
+        let (Some(service), Some(id)) = (&self.service, &self.identity) else {
+            return audio(writer, sid, bytes, rate).await;
+        };
+        let mut pcm = Vec::with_capacity(bytes.len() + 1);
+        if let Some(byte) = self.trailing.take() {
+            pcm.push(byte);
+        }
+        pcm.extend_from_slice(bytes);
+        if pcm.len() % 2 != 0 {
+            self.trailing = pcm.pop();
+        }
+        for packet in pcm.chunks(4096 * 2) {
+            let frames = (packet.len() / 2) as u64;
+            let sequence = service.packet(id, frames).await?;
+            event(writer,sid,json!({"type":"audio","audioBase64":STANDARD.encode(packet),"sampleRate":rate,"channels":1,"encoding":"pcm16le","delivery":id,"sequence":sequence,"frameCount":frames})).await?;
+        }
+        Ok(())
+    }
+    async fn finish(&self, writer: &Writer, sid: &str) -> Result<()> {
+        let (Some(service), Some(id)) = (&self.service, &self.identity) else {
+            return event(writer, sid, json!({"type":"finished"})).await;
+        };
+        if self.trailing.is_some() {
+            return Err("voice_protocol_error");
+        }
+        service.eof(id).await?;
+        event(writer, sid, json!({"type":"input_finished","delivery":id})).await?;
+        service.delivered(id).await?;
+        event(writer, sid, json!({"type":"delivered","delivery":id})).await
     }
 }
 async fn run_asr(
@@ -394,7 +538,19 @@ pub(crate) mod tests {
             let _dropped = dropped;
             std::future::pending::<()>().await;
         });
-        (Connection {active:Some(Active {id:id.into(),commands:Some(sender),task,ready:Arc::new(AtomicBool::new(true))})},observed)
+        (
+            Connection {
+                delivery: None,
+                test_tts_factory: None,
+                active: Some(Active {
+                    id: id.into(),
+                    commands: Some(sender),
+                    task,
+                    ready: Arc::new(AtomicBool::new(true)),
+                }),
+            },
+            observed,
+        )
     }
     #[test]
     fn ready_contract_and_asr_errors_are_explicit_and_sanitized() {
@@ -422,6 +578,8 @@ pub(crate) mod tests {
         });
         tokio::task::yield_now().await;
         let mut connection = Connection {
+            delivery: None,
+            test_tts_factory: None,
             active: Some(Active {
                 id: "current".into(),
                 commands: Some(sender.clone()),

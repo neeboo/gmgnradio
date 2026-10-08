@@ -9,7 +9,7 @@ import simd
 /// Exports borrowed Metal textures, not signed media URLs or pixel JSON. Host must
 /// destroy the Unity consumers before close. No content starts during construction.
 @MainActor final class UnityScreenVideoBridge: WorldScreenControlling {
-    static let supportedCommands = ["screen.list", "screen.play", "screen.stop", "video.load", "video.choose", "video.select", "video.remove", "video.play", "video.pause", "video.stop", "video.mode", "video.brightness", "video.bind", "video.unbind", "video.bound.play", "video.bound.dismiss"]
+    static let supportedCommands = ["screen.list", "screen.play", "screen.stop", "video.load", "video.choose", "video.select", "video.remove", "video.play", "video.pause", "video.stop", "video.recoverStop", "video.mode", "video.brightness", "video.bind", "video.unbind", "video.bound.play", "video.bound.dismiss", "stage.video.import", "stage.video.toggle", "stage.video.remove", "stage.video.bind", "stage.video.unbind", "stage.video.stop", "stage.video.recoverStop", "stage.video.mode", "stage.video.brightness"]
     struct CurrentTrack {
         let id: String
         let title: String
@@ -89,11 +89,15 @@ import simd
     }
 
     init(defaults: UserDefaults, state: @escaping () -> WorldState?, displayName: @escaping (String) -> String,
-         currentTrack: @escaping () -> CurrentTrack? = { nil }) {
+         videoAuthority: RustStageVideoClient,
+         currentTrack: @escaping () -> CurrentTrack? = { nil },
+         mediaCache: any ScreenMediaCaching = ScreenMediaCacheClient(),
+         playbackAuthority: any ScreenPlaybackAuthorizing = RustScreenPlaybackClient()) {
         self.state = state; names = displayName
         self.currentTrack = currentTrack
-        videos = StageVideoPlaybackStore(defaults: defaults)
-        screens = NativeScreenPlaybackCoordinator(cache: ScreenMediaCacheClient(), registry: registry)
+        videos = StageVideoPlaybackStore(defaults:defaults,authority:videoAuthority)
+        screens = NativeScreenPlaybackCoordinator(cache: mediaCache, registry: registry,
+            authority: playbackAuthority, worldID: { state()?.worldID })
         backgroundFrames = UnityStageVideoFrames(player: videos.player)
     }
 
@@ -204,7 +208,7 @@ import simd
         screenEpochs[id, default: 0] &+= 1; operations[id]?.cancel(); operations[id] = nil; screens.stop(id)
         return .ok("屏幕已停止。", details: ["screen_id": id])
     }
-    func calibrateScreen(objectID: String, widthMeters: Float, heightMeters: Float, centerHeightMeters: Float) -> WorldScreenCommandOutcome {
+    func calibrateScreen(objectID: String, widthMeters: Float, heightMeters: Float, centerHeightMeters: Float) async -> WorldScreenCommandOutcome {
         // No new parallel persistence: calibration must be hooked to the world's
         // formal metadata/CAS edit by the unified host, never an in-memory override.
         .failure(.screenGeometryMissing, "屏幕范围尚未确认，请在空间编辑中调整。")
@@ -217,6 +221,20 @@ import simd
     /// are not autoplayed. A removed/unplaced device is rechecked before publish.
     func command(_ value: [String: Any]) -> Bool {
         guard !closed, let op = value["op"] as? String, Self.supportedCommands.contains(op) else { return false }
+        if op == "stage.video.toggle" {
+            guard let id = value["id"] as? String, videos.assets.contains(where: { $0.id == id }) else { return false }
+            videos.toggle(id)
+            return true
+        }
+        if op.hasPrefix("stage.video.") {
+            var native = value
+            native["op"] = op == "stage.video.import" ? "video.choose" : String(op.dropFirst("stage.".count))
+            if op == "stage.video.bind" || op == "stage.video.unbind" {
+                guard let track = currentTrack() else { return false }
+                native["trackID"] = track.id
+            }
+            return command(native)
+        }
         followCurrentTrack()
         switch op {
         case "screen.list", "video.load": return true
@@ -224,7 +242,7 @@ import simd
             guard let id = value["objectID"] as? String, state()?.objectStates[id]?.isEnabled == true else { screenCommandNotice = "屏幕已移除或不可用，请重新选择。"; return false }
             guard definition(id) != nil else { screenCommandNotice = "这件物件尚未标定显示面，暂不支持播放。"; return false }
             guard let page = value["url"] as? String, page.count <= 2048, URL(string: page)?.scheme == "https" else { screenCommandNotice = "请填写完整的 HTTPS 视频页面链接。"; return false }
-            guard ScreenLinkSitePolicy.accepts(page) else { screenCommandNotice = "这条链接暂不支持原生播放。"; return false }
+            guard ScreenLinkSitePolicy.accepts(page) || ScreenMediaCacheClient.isYouTubePlaylist(page) else { screenCommandNotice = "这条链接暂不支持原生播放。"; return false }
             guard operations[id] == nil else { screenCommandNotice = "这个屏幕正在处理上一条请求，请等待或先停止播放。"; return false }
             guard screens.hasSession(id) || screens.activeCount < 3 else { screenCommandNotice = "同时播放的屏幕已达到上限。"; return false }
             screenCommandNotice = ""
@@ -264,6 +282,7 @@ import simd
             else { videos.resume() }
         case "video.pause": videos.pause()
         case "video.stop": videos.disableByUser()
+        case "video.recoverStop": videos.recoverPendingByStopping()
         case "video.mode":
             guard let mode = value["value"] as? String, let selected = StageVideoPlaybackMode(rawValue: mode) else { return false }
             videos.setMode(selected)
@@ -342,7 +361,8 @@ import simd
         return ["assets": videos.assets.map { ["id": $0.id, "name": $0.displayName] },
          "selectedID": videos.selectedAssetID as Any? ?? NSNull(), "activeID": videos.activeAssetID as Any? ?? NSNull(),
          "playing": videos.isActive && videos.player.rate > 0, "mode": videos.mode.rawValue,
-         "brightness": videos.brightness, "notice": notice,
+         "brightness": videos.brightness, "notice": videos.authorityError ?? notice,
+         "canRecoverStop": videos.canRecoverPendingStop,
          "currentTrackID": track?.id as Any? ?? NSNull(), "currentTrackTitle": track?.title as Any? ?? NSNull(),
          "boundAssetID": track.flatMap { videos.boundAsset(for: $0.id)?.id } as Any? ?? NSNull(),
          "screens": screens.objectIDs.map { id -> [String: Any] in

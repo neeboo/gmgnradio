@@ -696,12 +696,17 @@ final class MarbleSpatialView: MTKView {
 
     /// Short-window CPU/GPU/sort telemetry, not an FPS measurement.
     var renderPerformanceDiagnostics: [String: Any] {
+#if arch(arm64)
         spatialRenderer?.renderPerformanceDiagnostics ?? [:]
+#else
+        [:]
+#endif
     }
 
     /// 角色地面接触诊断（E2E / 日志只读）。没有 PMX 渲染器时返回空字典，
     /// 由调用方如实报"入口不可用"，绝不编造 0。
     var avatarGroundingDiagnostics: [String: Any] {
+#if arch(arm64)
         guard let renderer = spatialRenderer?.groundingRenderer else { return [:] }
         let minimum = renderer.minimumContactY
         let rest = renderer.restGlobalReferenceY
@@ -744,6 +749,9 @@ final class MarbleSpatialView: MTKView {
             diagnostics[key] = value
         }
         return diagnostics
+#else
+        return [:]
+#endif
     }
 
     /// 角色**逐帧结构化动作**事实（E2E / 诊断只读）。
@@ -752,8 +760,12 @@ final class MarbleSpatialView: MTKView {
     /// 播放时钟 / 每根诊断骨骼相对静止姿态的角度。没有 PMX 渲染器时返回空字典，
     /// 由调用方如实报"入口不可用"，绝不编造动作。
     var avatarMotionDiagnostics: [String: Any] {
+#if arch(arm64)
         guard let renderer = spatialRenderer?.groundingRenderer else { return [:] }
         return renderer.motionPlaybackSnapshot
+#else
+        return [:]
+#endif
     }
 
     /// 电视原生视频取帧表：App 组合在 `WorldScreenStore` 建好之后注入

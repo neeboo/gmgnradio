@@ -8,22 +8,27 @@ final class UnityPresenceSettingsBridge {
     let model: PresenceSettingsModel
     let runtime: StageAvatarRuntimeStore
     private let supportedEngines: Set<String>
+    private let selectionAuthority: RustPresenceSelectionClient
     private let onRuntimeChanged: (StageAvatarRuntimeSnapshot) -> Void
     private var operation: Task<Void, Never>?
     private var downloadRevision: UInt64 = 0
     private var downloadState = "idle"
-    private var pendingSelection: (revision: UInt64, avatarID: String, motionID: String?)?
+    private var pendingSelection: (revision: UInt64, authorityRevision: Int64)?
 
     static let supportedCommands = ["presence.load", "presence.import", "presence.motion.import", "presence.activate", "presence.remove", "presence.motion", "presence.motion.remove", "presence.catalog", "presence.catalog.refresh", "presence.catalog.install", "presence.motion.install", "presence.download", "presence.import.link", "presence.orb", "presence.orb.color", "presence.orb.intensity", "presence.runtime.result"]
 
     init(defaults: UserDefaults, packages: PresencePackageStore, motions: MotionPackageStore,
-         supportedEngines: Set<String>, onRuntimeChanged: @escaping (StageAvatarRuntimeSnapshot) -> Void) {
+         supportedEngines: Set<String>, productSettings: RustProductSettingsClient = .shared,
+         onRuntimeChanged: @escaping (StageAvatarRuntimeSnapshot) -> Void) {
         self.supportedEngines = supportedEngines
+        selectionAuthority = packages.selectionAuthority
         self.onRuntimeChanged = onRuntimeChanged
         runtime = StageAvatarRuntimeStore(packageStore: packages, motionPackageStore: motions)
         model = PresenceSettingsModel(defaults: defaults, avatarRuntime: runtime,
-            presenceStore: packages, motionStore: motions,
+            presenceStore: packages, motionStore: motions, productSettings: productSettings,
+            renderPolicy: "unity", supportedEngines: supportedEngines.union(["orb"]),
             playbackCompatibility: Self.playbackCompatibility, onWillActivateMotion: { _ in })
+        model.onSelectionChanged = { [weak self] in self?.publish() }
     }
 
     static func playbackCompatibility(_ engine: PresenceEngine?, _ format: StageMotionFormat)
@@ -34,30 +39,27 @@ final class UnityPresenceSettingsBridge {
         return PresenceSettingsModel.motionCompatibility(avatarEngine: engine, motionFormat: format)
     }
 
-    func load() { model.load(); runtime.refresh(); publish() }
+    func load() { run { bridge in do { try await bridge.model.loadConfirmed() } catch { bridge.model.message=error.localizedDescription;bridge.model.hasError=true } } }
     func stop() { operation?.cancel(); operation = nil }
     @discardableResult
     func stopSelectedMotion() -> Bool {
-        guard let idle = model.motions.first(where: { $0.id == MotionPackageStore.naturalIdleID })
-        else { return false }
-        operation?.cancel(); operation = nil
-        pendingSelection = nil
-        model.activateMotion(idle)
-        guard !model.hasError else { return false }
-        runtime.refresh()
-        publish()
+        guard operation == nil,pendingSelection == nil else { return false }
+        run { bridge in
+            do { _ = try await bridge.selectionAuthority.event("stop_motion");try bridge.model.refreshEffectiveMotionForActiveAvatar() }
+            catch { bridge.model.message=error.localizedDescription;bridge.model.hasError=true }
+        }
         return true
     }
     func completeSelectedMotion(revision: UInt64, motionID: String) -> Bool {
         guard operation == nil, pendingSelection == nil,
               revision == runtime.snapshot.revision,
               let motion = runtime.snapshot.motion, motion.id == motionID,
-              !motion.loop, let url = motion.url,
-              let idle = model.motions.first(where: { $0.id == MotionPackageStore.naturalIdleID })
+              !motion.loop
         else { return false }
-        runtime.finishOneShotMotion(at: url)
-        model.activateMotion(idle)
-        publish()
+        run { bridge in
+            do { _ = try await bridge.selectionAuthority.event("motion_finished",id:motionID);try bridge.model.refreshEffectiveMotionForActiveAvatar() }
+            catch { bridge.model.message=error.localizedDescription;bridge.model.hasError=true }
+        }
         return true
     }
     func canSelectMotion(_ id: String) -> Bool {
@@ -78,24 +80,15 @@ final class UnityPresenceSettingsBridge {
     }
     private func publish() {
         let selected = runtime.snapshot
-        // Natural idle is a user selection, but the humanoid renderer needs
-        // the installed idle clip rather than its procedural orb marker.
-        let selectedMotion = selected.motion
-        let motion: StageMotionAsset?
-        if selected.avatar != nil && (selectedMotion == nil || selectedMotion?.format == .procedural),
-           let idle = runtime.residentIdleMotion, let url = idle.url,
-           FileManager.default.fileExists(atPath: url.path) {
-            motion = idle
-        } else {
-            motion = selectedMotion
-        }
-        onRuntimeChanged(StageAvatarRuntimeSnapshot(avatar: selected.avatar, motion: motion,
-                                                    revision: selected.revision))
+        if let state=selectionAuthority.confirmed,state.pendingRenderer {
+            pendingSelection=(selected.revision,state.revision)
+        } else { pendingSelection=nil }
+        onRuntimeChanged(selected)
     }
 
     var snapshot: [String: Any] {
         let orb = model.orbAppearance
-        let confirmedMotionID = pendingSelection.map { $0.motionID } ?? model.activeMotionID
+        let confirmedMotionID = selectionAuthority.confirmed?.confirmedMotionID
         return ["packages": model.packages.map { package in
             ["id": package.manifest.id, "name": package.manifest.name,
              "engine": package.manifest.engine.rawValue, "active": package.isActive, "isActive": package.isActive,
@@ -136,22 +129,19 @@ final class UnityPresenceSettingsBridge {
                 return true // Initial/restored selection also gets a real runtime receipt.
             }
             guard previous.revision == revision else { return false }
-            pendingSelection = nil
-            if !success {
-                if let package = model.packages.first(where: { $0.manifest.id == previous.avatarID }) { model.activate(package) }
-                if let motionID = previous.motionID, let motion = model.motions.first(where: { $0.id == motionID }) { model.activateMotion(motion) }
-                model.message = "角色或动作加载失败，已恢复原选择。"; model.hasError = true
-                runtime.refresh(); publish()
-            } else {
-                model.message = "动作或角色已载入。"
-                model.hasError = false
+            guard operation == nil else{return false}
+            run { bridge in
+                do {
+                    _ = try await bridge.selectionAuthority.event("renderer_ack",success:success,expectedRevision:previous.authorityRevision)
+                    try bridge.model.refreshEffectiveMotionForActiveAvatar()
+                    bridge.model.message=success ? "动作或角色已载入。" : "角色或动作加载失败，已恢复原选择。"
+                    bridge.model.hasError = !success
+                }catch{bridge.model.message=error.localizedDescription;bridge.model.hasError=true}
             }
             return true
         }
         let id = value["id"] as? String ?? ""
-        guard operation == nil, pendingSelection == nil else { return false }
-        let previousAvatarID = model.packages.first(where: \.isActive)?.manifest.id ?? PresencePackageStore.builtInOrbID
-        let previousMotionID = model.activeMotionID
+        guard operation == nil, pendingSelection == nil, !model.isWorking else { return false }
         switch op {
         case "presence.load": load()
         case "presence.import": model.importModel()
@@ -159,21 +149,21 @@ final class UnityPresenceSettingsBridge {
         case "presence.activate":
             guard let package = model.packages.first(where: { $0.manifest.id == id }),
                   package.rendererAvailable, supportedEngines.contains(package.manifest.engine.rawValue) else { return false }
-            model.activate(package)
-            // Changing the resident is not a new request to perform the old
-            // manually selected motion, even when its format is compatible.
-            if !model.hasError, previousAvatarID != id,
-               let idle = model.motions.first(where: { $0.id == MotionPackageStore.naturalIdleID }) {
-                model.activateMotion(idle)
+            run { bridge in
+                do { try await bridge.model.activateConfirmed(package) }
+                catch{bridge.model.message=error.localizedDescription;bridge.model.hasError=true}
             }
         case "presence.remove":
-            guard let package = model.packages.first(where: { $0.manifest.id == id }), !package.isBuiltIn else { return false }
+            guard let package = model.packages.first(where: { $0.manifest.id == id }) else { return false }
             model.remove(package)
         case "presence.motion":
             guard let motion = model.availableMotions.first(where: { $0.id == id }), model.motionCompatibility(motion) == .compatible else { return false }
-            model.activateMotion(motion)
+            run { bridge in
+                do { try await bridge.model.activateMotionConfirmed(motion) }
+                catch{bridge.model.message=error.localizedDescription;bridge.model.hasError=true}
+            }
         case "presence.motion.remove":
-            guard let motion = model.motions.first(where: { $0.id == id }), !model.isBuiltInMotion(motion) else { return false }
+            guard let motion = model.motions.first(where: { $0.id == id }) else { return false }
             model.removeMotion(motion)
         case "presence.catalog", "presence.catalog.refresh":
             if let url = value["url"] as? String { model.remoteMotionCatalogURL = url }
@@ -185,7 +175,7 @@ final class UnityPresenceSettingsBridge {
         case "presence.download", "presence.import.link":
             guard let url = value["url"] as? String, !url.isEmpty else { return false }
             model.downloadURL = url; downloadRevision &+= 1; downloadState = "downloading"
-            run(previousSelection: (previousAvatarID, previousMotionID)) { bridge in
+            run { bridge in
                 await bridge.model.downloadAndInstall()
                 bridge.downloadRevision &+= 1; bridge.downloadState = bridge.model.hasError ? "failed" : "succeeded"
             }
@@ -199,26 +189,17 @@ final class UnityPresenceSettingsBridge {
         }
         if operation == nil {
             runtime.refresh()
-            if ["presence.activate", "presence.motion", "presence.import"].contains(op), !model.hasError,
-               op == "presence.motion" || previousAvatarID != runtime.snapshot.avatar?.id || previousMotionID != model.activeMotionID {
-                pendingSelection = (runtime.snapshot.revision, previousAvatarID, previousMotionID)
-                model.message = "正在载入角色或动作…"
-            }
             publish()
         }
         return !model.hasError
     }
 
-    private func run(previousSelection: (String, String?)? = nil,
-                     _ body: @escaping @MainActor (UnityPresenceSettingsBridge) async -> Void) {
+    private func run(_ body: @escaping @MainActor (UnityPresenceSettingsBridge) async -> Void) {
         operation = Task { [weak self] in
             guard let self else { return }
             await body(self)
             guard !Task.isCancelled else { return }
             operation = nil; runtime.refresh()
-            if let previousSelection, !model.hasError {
-                pendingSelection = (runtime.snapshot.revision, previousSelection.0, previousSelection.1)
-            }
             publish()
         }
     }

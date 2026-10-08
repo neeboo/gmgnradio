@@ -2,6 +2,54 @@ import Foundation
 import Testing
 @testable import GMGNRadio
 
+@MainActor private final class PrivateAgentSettingsFixture {
+    let daemon: PrivateMusicAuthorityFixture
+    let settings: RustProductSettingsClient
+    let defaults: UserDefaults
+    let suite: String
+    let secrets: FileSpeechSecretStore
+    private init(_ daemon: PrivateMusicAuthorityFixture, _ settings: RustProductSettingsClient, _ defaults: UserDefaults, _ suite: String) {
+        self.daemon=daemon;self.settings=settings;self.defaults=defaults;self.suite=suite
+        secrets=FileSpeechSecretStore(directory:daemon.root.appendingPathComponent("native-private-secrets"))
+    }
+    static func start() async throws -> PrivateAgentSettingsFixture {
+        let daemon=try await PrivateMusicAuthorityFixture.start()
+        let suite="gmgn-agent-settings-private-"+UUID().uuidString
+        let defaults=try #require(UserDefaults(suiteName:suite))
+        let settings=RustProductSettingsClient(root:daemon.root)
+        try await settings.ensureLoaded()
+        return PrivateAgentSettingsFixture(daemon,settings,defaults,suite)
+    }
+    deinit { UserDefaults(suiteName:suite)?.removePersistentDomain(forName:suite) }
+    func model(account: any CodexAccountServicing) -> AgentSettingsModel {
+        AgentSettingsModel(account:account,preferences:DJAgentPreferences(defaults:defaults,settings:settings),
+            residentPreferences:ResidentPreferences(defaults:defaults,settings:settings))
+    }
+    var speech: RustSpeechPreferences { RustSpeechPreferences(defaults:defaults,settings:settings,secrets:secrets) }
+    func confirmed(_ predicate: (RustProductSettingsClient.Values) -> Bool) async throws {
+        let deadline=Date().addingTimeInterval(5)
+        while settings.confirmed.map({predicate($0.values)}) != true {
+            guard Date()<deadline else {throw RustProductSettingsClient.SettingsError.unavailable}
+            try await Task.sleep(for:.milliseconds(10))
+        }
+    }
+    func reopen() async throws -> RustProductSettingsClient {
+        let client=RustProductSettingsClient(root:daemon.root);try await client.ensureLoaded();return client
+    }
+    func persistedValues() async throws -> RustProductSettingsClient.Values {
+        let database=daemon.root.appendingPathComponent("tasks.sqlite3").path
+        let data=try await Task.detached {
+            let process=Process();process.executableURL=URL(fileURLWithPath:"/usr/bin/sqlite3")
+            process.arguments=["-readonly",database,"SELECT value FROM product_settings WHERE profile='product';"]
+            let output=Pipe();process.standardOutput=output
+            try process.run();let bytes=output.fileHandleForReading.readDataToEndOfFile();process.waitUntilExit()
+            guard process.terminationStatus==0 else {throw RustProductSettingsClient.SettingsError.unavailable}
+            return bytes
+        }.value
+        return try JSONDecoder().decode(RustProductSettingsClient.Values.self,from:data)
+    }
+}
+
 @Test
 func defaultDJPreferenceCoversACompleteRadioShow() {
     let prompt = DJAgentPreferences.defaultHostPrompt
@@ -131,48 +179,54 @@ func agentSettingsLoadsCodexLoginAndPersistsTheHostPrompt() async throws {
     let account = CodexAccountServiceStub(
         state: .signedIn(method: "ChatGPT")
     )
-    let suiteName = "AgentSettingsModelTests.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-    let model = AgentSettingsModel(
-        account: account,
-        preferences: DJAgentPreferences(defaults: defaults)
-    )
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let defaults=fixture.defaults
+    let model=fixture.model(account:account)
 
     await model.load()
     model.hostPrompt = "少说一点，多留意时间和用户刚才说的话。"
     model.savePrompt()
+    try await fixture.confirmed {$0.djHostPrompt==model.hostPrompt}
+    let reopened=try await fixture.reopen()
 
     #expect(model.codexState == .signedIn(method: "ChatGPT"))
     #expect(
-        defaults.string(forKey: DJAgentPreferences.hostPromptKey)
+        reopened.confirmed?.values.djHostPrompt
             == "少说一点，多留意时间和用户刚才说的话。"
     )
+    #expect(defaults.string(forKey:DJAgentPreferences.hostPromptKey)==nil)
 }
 
 @MainActor
 @Test
-func agentSettingsPersistsTakeoverAndPlanningModel() throws {
-    let suiteName = "AgentControlSettingsTests.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-    let preferences = DJAgentPreferences(defaults: defaults)
-    let model = AgentSettingsModel(preferences: preferences)
+func agentSettingsPersistsTakeoverAndPlanningModel() async throws {
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let defaults=fixture.defaults
+    let model=fixture.model(account:CodexAccountServiceStub(state:.signedOut))
 
     model.takeoverEnabled = true
     model.planningModel = "gpt-5.4"
     model.saveAgentConfiguration()
 
-    let reloaded = AgentSettingsModel(preferences: preferences)
+    try await fixture.confirmed {$0.djTakeover && $0.djPlanningModel=="gpt-5.4"}
+    let reopened=try await fixture.reopen()
+    let reloaded=AgentSettingsModel(account:CodexAccountServiceStub(state:.signedOut),
+        preferences:DJAgentPreferences(defaults:fixture.defaults,settings:reopened),
+        residentPreferences:ResidentPreferences(defaults:fixture.defaults,settings:reopened))
     #expect(reloaded.takeoverEnabled)
     #expect(reloaded.planningModel == "gpt-5.4")
+    #expect(defaults.string(forKey:DJAgentPreferences.planningModelKey)==nil)
 }
 
 @MainActor
 @Test
-func agentSettingsStartsCodexLoginAndRefreshesTheState() async {
+func agentSettingsStartsCodexLoginAndRefreshesTheState() async throws {
     let account = CodexAccountServiceStub(state: .signedOut)
-    let model = AgentSettingsModel(account: account)
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let model=fixture.model(account:account)
 
     await model.connectCodex()
 
@@ -182,11 +236,13 @@ func agentSettingsStartsCodexLoginAndRefreshesTheState() async {
 
 @MainActor
 @Test
-func agentSettingsLogsOutOfCodexAndReturnsToSignedOut() async {
+func agentSettingsLogsOutOfCodexAndReturnsToSignedOut() async throws {
     let account = CodexAccountServiceStub(
         state: .signedIn(method: "ChatGPT")
     )
-    let model = AgentSettingsModel(account: account)
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let model=fixture.model(account:account)
 
     await model.disconnectCodex()
 
@@ -196,143 +252,135 @@ func agentSettingsLogsOutOfCodexAndReturnsToSignedOut() async {
 
 @MainActor
 @Test
-func agentSettingsPersistsRealtimeVoiceWithoutKeychainPrompts()
-    throws
+func agentSettingsPersistsStandardVoiceWithoutKeychainPrompts()
+    async throws
 {
-    let suiteName = "RealtimeVoiceSettingsTests.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-    let voicePreferences = RealtimeVoicePreferences(
-        defaults: defaults
-    )
-    let model = AgentSettingsModel(
-        preferences: DJAgentPreferences(defaults: defaults),
-        voicePreferences: voicePreferences
-    )
-    model.selectRealtimeProvider(.elevenLabs)
-    model.elevenLabsAgentID = "agent_radio"
-    model.elevenLabsVoiceID = "voice-night"
-    model.elevenLabsConversationToken = "private-token"
-    model.voiceAPIKey = "sk-elevenlabs"
-
-    let configuration = try #require(model.saveVoiceConfiguration())
-
-    #expect(configuration.agentID == "agent_radio")
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let defaults=fixture.defaults
+    try await fixture.speech.save(.init(provider:.elevenlabs,apiKey:"sk-elevenlabs",voiceID:"voice-night",model:"eleven_multilingual_v2"),for:"tts")
+    let reopened=try await fixture.reopen()
+    let preferences=RustSpeechPreferences(defaults:defaults,settings:reopened,secrets:fixture.secrets)
+    let configuration=preferences.configuration(for:"tts",includesEnvironment:false)
+    #expect(configuration.provider == .elevenlabs)
     #expect(configuration.voiceID == "voice-night")
-    #expect(configuration.conversationToken == "private-token")
     #expect(configuration.apiKey == "sk-elevenlabs")
-    #expect(
-        defaults.string(
-            forKey: RealtimeVoicePreferences.conversationTokenKey
-        ) == "private-token"
-    )
-    #expect(
-        defaults.string(forKey: RealtimeVoicePreferences.apiKeyKey)
-            == "sk-elevenlabs"
-    )
+    #expect(configuration.model == "eleven_multilingual_v2")
+    let persisted=try await fixture.persistedValues()
+    #expect(persisted.ttsProvider=="elevenlabs")
+    #expect(persisted.ttsModel=="eleven_multilingual_v2")
+    #expect(persisted.ttsVoice=="voice-night")
+    #expect(!String(decoding:try JSONEncoder().encode(persisted),as:UTF8.self).contains("sk-elevenlabs"))
+    #expect(fixture.secrets.read(provider:"elevenlabs")=="sk-elevenlabs")
+    #expect(defaults.string(forKey:"voice.elevenlabs.apiKey")==nil)
+    #expect(preferences.configuration(for:"tts",includesEnvironment:false,includesSecrets:false).apiKey.isEmpty)
 }
 
 @MainActor
 @Test
-func realtimeVoiceConfigurationAcceptsPublicAgentWithoutPrivateToken() {
-    let model = AgentSettingsModel()
-    model.selectRealtimeProvider(.elevenLabs)
-    model.elevenLabsAgentID = "agent_public"
-    model.elevenLabsConversationToken = ""
-
-    let configuration = model.saveVoiceConfiguration()
-
-    #expect(configuration?.agentID == "agent_public")
-    #expect(configuration?.conversationToken == nil)
+func standardVoiceMetadataDoesNotExposePrivateCredentials() async throws {
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    try await fixture.speech.save(.init(provider:.fish,apiKey:"private-token",voiceID:"reference",model:"s2.1-pro-free"),for:"tts")
+    let metadata=fixture.speech.configuration(for:"tts",includesEnvironment:false,includesSecrets:false)
+    #expect(metadata.provider == .fish)
+    #expect(metadata.voiceID == "reference")
+    #expect(metadata.apiKey.isEmpty)
+    #expect(fixture.secrets.read(provider:"fish")=="private-token")
 }
 
 @MainActor
 @Test
-func realtimeVoiceConfigurationRejectsThePlaceholderAgentID() {
-    let model = AgentSettingsModel()
-    model.selectRealtimeProvider(.elevenLabs)
-    model.elevenLabsAgentID = "agent-public"
+func standardVoiceRejectsInvalidPurposeWithoutChangingAuthorityOrSecrets() async throws {
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let revision=fixture.settings.confirmed?.revision
+    await #expect(throws:RustProductSettingsClient.SettingsError.self) {
+        try await fixture.speech.save(.init(apiKey:"private-token",model:"invalid"),for:"realtime")
+    }
+    #expect(fixture.settings.confirmed?.revision==revision)
+    #expect(fixture.secrets.read(provider:"bailian")==nil)
+}
 
-    let configuration = model.saveVoiceConfiguration()
-
-    #expect(configuration == nil)
-    #expect(model.hasError)
-    #expect(model.message?.contains("真实") == true)
+@MainActor @Test
+func standardVoiceRejectedModelRestoresPrivateCredentialAndConfirmedSettings() async throws {
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let original=fixture.speech.configuration(for:"tts",includesEnvironment:false,includesSecrets:false)
+    try await fixture.speech.save(.init(apiKey:"original-private-key",voiceID:original.voiceID,model:original.model),for:"tts")
+    let revision=fixture.settings.confirmed?.revision
+    await #expect(throws:(any Error).self) {
+        try await fixture.speech.save(.init(apiKey:"rejected-private-key",voiceID:original.voiceID,model:"unknown-model"),for:"tts")
+    }
+    #expect(fixture.settings.confirmed?.revision==revision)
+    #expect(fixture.secrets.read(provider:"bailian")=="original-private-key")
+    let reopened=try await fixture.reopen()
+    #expect(reopened.confirmed?.revision==revision)
+    #expect(reopened.confirmed?.values.ttsModel==original.model)
 }
 
 @MainActor
 @Test
 func agentSettingsSwitchesProviderAndStoresBailianKeyLocally()
-    throws
+    async throws
 {
-    let suiteName = "RealtimeVoiceProviderTests.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-    let preferences = RealtimeVoicePreferences(
-        defaults: defaults
-    )
-    let model = AgentSettingsModel(voicePreferences: preferences)
-
-    model.selectRealtimeProvider(.bailian)
-    model.voiceAPIKey = "sk-bailian"
-
-    let configuration = try #require(model.saveVoiceConfiguration())
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let defaults=fixture.defaults
+    let original=fixture.speech.configuration(for:"tts",includesEnvironment:false,includesSecrets:false)
+    try await fixture.speech.save(.init(provider:.bailian,apiKey:"sk-bailian",voiceID:original.voiceID,model:original.model),for:"tts")
+    let reopened=try await fixture.reopen()
+    let preferences=RustSpeechPreferences(defaults:defaults,settings:reopened,secrets:fixture.secrets)
+    let configuration=preferences.configuration(for:"tts",includesEnvironment:false)
 
     #expect(configuration.provider == .bailian)
     #expect(configuration.apiKey == "sk-bailian")
-    #expect(configuration.model == BailianRealtimeOptions.defaultModel)
-    #expect(configuration.voiceID == BailianRealtimeOptions.defaultVoice)
+    #expect(configuration.model == original.model)
+    #expect(configuration.voiceID == original.voiceID)
+    #expect(fixture.secrets.read(provider:"bailian")=="sk-bailian")
     #expect(
         defaults.string(forKey: "voice.bailian.apiKey")
-            == "sk-bailian"
+            == nil
     )
 }
 @MainActor
 @Test
-func agentSettingsPersistsTheSelectedMicrophone() throws {
-    let suiteName = "RealtimeVoiceMicrophoneTests.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: suiteName))
-    defer { defaults.removePersistentDomain(forName: suiteName) }
-    let preferences = RealtimeVoicePreferences(
-        defaults: defaults
-    )
-    let model = AgentSettingsModel(voicePreferences: preferences)
-
-    model.selectRealtimeProvider(.bailian)
-    model.voiceAPIKey = "sk-bailian"
-    model.voiceMicrophoneDeviceID = "PD200X"
-
-    let configuration = try #require(model.saveVoiceConfiguration())
-    let reloaded = preferences.load(provider: .bailian)
-
-    #expect(configuration.microphoneDeviceID == "PD200X")
-    #expect(reloaded.microphoneDeviceID == "PD200X")
+func agentSettingsPersistsTheSelectedMicrophone() async throws {
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let defaults=fixture.defaults
+    _=try await fixture.settings.apply(["microphoneDeviceID":"PD200X"])
+    let reloaded=try await fixture.reopen()
+    #expect(fixture.settings.confirmed?.values.microphoneDeviceID == "PD200X")
+    #expect(reloaded.confirmed?.values.microphoneDeviceID == "PD200X")
+    #expect(try await fixture.persistedValues().microphoneDeviceID == "PD200X")
     #expect(
         defaults.string(
-            forKey: RealtimeVoicePreferences.microphoneDeviceIDKey
-        ) == "PD200X"
+            forKey: "voice.microphoneDeviceID"
+        ) == nil
     )
 }
 
 @MainActor
 @Test
-func bailianModelAndVoiceUseSelectableDefaults() {
-    let model = AgentSettingsModel()
-
-    model.selectRealtimeProvider(.bailian)
-
-    #expect(
-        BailianRealtimeOptions.models.contains {
-            $0.id == model.voiceModel
-        }
-    )
-    #expect(
-        BailianRealtimeOptions.voices(
-            for: model.voiceModel
-        ).contains {
-            $0.id == model.voiceID
-        }
-    )
+func standardASRChoicePersistsIndependentlyOfTTS() async throws {
+    let fixture=try await PrivateAgentSettingsFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let original=fixture.speech.configuration(for:"tts",includesEnvironment:false,includesSecrets:false)
+    try await fixture.speech.save(.init(provider:.elevenlabs,apiKey:"private-asr-key",model:"scribe_v2_realtime"),for:"asr")
+    let reopened=try await fixture.reopen()
+    let preferences=RustSpeechPreferences(defaults:fixture.defaults,settings:reopened,secrets:fixture.secrets)
+    let asr=preferences.configuration(for:"asr",includesEnvironment:false)
+    let tts=preferences.configuration(for:"tts",includesEnvironment:false,includesSecrets:false)
+    #expect(asr.provider == .elevenlabs)
+    #expect(asr.model == "scribe_v2_realtime")
+    #expect(asr.apiKey == "private-asr-key")
+    let persisted=try await fixture.persistedValues()
+    #expect(persisted.asrProvider=="elevenlabs")
+    #expect(persisted.asrModel=="scribe_v2_realtime")
+    #expect(tts.provider == original.provider)
+    #expect(tts.model == original.model)
+    #expect(tts.voiceID == original.voiceID)
 }
 
 @Test

@@ -28,7 +28,7 @@ namespace GMGN.UnityPlayer.Editor
             try {
                 var controller = owner.AddComponent<UnityScreenVideoController>();
                 var root = new VisualElement();
-                controller.Initialize(root, _ => false);
+                controller.Initialize(root);
                 var quad = new JArray(new JArray(-1, 0, 0), new JArray(1, 0, 0), new JArray(1, 1, 0), new JArray(-1, 1, 0));
                 var screen = new JObject { ["objectID"] = "fixture.tv", ["name"] = "电视", ["state"] = "未开始", ["geometrySource"] = "calibrated", ["quad"] = quad };
                 var snapshot = new JObject { ["screens"] = new JArray(screen), ["frames"] = new JArray() };
@@ -44,18 +44,12 @@ namespace GMGN.UnityPlayer.Editor
                     var mesh = renderer.GetComponent<MeshFilter>().sharedMesh;
                     if (mesh.uv[0] != new Vector2(0, 1) || mesh.uv[2] != new Vector2(1, 0)) throw new Exception("Native top-down display UV is inverted");
                 }
-                if (root.Q<Label>("screenCommandStatus").parent?.name != "screenVideoPanel" ||
-                    root.Q<VisualElement>("screenVideoRows").parent?.name != "screenVideoPanel") throw new Exception("Screen status can be clipped inside scroll viewport");
-                if (!root.Q<VisualElement>("screenVideoRows").Q<Label>().text.Contains("已停止")) throw new Exception("Playback state is missing from sticky panel footer");
+                if (root.Query<UnityEngine.UIElements.Button>().ToList().Count != 0 || root.Query<TextField>().ToList().Count != 0) throw new Exception("Native screen renderer must not construct retired product controls");
                 controller.SetWorldVisible(false);
                 if (owner.GetComponentInChildren<MeshRenderer>() != null) throw new Exception("Hidden world retains active screen");
                 controller.SetWorldVisible(true);
                 controller.ApplySnapshot(new JObject { ["screens"] = new JArray(), ["frames"] = new JArray() });
                 if (((IDictionary)field.GetValue(controller)).Count != 0) throw new Exception("Removed device retains screen");
-                var send = typeof(UnityScreenVideoController).GetMethod("SendScreen", BindingFlags.Instance | BindingFlags.NonPublic);
-                controller.ApplySnapshot(snapshot);
-                send.Invoke(controller, new object[] { "screen.play" });
-                if (!root.Q<Label>("screenCommandStatus").text.Contains("HTTPS")) throw new Exception("Missing actionable empty-link validation");
                 controller.Dispose();
                 var path = Environment.GetEnvironmentVariable("GMGN_SCREEN_VIDEO_MODEL_FIXTURE");
                 if (!string.IsNullOrEmpty(path)) {
@@ -72,41 +66,10 @@ namespace GMGN.UnityPlayer.Editor
                         Debug.Log("ScreenVideoSurfaceChecks actual GLB PASS: calibrated aperture inside bezel, excludes feet, follows model transform, rejects unknown asset");
                     } finally { UnityEngine.Object.Destroy(actual); }
                 }
-                await VerifyPanelLayout();
-                Debug.Log("ScreenVideoSurfaceChecks PASS: persistent idle/loading/failed/stopped geometry, removal, visibility, empty HTTPS input, actual compact panel layout");
+                Debug.Log("ScreenVideoSurfaceChecks PASS: persistent idle/loading/failed/stopped geometry, removal, visibility, no legacy screen controls");
                 EditorApplication.Exit(0);
             } catch (Exception error) { Debug.LogException(error); EditorApplication.Exit(1); }
             finally { UnityEngine.Object.DestroyImmediate(owner); }
-        }
-        static async System.Threading.Tasks.Task VerifyPanelLayout() {
-            // The fixture owns scale explicitly; the host DLL is absent in Editor.
-            foreach (var nativeScale in UnityEngine.Object.FindObjectsByType<NativeUIScale>(FindObjectsSortMode.None)) nativeScale.enabled = false;
-            var go = new GameObject("Actual screen panel layout");
-            var target = new RenderTexture(1440, 900, 0); target.Create();
-            var settings = UnityEngine.Object.Instantiate(Resources.Load<PanelSettings>("PlayerPanel"));
-            settings.scaleMode = PanelScaleMode.ConstantPixelSize; settings.scale = 2; settings.targetTexture = target;
-            var document = go.AddComponent<UIDocument>(); document.panelSettings = settings;
-            var root = document.rootVisualElement;
-            Resources.Load<VisualTreeAsset>("Player").CloneTree(root); root.styleSheets.Add(Resources.Load<StyleSheet>("Player"));
-            root.AddToClassList("document-root"); root.AddToClassList("compact-window");
-            var controller = go.AddComponent<UnityScreenVideoController>(); controller.Initialize(root.Q(className: "body"), _ => false);
-            try {
-                foreach (var state in new[] { "未开始", "取流失败：HTTP 403，视频源拒绝了媒体请求。" }) {
-                    controller.ApplySnapshot(new JObject { ["screens"] = new JArray(new JObject { ["objectID"] = "layout.tv", ["name"] = "电视", ["state"] = state }), ["frames"] = new JArray() });
-                    controller.Show(); root.Q<TextField>("screenURL").value = "https://www.youtube.com/watch?v=1tjrYgF9pes&list=RDNrsQHYM9hT4&index=12";
-                    await System.Threading.Tasks.Task.Delay(700);
-                    var panel = root.Q("screenVideoPanel"); var input = root.Q<TextField>("screenURL").Q(className: "unity-base-field__input");
-                    var play = root.Q<Button>("screenPlay"); var stop = root.Q<Button>("screenStop"); var footer = root.Q("screenVideoRows").Q<Label>();
-                    void Require(bool value, string issue) { if (!value) throw new Exception(issue); }
-                    Require(root.panel.contextType == ContextType.Player && Mathf.Abs(root.layout.width - 720) < 1 && Mathf.Abs(root.layout.height - 450) < 1, "Fixture must reproduce physical 1440x900 at scale 2: " + root.layout);
-                    Require(!(root.Q("screenVideoControls") is ScrollView) && panel.Q<Scroller>() == null, "Unexpected slider/scrollbar in screen form");
-                    Require(input.worldBound.height >= 32 && play.worldBound.height >= 32 && stop.worldBound.height >= 32, "Input/buttons clipped: " + input.worldBound + "/" + play.worldBound + "/" + stop.worldBound);
-                    Require(play.worldBound.xMax <= stop.worldBound.xMin && input.worldBound.yMax <= play.worldBound.yMin, "Screen controls overlap");
-                    Require(panel.worldBound.yMin >= 0 && panel.worldBound.yMax <= root.worldBound.yMax && panel.worldBound.xMin >= 0 && panel.worldBound.xMax <= root.worldBound.xMax, "Screen card escapes compact viewport: " + panel.worldBound);
-                    Require(footer.worldBound.height >= footer.resolvedStyle.fontSize && footer.worldBound.yMin >= play.worldBound.yMax && footer.worldBound.yMax <= panel.worldBound.yMax, "Footer clipped or overlapping: " + footer.worldBound);
-                    Debug.Log($"ScreenVideoSurfaceChecks compact layout PASS: root={root.layout}; panel={panel.worldBound}; input={input.worldBound}; play={play.worldBound}; stop={stop.worldBound}; footer={footer.worldBound}; state={state}");
-                }
-            } finally { controller.Dispose(); UnityEngine.Object.Destroy(go); UnityEngine.Object.Destroy(settings); target.Release(); UnityEngine.Object.Destroy(target); }
         }
     }
 }

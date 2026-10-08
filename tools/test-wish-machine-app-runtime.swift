@@ -13,6 +13,7 @@ func declaration(_ name: String) -> String {
     fatalError("unterminated method")
 }
 let methods = ["private func wishMachineClaimEvidence(", "private func synchronizeWishMachinePresentation()",
+               "private func applyWishMachinePresentation()",
                "private func wishMachineTaskPresentation(for",
                "private func refreshWishMachine()", "private func acknowledgeWishEvents(", "private func retryWishAcknowledgements()",
                "private func configureWishMessageDelivery()", "private func updateWishMessageScope()",
@@ -214,6 +215,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     func receiveContinuationEvent(_ event: Event) { if !continuations.contains(where: { $0.id == event.id }) { continuations.append(event) } }
 }
 @MainActor final class Coordinator {
+    func waitUntilReady() async throws {}
     var onChange: (() -> Void)?
     var placement: WishPlacementDelegation?
     func placementDelegation(worldID: String, residentScope: String, objectID: String) -> WishPlacementDelegation? { placement }
@@ -441,15 +443,22 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     /// tools/test-wish-task-messages.swift 钉。
     func publishResidentTranscript() {}
     \#(methods)
-    func refresh() async { await refreshWishMachine() }
+    private var wishPresentationTask: Task<Void, Never>?
+    private var wishPresentationRefreshPending = false
+    func refresh() async {
+        await refreshWishMachine()
+        await wishPresentationTask?.value
+    }
     func settle() async {
         await Task.yield()
         await refreshWishMachineMessages()
         while residentWishMessageRefreshRunning { await Task.yield() }
+        await wishPresentationTask?.value
     }
     func drainScheduledWork() async {
         for _ in 0..<30 { await Task.yield() }
         while residentWishMessageRefreshRunning { await Task.yield() }
+        await wishPresentationTask?.value
     }
     func evidence(_ job: WishMachineJob) -> WishMachineClaimEvidence? { wishMachineClaimEvidence(for: job) }
     // 原文层已整体移除（2026-10-01）：这里原先桩着 `registerResidentMemoryTurn`
@@ -459,10 +468,10 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     /// 生产里作用域在 ensureResidentLoop()/回合入口绑定；harness 直接绑定一次。
     func bindWishScope() { bindResidentWishScope(currentResidentWorldContext(), loop: residentAgentLoop!) }
     /// 面板的"恢复自动领取"控件就是这一次调用（生产里由两个窗口的 handler 接线）。
-    func resume(_ id: UUID) -> Bool { resumeWishAutomaticContinuation(id: id) }
-    func register(_ image: ResidentImageAttachment) { registerWishImages([image], loop: residentAgentLoop!, worldScope: scope) }
-    func prepare(_ input: ResidentAgentLoop.Input) throws -> UUID? { try authorizeWishImages(input, worldContext: currentResidentWorldContext()) }
-    func pause() { pauseResidentWishContinuations() }
+    func resume(_ id: UUID) async -> Bool { await resumeWishAutomaticContinuation(id: id) }
+    func register(_ image: ResidentImageAttachment) async { await registerWishImages([image], loop: residentAgentLoop!, worldScope: scope) }
+    func prepare(_ input: ResidentAgentLoop.Input) async throws -> UUID? { try await authorizeWishImages(input, worldContext: currentResidentWorldContext()) }
+    func pause() async { await pauseResidentWishContinuations() }
     /// 本地直达的记账是私有的：这层只读包装让断言能看见"同一个事实只本地投递一次"。
     func localFactsQueued() -> Set<UUID> { residentWishLocalFactsQueued }
 }
@@ -539,7 +548,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         check(app.wishMachineCoordinator.published == [event.id] && app.wishMachineCoordinator.acknowledged.isEmpty, "coordinator records publication only and never substitutes local delivery acknowledgements")
         app.scope = "other-resident"; app.spatialStage.selectedWorldID = "other-world"
         app.wishMachineCoordinator.pauseFails = true
-        app.pause()
+        await app.pause()
         check(app.wishMachineCoordinator.pausedScopes == ["room:resident"], "stop after world selection uses the original bound resident scope")
         check(!app.notices.isEmpty, "pause persistence failure is visible rather than silently swallowed")
         app.scope = "resident"; app.spatialStage.selectedWorldID = "room"
@@ -549,7 +558,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         check(app.wishMachineCoordinator.acknowledged.isEmpty && app.spatialStage.wishMachineOutput?.id == "item", "pause retains completion fact and displayed asset")
         let oldLoop = app.residentAgentLoop
         app.residentAgentLoop = ResidentAgentLoop()
-        app.pause()
+        await app.pause()
         check(app.wishMachineCoordinator.pausedScopes.count == 1, "old binding cannot pause a replacement resident loop")
         app.residentAgentLoop = oldLoop
         check(app.evidence(job)?.outputAvailable == true && app.evidence(job)?.distanceMeters == 0, "claim evidence uses actual rendered output and resident location")
@@ -588,19 +597,19 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         let runID = UUID()
         app.residentAgentLoop!.active = runID
         let image = ResidentImageAttachment(id: UUID(), url: URL(fileURLWithPath: "/fixture/prepared.png"), displayName: "用户图片")
-        app.register(image)
+        await app.register(image)
         let input = ResidentAgentLoop.Input(runID: runID, userMessages: ["领取"], imageURLs: [image.url], events: app.residentAgentLoop!.continuations)
         var background = input; background.isBackground = true
-        check(try app.prepare(background) == nil && app.wishMachineCoordinator.granted.isEmpty, "background continuation cannot gain manufacturing permission even with an image URL")
+        check(try await app.prepare(background) == nil && app.wishMachineCoordinator.granted.isEmpty, "background continuation cannot gain manufacturing permission even with an image URL")
         app.scope = "another-resident"
-        do { _ = try app.prepare(input); check(false, "another scope should not reuse image registration") } catch WishMachineError.unknownAttachment { }
+        do { _ = try await app.prepare(input); check(false, "another scope should not reuse image registration") } catch WishMachineError.unknownAttachment { }
         app.scope = "resident"
         let originalLoop = app.residentAgentLoop
         app.residentAgentLoop = ResidentAgentLoop(); app.residentAgentLoop!.active = runID
-        do { _ = try app.prepare(input); check(false, "replacement loop should not reuse old image registration") } catch WishMachineError.unknownAttachment { }
+        do { _ = try await app.prepare(input); check(false, "replacement loop should not reuse old image registration") } catch WishMachineError.unknownAttachment { }
         app.residentAgentLoop = originalLoop
         let followup = ResidentAgentLoop.Input(runID: runID, userMessages: ["用刚才的图片做一个42厘米的摆件"], imageURLs: [], events: [])
-        check(try app.prepare(followup) == runID, "later text-only human instruction can reference the same scoped image")
+        check(try await app.prepare(followup) == runID, "later text-only human instruction can reference the same scoped image")
         app.wishMachineCoordinator.authorizationFails = true
         do { _ = try await app.perform(input); check(false, "authorization failure should throw") } catch { }
         check(app.avatarRuntime.thinkingID == nil && app.liveCamMessageID == nil, "authorization persistence failure clears thinking and message lease")
@@ -699,8 +708,10 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         app.wishMachineCoordinator.jobs.append(.init(id: nextID, worldID: "room", residentScope: "resident", objectID: "new-item", stage: .ready))
         app.propGenerationStore.jobs = app.wishMachineCoordinator.jobs
         app.wishMachineCoordinator.events.append(.init(id: UUID(), wishID: nextID, worldID: "room", residentScope: "resident", objectID: "new-item", kind: .outputReady))
-        app.spatialStage.wishMachineOutputStatus = .ready(id: "new-item")
         app.residentAgentLoop!.active = nil
+        await app.refresh()
+        check(app.spatialStage.wishMachineOutput?.id == "new-item", "new output is selected before its renderer completion")
+        app.spatialStage.wishMachineOutputStatus = .ready(id: "new-item")
         await app.refresh()
         check(app.residentAgentLoop!.continuations.count == continuationCount + 1, "new unpaused job still receives its delegated continuation")
         app.spatialStage.selectedWorldID = "other-world"
@@ -837,7 +848,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
               && releaseApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == true,
               "run stop and task-level pause are two observably separate states")
         releaseApp.bindWishScope()
-        check(releaseApp.resume(id),
+        check(await releaseApp.resume(id),
               "the panel's single resume action succeeds on a stopped task")
         check(releaseApp.wishMachineCoordinator.jobs[0].autoContinuationPaused == false
               && releaseApp.residentAgentLoop!.snapshot.isAutonomyPausedByUser == false
@@ -858,7 +869,7 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
         try releaseApp.wishMachineCoordinator.pauseContinuations(worldID: "room", residentScope: "resident")
         releaseApp.residentAgentLoop!.stopped = true
         releaseApp.residentAgentLoop!.intentPaused = true
-        check(releaseApp.resume(id)
+        check(await releaseApp.resume(id)
               && releaseApp.wishMachineCoordinator.resumeAuthorizations.count == 2
               && releaseApp.wishMachineCoordinator.resumeAuthorizations[0] != releaseApp.wishMachineCoordinator.resumeAuthorizations[1],
               "each stop needs its own fresh release authorization; the old one is never replayed")

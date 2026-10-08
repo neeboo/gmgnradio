@@ -27,26 +27,26 @@ final class MusicAccountsModel {
     private let service: any MusicAccountServicing
     private let webLogin: any MusicProviderWebAuthenticating
     private let appleMusic: AppleMusicSource
-    private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
 
     init(
         service: any MusicAccountServicing = MusicAccountCommandService.live(),
         webLogin: any MusicProviderWebAuthenticating = MusicProviderWebLoginController(),
         appleMusic: AppleMusicSource = AppleMusicSource(),
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        settings: RustProductSettingsClient = .shared
     ) {
         self.service = service
         self.webLogin = webLogin
         self.appleMusic = appleMusic
-        self.defaults = defaults
+        self.settings = settings
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
     }
 
     func load() async {
-        let connected = Set(
-            defaults.stringArray(
-                forKey: Self.connectedProvidersDefaultsKey
-            ) ?? []
-        )
+        do { try await settings.ensureLoaded() }
+        catch { show(error: error); return }
+        let connected = Set(settings.confirmed?.values.musicConnectedProviders ?? [])
         neteaseState = connected.contains(MusicProviderID.netease.rawValue)
             ? .connected
             : .disconnected
@@ -99,7 +99,7 @@ final class MusicAccountsModel {
                 providerID: providerID,
                 cookie: cookie
             )
-            rememberConnection(providerID, connected: true)
+            try await rememberConnection(providerID, connected: true)
             setState(.connected, for: providerID)
             syncingProviders.insert(providerID)
             show(message: "\(providerName(providerID))已连接，正在后台同步歌单…")
@@ -120,7 +120,7 @@ final class MusicAccountsModel {
         do {
             try await service.disconnect(providerID: providerID)
             await webLogin.clearSession(providerID: providerID)
-            rememberConnection(providerID, connected: false)
+            try await rememberConnection(providerID, connected: false)
             setState(.disconnected, for: providerID)
             syncingProviders.remove(providerID)
             publishAccountChange(providerID, connected: false)
@@ -137,7 +137,8 @@ final class MusicAccountsModel {
             from: await appleMusic.requestAuthorization()
         )
         if appleMusicState == .connected {
-            rememberConnection(.appleMusic, connected: true)
+            do { try await rememberConnection(.appleMusic, connected: true) }
+            catch { appleMusicState = .disconnected; show(error: error); return }
             publishAccountChange(.appleMusic, connected: true)
             show(message: "Apple Music 已连接。")
         } else {
@@ -162,21 +163,8 @@ final class MusicAccountsModel {
     private func rememberConnection(
         _ providerID: MusicProviderID,
         connected: Bool
-    ) {
-        var providerIDs = Set(
-            defaults.stringArray(
-                forKey: Self.connectedProvidersDefaultsKey
-            ) ?? []
-        )
-        if connected {
-            providerIDs.insert(providerID.rawValue)
-        } else {
-            providerIDs.remove(providerID.rawValue)
-        }
-        defaults.set(
-            providerIDs.sorted(),
-            forKey: Self.connectedProvidersDefaultsKey
-        )
+    ) async throws {
+        _ = try await settings.recordMusicConnection(providerID: providerID.rawValue, connected: connected)
     }
 
     func state(for providerID: MusicProviderID) -> MusicAccountAuthorizationState {

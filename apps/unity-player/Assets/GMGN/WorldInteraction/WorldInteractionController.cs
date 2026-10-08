@@ -122,8 +122,7 @@ namespace GMGN.UnityPlayer
             var root = inputRoot;
             if (root?.panel == null || Camera.main == null) return;
             for (var hit = target; hit != null; hit = hit.parent)
-                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView ||
-                    hit.name == "chatPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) {
+                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView) {
                     Debug.Log($"World selection blocked by UI: {hit.name}"); return;
                 }
             var ray = PointerRay(point);
@@ -162,7 +161,7 @@ namespace GMGN.UnityPlayer
             if (inventoryPreview && selected?.Instance != null) {
                 bool placed = (bool?)authority?["state"]?["objectStates"]?[selected.ObjectID]?["isEnabled"] == true &&
                     authority?["state"]?["propTombstones"]?[selected.ObjectID] == null &&
-                    (string)authority?["state"]?["heldProp"]?["objectID"] != selected.ObjectID;
+                    WorldProjectionOptional.HeldID(authority?["state"]) != selected.ObjectID;
                 selected.Instance.SetActive(placed); selected.Status = placed ? "restored" : "inventory";
             }
             if (deviceTemplate != null && selected != null) {
@@ -190,7 +189,7 @@ namespace GMGN.UnityPlayer
                 replacement.Instance == selected.Instance &&
                 authority?["state"]?["objectStates"]?[selected.ObjectID] != null &&
                 authority?["state"]?["propTombstones"]?[selected.ObjectID] == null &&
-                (string)authority?["state"]?["heldProp"]?["objectID"] != selected.ObjectID;
+                WorldProjectionOptional.HeldID(authority?["state"]) != selected.ObjectID;
             if (!retain) Cancel();
             else { selected = replacement; if (inventoryPreview) { selected.Instance.SetActive(true); selected.Status = "restored"; } }
             mutableItems = new List<RecoveryItem>(recovered); items = mutableItems; RebuildDeviceGeometry();
@@ -198,7 +197,7 @@ namespace GMGN.UnityPlayer
         public bool BeginInventoryPlacement(string objectID, Vector3? position = null)
         {
             if (!IsEditing || saving || authority == null || placementGrid == null) return false;
-            if ((string)authority["state"]?["heldProp"]?["objectID"] == objectID) return false;
+            if (WorldProjectionOptional.HeldID(authority["state"]) == objectID) return false;
             var item = mutableItems.Find(value => value.ObjectID == objectID && (value.Status == "inventory" || value.Status == "restored") && value.Instance != null);
             if (item == null) return false;
             Cancel(); selected = item; inventoryPreview = true; initialPosition = item.Instance.transform.position;
@@ -220,7 +219,7 @@ namespace GMGN.UnityPlayer
             if ((bool?)existing?["isEnabled"] == true && existing["metadata"]?["gmgn.builtin-device.v1"] != null) {
                 var item = mutableItems.Find(value => value.ObjectID == id && value.Instance != null && value.Status == "restored");
                 if (item == null) return false;
-                Cancel(); selected = item;
+                Cancel(); selected = item; deviceTemplate = (JObject)template.DeepClone();
                 initialPosition = item.Instance.transform.position; initialRotation = item.Instance.transform.rotation;
                 deviceRelocationPreview = true; item.Instance.transform.position = position;
                 active = true; RebuildDeviceGeometry(); PreviewStarted?.Invoke(); return true;
@@ -242,13 +241,18 @@ namespace GMGN.UnityPlayer
         public void ApplyDevicePlacement(JObject update)
         {
             if (!saving || deviceTemplate == null || (string)update["requestID"] != requestID) return;
-            if ((string)update["status"] == "failed") { saving = false; Cancel(); backend.RequestWorldSnapshot(worldID); return; }
+            if ((string)update["status"] == "failed") {
+                saving = false;
+                var code = (string)update["code"] ?? "world_device_unavailable";
+                message.text = "未保存（" + code + "），预览已保留，可调整位置再确认。";
+                Status?.Invoke(message.text); backend.RequestWorldSnapshot(worldID); return;
+            }
             if (update["result"]?["record"] is not JObject record) return;
             var saved = record["state"]?["objectStates"]?[selected.ObjectID];
             if ((bool?)saved?["isEnabled"] != true || saved["metadata"]?["gmgn.builtin-device.v1"] == null) return;
             selected.Instance.transform.SetPositionAndRotation(WorldCoordinates.Position(saved["transform"]["position"]), WorldCoordinates.Rotation(saved["transform"]["rotation"]));
             authority = (JObject)record.DeepClone(); saving = false; deviceTemplate = null;
-            deviceExistingPreview = false;
+            deviceExistingPreview = false; deviceRelocationPreview = false;
             DeviceRestored?.Invoke(selected.Instance.GetComponent<BuiltinWorldDevice>());
             selected = null; PreviewEnded?.Invoke(); RebuildDeviceGeometry();
         }
@@ -278,33 +282,36 @@ namespace GMGN.UnityPlayer
                 requestID = "unity-device:" + Guid.NewGuid().ToString("D");
                 saving = PlaceDevice?.Invoke(new JObject { ["op"] = "world.device.place", ["worldID"] = worldID,
                     ["requestID"] = requestID, ["templateID"] = (string)deviceTemplate["id"],
-                    ["expectedRevision"] = (ulong)authority["recordRevision"], ["placementPayload"] = lastPlacementPayload }) == true;
+                    ["expectedRevision"] = (ulong)authority["recordRevision"], ["expectedLayoutRevision"] = (ulong)state["layoutRevision"],
+                    ["position"] = OriginalPointerIntent()["position"], ["yaw"] = OriginalPointerIntent()["yaw"] }) == true;
                 if (!saving) Status?.Invoke("空间服务忙，摆放预览已保留，请稍后再确认。");
                 return;
             }
-            submitted = (JObject)state.DeepClone();
-            if (inventoryPreview) submitted["objectStates"][selected.ObjectID]["isEnabled"] = true;
-            if (submitted["objectStates"]?[selected.ObjectID]?["transform"] is not JObject transform) {
-                message.text = "这个物件不在当前空间数据中，请刷新后重试。"; return;
-            }
-            var p = selected.Instance.transform.position; var q = selected.Instance.transform.rotation;
-            transform["position"] = new JObject { ["x"] = p.x, ["y"] = p.y, ["z"] = -p.z };
-            transform["rotation"] = new JObject { ["x"] = -q.x, ["y"] = -q.y, ["z"] = q.z, ["w"] = q.w };
-            submitted["revision"] = (ulong)submitted["revision"] + 1;
             requestID = "unity-layout:" + Guid.NewGuid().ToString("D");
-            saving = backend.CommitWorld(worldID, requestID, (ulong)authority["recordRevision"], submitted,
-                new JObject { ["kind"] = "move-preview-confirm", ["objectID"] = selected.ObjectID });
+            saving = backend.RequestPropOperation("world.prop.command", worldID, requestID,
+                (ulong)authority["recordRevision"], (ulong)state["layoutRevision"], OriginalPointerIntent());
             if (!saving) { message.text = "空间服务忙，调整预览已保留，请稍后重试。"; Status?.Invoke(message.text); return; }
             message.text = "正在保存，等待空间服务确认…";
             Status?.Invoke(message.text);
         }
+        JObject PointerPlaceIntent()
+        {
+            var p = selected.Instance.transform.position;
+            return new JObject { ["op"] = "place", ["objectID"] = selected.ObjectID,
+                ["position"] = new JArray(p.x, p.y, -p.z),
+                ["yaw"] = -selected.Instance.transform.eulerAngles.y * Mathf.Deg2Rad };
+        }
+
+        JObject OriginalPointerIntent()
+            => poseVersion == evaluatedPoseVersion && (string)lastPlacementPayload?["objectID"] == selected?.ObjectID
+                ? (JObject)lastPlacementPayload.DeepClone() : PointerPlaceIntent();
 
         internal bool BeginGesture(PointerDownEvent e)
         {
+            if (GetComponent<GPUIChat2Probe>()?.BlocksWorldInput == true) return false;
             if (!active || saving || awaitingReadback || readbackUnconfirmed || (e.button != 0 && e.button != 1)) return false;
             for (var hit = e.target as VisualElement; hit != null; hit = hit.parent)
-                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView ||
-                    hit.name == "chatPanel" || hit.name == "worldInteraction" || hit.ClassListContains("queue-panel")) return false;
+                if (hit is Button || hit is TextField || hit is Slider || hit is ScrollView) return false;
             var focused = inputRoot.focusController?.focusedElement as VisualElement;
             for (; focused != null; focused = focused.parent) if (focused is TextField) return false;
             // A new gesture supersedes a released pose still being evaluated.
@@ -400,40 +407,25 @@ namespace GMGN.UnityPlayer
         public static Vector2 PanelPointToScreen(Vector2 point, Vector2 origin, Vector2 end, Vector2 framebuffer)
             => new Vector2((point.x-origin.x)/(end.x-origin.x)*framebuffer.x,
                 framebuffer.y-(point.y-origin.y)/(end.y-origin.y)*framebuffer.y);
-        async void Evaluate(bool final)
+        void Evaluate(bool final)
         {
             if (!IsEditing || selected == null || authority == null) return;
             if (buildingEvaluation || evaluationID != null || Time.unscaledTime < nextEvaluation) return;
             nextEvaluation = Time.unscaledTime + .12f;
             evaluatedRevision = (ulong)authority["recordRevision"];
             evaluatedPoseVersion = poseVersion;
+            lastPlacementPayload = PointerPlaceIntent();
             evaluationID = "unity-placement:" + Guid.NewGuid().ToString("D");
-            var buildingID = evaluationID;
-            JObject payload;
-            string rejectionMessage = null;
-            buildingEvaluation = true;
-            try {
-                payload = BuildPlacementRequestAsync != null
-                    ? await BuildPlacementRequestAsync(selected.ObjectID, selected.Instance.transform.position, selected.Instance.transform.rotation, authority)
-                    : BuildPlacementRequest?.Invoke(selected.ObjectID, selected.Instance.transform.position, selected.Instance.transform.rotation, authority);
-            } catch (Exception error) {
-                rejectionMessage = error is PlacementPreparationException ? error.Message : "摆放校验准备失败，这次调整未保存。";
-                Debug.LogWarning($"Placement request rejected: objectID={selected?.ObjectID}; code={(error as PlacementPreparationException)?.Code ?? error.GetType().Name}");
-                payload = null;
-            } finally { buildingEvaluation = false; }
-            if (evaluationID != buildingID || selected == null) return;
-            if (poseVersion != evaluatedPoseVersion) { evaluationID = null; return; }
-            if (payload == null || ApplyValidatedPreview == null) {
-                evaluationID = null;
-                Status?.Invoke(rejectionMessage ?? "空间摆放校验尚未连接，这次调整不会保存。");
-                PreviewChanged?.Invoke(new JObject { ["canPlace"] = false, ["columns"] = new JArray() });
-                if (final) releasePending = false; return;
+            if (deviceTemplate == null) {
+                evaluatedSupportHeight = null;
+                if (!backend.RequestPropOperation("world.prop.preview", worldID, evaluationID, evaluatedRevision,
+                    (ulong)authority["state"]["layoutRevision"], PointerPlaceIntent())) evaluationID = null;
+                return;
             }
-            evaluatedSupportHeight = (float?)payload["anchor"]?["supportHeight"];
-            lastPlacementPayload = payload;
-            if (!backend.RequestPlacementEvaluation(payload, evaluationID)) {
-                evaluationID = null;
-            }
+            var pointer = PointerPlaceIntent();
+            if (!backend.RequestDevicePreview(worldID, evaluationID, evaluatedRevision, (ulong)authority["state"]["layoutRevision"],
+                (string)deviceTemplate["id"], pointer["position"], pointer["yaw"])) evaluationID = null;
+            return;
         }
         void OnPlacement(JObject update)
         {
@@ -441,13 +433,22 @@ namespace GMGN.UnityPlayer
             evaluationID = null;
             if (poseVersion != evaluatedPoseVersion) return;
             if ((string)update["status"] == "failed") {
+                PreviewChanged?.Invoke(new JObject { ["canPlace"] = false, ["columns"] = new JArray() });
                 Status?.Invoke((string)update["message"] ?? "摆放校验服务未能确认，这次调整未保存。");
                 releasePending = false;
                 return;
             }
             var result = update["result"] as JObject;
             if (result != null && evaluatedSupportHeight.HasValue) result["previewSupportHeight"] = evaluatedSupportHeight.Value;
-            if ((bool?)result?["canPlace"] == true) ApplyValidatedPreview?.Invoke(result, selected.Instance.transform);
+            if ((bool?)result?["canPlace"] == true) {
+                if ((string)update["operation"] == "world.prop.preview" && result["receipt"]?["placement"] is JObject placement) {
+                    selected.Instance.transform.SetPositionAndRotation(WorldCoordinates.Position(placement["position"]),
+                        Quaternion.Euler(0, -(float)placement["yaw"] * Mathf.Rad2Deg, 0));
+                } else if ((string)update["operation"] == "world.device.preview" && result["placement"] is JObject devicePlacement) {
+                    selected.Instance.transform.SetPositionAndRotation(WorldCoordinates.Position(devicePlacement["position"]),
+                        Quaternion.Euler(0, -(float)devicePlacement["yaw"] * Mathf.Rad2Deg, 0));
+                }
+            }
             PreviewChanged?.Invoke(result);
             if (!releasePending) return;
             releasePending = false;
@@ -468,7 +469,8 @@ namespace GMGN.UnityPlayer
                 if (PlayerScreen.PopupDismissedFrame < pendingEscapeFrame) manipulator?.Abort();
                 pendingEscapeFrame = -1;
             }
-            if (Keyboard.current?.escapeKey.wasPressedThisFrame == true) pendingEscapeFrame = Time.frameCount;
+            if (GetComponent<GPUIChat2Probe>()?.BlocksWorldInput != true && Keyboard.current?.escapeKey.wasPressedThisFrame == true)
+                pendingEscapeFrame = Time.frameCount;
             if (awaitingReadback && Time.unscaledTime >= nextReadback) {
                 if (readbackAttempts >= 3) {
                     awaitingReadback = false; readbackUnconfirmed = true;
@@ -488,7 +490,7 @@ namespace GMGN.UnityPlayer
                 authority = (JObject)record.DeepClone();
                 if (!saving && selected != null && ((record["state"]?["objectStates"]?[selected.ObjectID] == null && (deviceTemplate == null || deviceExistingPreview)) ||
                     record["state"]?["propTombstones"]?[selected.ObjectID] != null ||
-                    (string)record["state"]?["heldProp"]?["objectID"] == selected.ObjectID)) Cancel();
+                    WorldProjectionOptional.HeldID(record["state"]) == selected.ObjectID)) Cancel();
                 if ((awaitingReadback || readbackUnconfirmed) && (ulong)record["recordRevision"] >= savedRevision) {
                     var persisted = record["state"]?["objectStates"]?[savedObjectID]?["transform"];
                     var expected = submitted["objectStates"]?[savedObjectID]?["transform"];
@@ -523,8 +525,9 @@ namespace GMGN.UnityPlayer
                 message.text = (string)update["message"] ?? "这次没有保存，调整预览已保留，请重新确认。";
                 backend.RequestWorldSnapshot(worldID); return;
             }
-            if ((string)update["operation"] == "world.commit" && update["result"]?["revision"] != null) {
-                savedRevision = (ulong)update["result"]["revision"];
+            if ((string)update["operation"] == "world.prop.command" && update["result"]?["snapshot"]?["record"] is JObject committed) {
+                submitted = (JObject)committed["state"].DeepClone();
+                savedRevision = (ulong)committed["recordRevision"];
                 savedObjectID = selected.ObjectID;
                 // The write has a receipt. Never turn subsequent read failures
                 // into a fictitious cancelled write or keep camera input locked.

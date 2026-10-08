@@ -25,32 +25,19 @@ struct OrbAppearance: Equatable, Sendable {
         SIMD4(red, green, blue, 1)
     }
 
-    static func load(from defaults: UserDefaults = .standard) -> OrbAppearance {
-        guard defaults.object(forKey: Keys.red) != nil else {
-            return .default
-        }
-        return OrbAppearance(
-            red: clampedColor(defaults.float(forKey: Keys.red)),
-            green: clampedColor(defaults.float(forKey: Keys.green)),
-            blue: clampedColor(defaults.float(forKey: Keys.blue)),
-            flowIntensity: clampedIntensity(
-                defaults.float(forKey: Keys.flowIntensity)
-            )
-        )
+    @MainActor static func load(from defaults: UserDefaults = .standard, settings: RustProductSettingsClient = .shared) -> OrbAppearance {
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
+        guard let values=settings.confirmed?.values else { return .default }
+        return OrbAppearance(red: Float(values.orbRed), green: Float(values.orbGreen), blue: Float(values.orbBlue), flowIntensity: Float(values.orbFlowIntensity))
     }
 
-    func save(to defaults: UserDefaults = .standard) {
-        defaults.set(Self.clampedColor(red), forKey: Keys.red)
-        defaults.set(Self.clampedColor(green), forKey: Keys.green)
-        defaults.set(Self.clampedColor(blue), forKey: Keys.blue)
-        defaults.set(
-            Self.clampedIntensity(flowIntensity),
-            forKey: Keys.flowIntensity
-        )
+    @MainActor func save(to defaults: UserDefaults = .standard, settings: RustProductSettingsClient = .shared) async throws -> OrbAppearance {
+        _ = try await settings.apply(["orbRed":red,"orbGreen":green,"orbBlue":blue,"orbFlowIntensity":flowIntensity])
         NotificationCenter.default.post(
             name: .orbAppearanceDidChange,
             object: defaults
         )
+        return Self.load(from: defaults, settings: settings)
     }
 
     private static func clampedColor(_ value: Float) -> Float {

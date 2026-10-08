@@ -30,6 +30,57 @@ namespace GMGN.UnityPlayer
         [Serializable] sealed class Event { public string kind, text, message; public ulong requestID; }
         [Serializable] sealed class Command { public string op, text, path, lyricPath; public ulong requestID; public int index; public bool autoplay; public double value; }
         readonly Dictionary<ulong, string> requestIds = new();
+        readonly Dictionary<ulong, ulong> gpuiRequests = new();
+        readonly List<JObject> gpuiFailures = new();
+        public event Action<string> GPUIHostSnapshot;
+        public void BeginGPUIEpoch() { gpuiRequests.Clear(); gpuiFailures.Clear(); }
+        public bool SendGPUICommand(JObject value)
+        {
+            if (value == null) return false;
+            var command = (JObject)value.DeepClone();
+            var operation = (string)command["op"];
+            if (operation == "chat.send") {
+                if (command["requestID"]?.Type != JTokenType.Integer) return false;
+                var paneID = (ulong)command["requestID"];
+                if (gpuiRequests.ContainsValue(paneID)) return false;
+                var actualID = ++sequence;
+                gpuiRequests[actualID] = paneID;
+                command["requestID"] = actualID;
+                if (ExecuteWorld(command)) return true;
+                gpuiRequests.Remove(actualID);
+                gpuiFailures.Add(new JObject { ["kind"] = "failure", ["requestID"] = paneID,
+                    ["message"] = "消息未发送，请重试。", ["code"] = "command_not_accepted" });
+                return false;
+            }
+            if (operation == "chat.cancel") {
+                if (command["requestID"]?.Type != JTokenType.Integer) return false;
+                var paneID = (ulong)command["requestID"];
+                foreach (var pair in gpuiRequests) if (pair.Value == paneID) {
+                    command["requestID"] = pair.Key; return ExecuteWorld(command);
+                }
+                return false;
+            }
+            return ExecuteWorld(command);
+        }
+        void PublishGPUIProjection(JObject original)
+        {
+            if (GPUIHostSnapshot == null) return;
+            var projection = (JObject)original.DeepClone();
+            if (projection["chat"] is JObject chat) {
+                var mapped = new JArray();
+                if (chat["events"] is JArray events) foreach (var token in events) {
+                    if (token is not JObject item || item["requestID"]?.Type != JTokenType.Integer) continue;
+                    var actualID = (ulong)item["requestID"];
+                    if (!gpuiRequests.TryGetValue(actualID, out var paneID)) continue;
+                    var copy = (JObject)item.DeepClone(); copy["requestID"] = paneID; mapped.Add(copy);
+                    var kind = (string)item["kind"];
+                    if (kind == "reply" || kind == "failure" || kind == "cancelled") gpuiRequests.Remove(actualID);
+                }
+                foreach (var failure in gpuiFailures) mapped.Add(failure);
+                gpuiFailures.Clear(); chat["events"] = mapped;
+            }
+            GPUIHostSnapshot.Invoke(projection.ToString(Newtonsoft.Json.Formatting.None));
+        }
         IntPtr host;
         ulong sequence;
         LyricPointLine[] lyrics = Array.Empty<LyricPointLine>();
@@ -66,6 +117,7 @@ namespace GMGN.UnityPlayer
         string characterPositionFingerprint;
         public event Action<string> UiIntent;
         public bool SendCommand(JObject command) => ExecuteWorld(command);
+        public event Action<JObject> WorldPhysicsProbeRequested;
         public bool SendDevicePlacement(JObject command)
         {
             if (host == IntPtr.Zero || command == null || (string)command["op"] != "world.device.place"
@@ -108,6 +160,7 @@ namespace GMGN.UnityPlayer
         public JObject WorldProjection { get; private set; }
         public event Action<JObject> WorldUpdated;
         public event Action<JObject> PlacementEvaluated;
+        public event Action PropNativeFactsRejected;
         public event Action<JObject> PlacementDerived;
         readonly ConcurrentQueue<(byte[] bytes, string operation, string requestID, string error)> placementCommands = new();
         int placementSerializationPending;
@@ -139,10 +192,16 @@ namespace GMGN.UnityPlayer
         {
             return QueuePlacement(payload, requestID, "world.placement.evaluate");
         }
+        public bool ReportPropNativeFacts(JObject payload)
+            => QueuePlacement(payload, "unity-loaded-facts", "world.prop.loaded");
         public bool RequestWorldSnapshot(string worldID) => ExecuteWorld(new JObject { ["op"] = "world.snapshot", ["worldID"] = worldID });
-        public bool CommitWorld(string worldID, string requestID, ulong expectedRevision, JObject state, JObject intent)
-            => ExecuteWorld(new JObject { ["op"] = "world.commit", ["worldID"] = worldID, ["requestID"] = requestID,
-                ["expectedRevision"] = expectedRevision, ["state"] = state, ["intent"] = intent });
+        public bool RequestPropOperation(string operation, string worldID, string requestID, ulong revision, ulong layoutRevision, JObject command)
+            => ExecuteWorld(new JObject { ["op"] = operation, ["worldID"] = worldID, ["requestID"] = requestID,
+                ["expectedRevision"] = revision, ["expectedLayoutRevision"] = layoutRevision, ["command"] = command });
+        public bool RequestDevicePreview(string worldID, string requestID, ulong revision, ulong layoutRevision, string templateID, JToken position, JToken yaw)
+            => ExecuteWorld(new JObject { ["op"] = "world.device.preview", ["worldID"] = worldID, ["requestID"] = requestID,
+                ["expectedRevision"] = revision, ["expectedLayoutRevision"] = layoutRevision, ["templateID"] = templateID,
+                ["position"] = position, ["yaw"] = yaw });
         bool ExecuteWorld(JObject command) => host != IntPtr.Zero && gmgn_unity_host_command(host, command.ToString(Newtonsoft.Json.Formatting.None)) == 1;
         public event Action<PlayerSnapshot> Snapshot;
         public event Action<ChatUpdate> Chat;
@@ -187,7 +246,8 @@ namespace GMGN.UnityPlayer
                     var failed = new JObject { ["operation"] = placement.operation, ["requestID"] = placement.requestID,
                         ["status"] = "failed", ["code"] = placement.error != null ? "serialization_failed" : "placement_not_accepted",
                         ["message"] = "摆放校验未能开始，请稍后重试。" };
-                    if (placement.operation == "world.placement.derive") PlacementDerived?.Invoke(failed);
+                    if (placement.operation == "world.prop.loaded") PropNativeFactsRejected?.Invoke();
+                    else if (placement.operation == "world.placement.derive") PlacementDerived?.Invoke(failed);
                     else if (placement.operation == "world.device.place") DevicePlacementUpdated?.Invoke(failed);
                     else PlacementEvaluated?.Invoke(failed);
                 }
@@ -199,6 +259,9 @@ namespace GMGN.UnityPlayer
             try { json = Marshal.PtrToStringUTF8(pointer); value = JsonUtility.FromJson<Envelope>(json); }
             finally { gmgn_unity_host_string_free(pointer); }
             var projection = JObject.Parse(json);
+            PublishGPUIProjection(projection);
+            if (projection["worldPhysicsProbes"] is JObject physicsRequest && physicsRequest["requestID"] != null)
+                WorldPhysicsProbeRequested?.Invoke(physicsRequest);
             if (projection["characterPosition"] is JObject characterPosition) {
                 var fingerprint = characterPosition.ToString(Newtonsoft.Json.Formatting.None);
                 if (characterPositionFingerprint != fingerprint) {
@@ -266,7 +329,8 @@ namespace GMGN.UnityPlayer
             }
             if (projection["devicePlacement"] is JObject devicePulse && (ulong?)devicePulse["generation"] is ulong deviceRevision && devicePlacementGeneration != deviceRevision) {
                 devicePlacementGeneration = deviceRevision;
-                DevicePlacementUpdated?.Invoke(devicePulse);
+                if ((string)devicePulse?["operation"] == "world.device.preview") PlacementEvaluated?.Invoke(devicePulse);
+                else DevicePlacementUpdated?.Invoke(devicePulse);
             }
             if (projection["selection"] is JObject selection && (ulong?)selection["revision"] is ulong revision && revision > selectionRevision) {
                 selectionRevision = revision;
@@ -306,7 +370,7 @@ namespace GMGN.UnityPlayer
                 worldGeneration = value.world.generation;
                 var update = JObject.Parse(json)["world"] as JObject;
                 if (update != null && update["status"] != null) {
-                    if ((string)update["operation"] == "world.placement.evaluate") {
+                    if ((string)update["operation"] == "world.placement.evaluate" || (string)update["operation"] == "world.prop.preview") {
                         PlacementEvaluated?.Invoke(update);
                     } else if ((string)update["operation"] == "world.placement.derive") {
                         PlacementDerived?.Invoke(update);
@@ -365,7 +429,6 @@ namespace GMGN.UnityPlayer
             if (!Execute(new Command { op = operation })) Error?.Invoke("暂时无法切换歌曲，请稍后重试。");
         }
         public void SelectQueueItem(int index) { if (!Execute(new Command { op = "music.select", index = index })) Error?.Invoke("这首音乐暂时无法播放，请重新选择音乐。"); }
-        public void OpenSettings() { if (!Execute(new Command { op = "settings.open" })) Error?.Invoke("设置面板暂时无法打开。"); }
         public void Seek(double seconds) => Status?.Invoke("当前音乐后端尚未提供跳转。");
         public void SetVolume(float volume) => Execute(new Command { op = "music.volume", value = volume });
         public void Send(string messageId, string text) { var id = ++sequence; requestIds[id] = messageId; var accepted = Execute(new Command { op = "chat.send", requestID = id, text = text }); Debug.Log($"[UnityChat] native_command accepted={accepted} request={id}"); if (!accepted) { requestIds.Remove(id); Chat?.Invoke(new ChatUpdate { messageId = messageId, error = "消息未发送，请重试。", complete = true }); } }

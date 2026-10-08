@@ -22,6 +22,7 @@ namespace GMGN.UnityPlayer.World
         public string Message;
         public GameObject Instance;
         public string AssetMetadata;
+        public string PreparedAssetPath;
     }
 
     public static class WorldCoordinates
@@ -67,7 +68,7 @@ namespace GMGN.UnityPlayer.World
             bool includeInventory = false)
         {
             var objects = state["objectStates"] as JObject ?? throw new InvalidDataException("空间缺少物件状态。");
-            var heldID = (string)state["heldProp"]?["objectID"];
+            var heldID = WorldProjectionOptional.HeldID(state);
             var result = new List<RecoveryItem>();
             foreach (var entry in objects.Properties())
             {
@@ -105,7 +106,7 @@ namespace GMGN.UnityPlayer.World
                     // the loader. Legacy transform.scale encodes that same size.
                     loaded.name = entry.Name;
                     loaded.SetActive(enabled && !held);
-                    item.Instance = loaded; item.Status = held ? "attachment_pending" : enabled ? "restored" : "inventory";
+                    item.Instance = loaded; item.PreparedAssetPath = path; item.Status = held ? "attachment_pending" : enabled ? "restored" : "inventory";
                     item.Message = held ? "手持模型已准备，等待角色挂点。" : enabled ? "物件模型和位置已恢复。" : "模型已准备，可以从库存开始摆放。";
                 }
                 catch (OperationCanceledException) { if (loaded != null) UnityEngine.Object.Destroy(loaded); throw; }

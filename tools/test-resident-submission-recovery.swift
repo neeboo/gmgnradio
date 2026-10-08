@@ -126,6 +126,7 @@ let main = directory.appendingPathComponent("main.swift"), binary = directory.ap
 try program.write(to: main, atomically: true, encoding: .utf8)
 let compile = Process(); compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 compile.arguments = ["-j1", "-swift-version", "6", "-parse-as-library", main.path,
+    sources.appendingPathComponent("Presence/RustResidentSchedulerClient.swift").path,
     sources.appendingPathComponent("Agent/ResidentAgentLoop.swift").path,
     sources.appendingPathComponent("Agent/ResidentMemoryStore.swift").path,
     sources.appendingPathComponent("Agent/ResidentStateClient.swift").path,

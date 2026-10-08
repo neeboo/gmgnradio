@@ -38,6 +38,14 @@ impl Database {
                 let initialized = Store::open(root, change).and_then(|mut s| {
                     s.import(legacy)?;
                     s.recover()?;
+                    crate::agent_chat::recover(&s.connection)?;
+                    crate::speech_delivery::recover(&mut s.connection)?;
+                    crate::world_prop::recover(&s.connection)?;
+                    crate::world_device::recover(&s.connection)?;
+                    crate::world_control::recover(&s.connection)?;
+                    crate::marble_control::recover(&s.connection)?;
+                    crate::music_cache::recover(&s.connection)?;
+                    crate::jukebox::recover(&s.connection)?;
                     Ok(s)
                 });
                 match initialized {
@@ -77,11 +85,15 @@ impl Database {
 /// touching any row. Version 2 adds the resident state/event/message tables.
 /// Version 3 adds memory, version 4 world authority, and version 5 music
 /// programs/playlists/import markers; version 6 adds public-video media cache
-/// metadata and persistent playback lists on the same connection. Every step
+/// metadata and persistent playback lists on the same connection; version 7
+/// adds durable agent dispatch and recovery; version 8 adds foreground and
+/// steering control records; version 9 adds music playback authority and version
+/// 10 adds Wish control; version 11 adds world activity authority; version 12
+/// adds per-screen playback authority. Every step
 /// commits inside its own transaction; a failed step rolls back and leaves the
 /// database at its previous version, so an upgrade failure never corrupts an
 /// existing store.
-fn migrate(connection: &mut Connection) -> Result<()> {
+pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL);",
@@ -123,6 +135,93 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if applied < 6 {
         apply_step(connection, 6, "public-video-cache-v1", crate::media::schema)?;
+    }
+    if applied < 7 {
+        apply_step(connection, 7, "agent-runtime-v1", |connection| {
+            crate::agent_scheduler::schema(connection)?;
+            crate::agent_tools::schema(connection)
+        })?;
+    }
+    if applied < 8 {
+        apply_step(connection, 8, "agent-foreground-v1", crate::agent_scheduler::schema)?;
+    }
+    if applied < 9 {
+        apply_step(connection, 9, "music-playback-v1", crate::music_playback::schema)?;
+    }
+    if applied < 10 {
+        apply_step(connection, 10, "wish-control-v1", crate::wish_control::schema)?;
+    }
+    if applied < 11 {
+        apply_step(connection, 11, "world-activity-v1", crate::world_activity::schema)?;
+    }
+    if applied < 12 {
+        apply_step(connection, 12, "screen-playback-v1", crate::screen_playback::schema)?;
+    }
+    if applied < 13 {
+        apply_step(connection, 13, "agent-chat-v1", crate::agent_chat::schema)?;
+    }
+    if applied < 14 {
+        apply_step(connection, 14, "screen-state-v1", crate::screen_state::schema)?;
+    }
+    if applied < 15 {
+        apply_step(connection, 15, "speech-delivery-v1", crate::speech_delivery::schema)?;
+    }
+    if applied < 16 {
+        apply_step(connection, 16, "world-prop-v1", crate::world_prop::schema)?;
+    }
+    if applied < 17 {
+        apply_step(connection, 17, "world-device-v1", crate::world_device::schema)?;
+    }
+    if applied < 18 {
+        apply_step(connection, 18, "resident-intent-v1", crate::resident_intent::schema)?;
+    }
+    if applied < 19 {
+        apply_step(connection, 19, "music-library-v1", crate::music_library::schema)?;
+    }
+    if applied < 20 {
+        apply_step(connection, 20, "music-program-v1", crate::music_program::schema)?;
+    }
+    if applied < 21 {
+        apply_step(connection, 21, "product-settings-v1", crate::product_settings::schema)?;
+    }
+    if applied < 22 {
+        apply_step(connection, 22, "chat-attachments-v1", crate::chat_attachments::schema)?;
+    }
+    if applied < 23 {
+        apply_step(connection, 23, "presence-selection-v1", crate::presence_selection::schema)?;
+    }
+    if applied < 24 {
+        apply_step(connection, 24, "world-cli-continuity-v1", crate::agent_cli::schema)?;
+    }
+    if applied < 25 {
+        apply_step(connection, 25, "wish-reference-v1", crate::wish_reference::schema)?;
+    }
+    if applied < 26 {
+        apply_step(connection, 26, "program-playback-v1", crate::music_playback::program_schema)?;
+    }
+    if applied < 27 {
+        apply_step(connection, 27, "music-knowledge-v1", crate::music_knowledge::schema)?;
+    }
+    if applied < 28 {
+        apply_step(connection, 28, "world-control-v1", crate::world_control::schema)?;
+    }
+    if applied < 29 {
+        apply_step(connection, 29, "inbox-control-v1", crate::inbox_control::schema)?;
+    }
+    if applied < 30 {
+        apply_step(connection, 30, "marble-control-v1", crate::marble_control::schema)?;
+    }
+    if applied < 31 {
+        apply_step(connection, 31, "stage-video-v1", crate::stage_video::schema)?;
+    }
+    if applied < 32 {
+        apply_step(connection, 32, "music-cache-v1", crate::music_cache::schema)?;
+    }
+    if applied < 33 {
+        apply_step(connection, 33, "jukebox-compound-v1", crate::jukebox::schema)?;
+    }
+    if applied < 34 {
+        apply_step(connection, 34, "chat-speech-v1", crate::chat_speech::schema)?;
     }
     Ok(())
 }
@@ -554,6 +653,8 @@ impl Store {
         Ok((job, replaced.job))
     }
     fn recover(&mut self) -> Result<()> {
+        crate::agent_scheduler::recover(&self.connection)?;
+        crate::agent_tools::recover(&self.connection)?;
         for mut value in self.all()? {
             let j = &mut value.job;
             if j.receipt.is_none()
@@ -714,6 +815,62 @@ fn root_key(key: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrading_v10_adds_activity_authority_without_fabricating_runs() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection.execute_batch(
+            "DROP TABLE world_activity_commands;
+             DROP TABLE world_activity_runs;
+             DROP TABLE screen_playback_commands;
+             DROP TABLE screen_playback_sessions;
+             DELETE FROM schema_migrations WHERE version>=11;
+             INSERT INTO wish_control_documents(owner,session,revision,payload,import_hash)
+             VALUES('owner','session',7,'{\"jobs\":[]}','original');",
+        ).unwrap();
+        migrate(&mut connection).unwrap();
+        migrate(&mut connection).unwrap();
+        let prior: (i64, String) = connection.query_row(
+            "SELECT revision,import_hash FROM wish_control_documents WHERE owner='owner'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(prior, (7, "original".to_owned()));
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM world_activity_runs", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+        let version: i64 = connection.query_row(
+            "SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(version, 34);
+    }
+
+    #[test]
+    fn upgrading_v7_preserves_agent_events_and_adds_foreground_controls() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection.execute_batch(
+            "DROP TABLE agent_loop_human_messages;
+             DELETE FROM schema_migrations WHERE version>=8;
+             INSERT INTO agent_loop_events(world,scope,event,payload,state)
+             VALUES('world','scope','pending-v7','{}','pending');",
+        ).unwrap();
+        migrate(&mut connection).unwrap();
+        migrate(&mut connection).unwrap();
+        let state: String = connection.query_row(
+            "SELECT state FROM agent_loop_events WHERE event='pending-v7'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(state, "pending");
+        let version: i64 = connection.query_row(
+            "SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(version, 34);
+        let controls: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM agent_loop_human_messages", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(controls, 0);
+    }
 
     const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
 
@@ -1080,7 +1237,7 @@ mod tests {
             )
             .unwrap();
         // v5 adds music authority without changing previous stored rows.
-        assert_eq!(version, 6);
+        assert_eq!(version, 34);
         // v1 rows and the full old message contract survive untouched.
         let jobs: i64 = connection
             .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))

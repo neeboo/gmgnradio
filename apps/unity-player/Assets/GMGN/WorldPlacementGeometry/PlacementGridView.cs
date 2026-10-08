@@ -33,6 +33,18 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
                 cells.Add(new Vector3(column.x * spacing, supportHeight, -column.y * spacing));
             Upload(cells, spacing, (bool?)result["canPlace"] == true ? new Color(.2f,1,.45f,.7f) : new Color(1,.15f,.15f,.7f));
         }
+        public void ShowAuthoritativePreview(JObject result)
+        {
+            if (result?["columns"] is not JArray columns || result["spacing"] == null) { Hide(); return; }
+            var spacing = (float)result["spacing"];
+            var cells = new List<Vector3>();
+            foreach (var item in columns) {
+                if (item["column"] == null || item["height"] == null) { Hide(); return; }
+                cells.Add(new Vector3((int)item["column"]["x"] * spacing, (float)item["height"], -(int)item["column"]["z"] * spacing));
+            }
+            // Colour is the Rust whole-object verdict projected onto its local footprint.
+            Upload(cells, spacing, (bool?)result["canPlace"] == true ? new Color(.2f,1,.45f,.7f) : new Color(1,.15f,.15f,.7f));
+        }
         void Upload(List<Vector3> cells, float spacing, Color color)
         {
             var vertices = new List<Vector3>(); var uv = new List<Vector2>(); var indices = new List<int>();

@@ -48,6 +48,7 @@ let viewSupportDeclarations = """
 import Foundation
 import simd
 import WorldRuntime
+import CryptoKit
 \(method("enum PropAttachmentPoint", in: propAttachment))
 \(method("extension PropAttachmentPoint", in: propAttachmentSlot))
 \(method("extension WorldPropSlot", in: propAttachmentSlot))
@@ -244,8 +245,8 @@ import simd
 import os
 import AppKit
 import WorldRuntime
-func precondition(_ condition:@autoclosure()->Bool,_ message:String="assertion failed") {
- if !condition() { print("FAIL: \(message)"); exit(1) }
+@MainActor func precondition(_ condition:@autoclosure()->Bool,_ message:String="assertion failed") {
+ if !condition() { print("FAIL: \(message)"); PrivatePropEditorAuthority.stopAll(); exit(1) }
 }
 /// 场景键盘/指针门禁的**判据本体**（生产实现，逐字抽取）。
 \#(inputFocusPredicate)
@@ -566,45 +567,21 @@ enum ResidentPropPlacementError: Error { case inactiveContext }
  struct Manifest { let worldID:String }
  let manifest:Manifest
  var state:WorldState
+ let authority = PrivatePropEditorAuthority()
  init(_ state:WorldState) { self.state = state;manifest = .init(worldID:state.worldID) }
+ \#(method("func rustPropAuthoritySnapshot(",in:try String(contentsOf:root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/WorldAgentContext.swift"),encoding:.utf8)).replacingOccurrences(of:"struct Snapshot: Decodable {",with:"authorityIdentity=identity\n        try await authority.ensure(state,identity:identity)\n        struct Snapshot: Decodable {"))
+ func adoptRustPropReceipt(_ data:Data) async throws {
+  struct Receipt:Decodable {struct Snapshot:Decodable {struct Record:Decodable {let state:WorldState};let record:Record};let snapshot:Snapshot}
+  let decoder=JSONDecoder();decoder.dateDecodingStrategy = .millisecondsSince1970
+  let receipt=try decoder.decode(Receipt.self,from:data)
+  guard let identity=authorityIdentity,receipt.snapshot.record.state.worldID==manifest.worldID else {throw RustWorldPropError.invalidResponse}
+  let (latest,_) = try await rustPropAuthoritySnapshot(client:authority.client,identity:identity)
+  guard latest==receipt.snapshot.record.state else {throw RustWorldPropError.executionUnknown}
+  state=latest
+ }
+ var authorityIdentity:RustWorldPropClient.Identity?
 }
 typealias WorldAgentContext = LayoutContext
-@MainActor final class PlacementFixture {
- let context:LayoutContext
- let isCurrent:()->Bool
- init(_ context:LayoutContext, isCurrent:@escaping()->Bool) { self.context = context;self.isCurrent = isCurrent }
- func preview(objectID:String,placement:WorldPropPlacement) throws -> WorldObjectState {
-  guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-  return context.state.objectStates[objectID]!
- }
- /// 与生产 `ResidentPropPlacementService.holdCommand(objectID:point:)` **同一个签名**
- /// （`apps/macos/Sources/GMGNRadio/Presence/ResidentPropPlacementService.swift:310`）：
- /// 抽取出来的 `configureResidentPropEditor` 就是按 `point:` 调的，签名一漂就编不过。
- /// 挂点走生产的 `PropAttachmentPoint.worldSlot` 映射（真源码），不在这里另写一份 switch。
- func holdCommand(objectID:String, point:PropAttachmentPoint = .rightHand) throws -> WorldPropLayoutCommand {
-  guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-  return .hold(objectID:objectID,avatarAssetID:"pmx.2b-miss-0414-standard",
-   calibration:.init(avatarAssetID:"pmx.2b-miss-0414-standard",hand:point.worldSlot,
-    normalizedGrip:.init(x:0.5,y:0.2,z:0.5),localOffset:.init(x:0,y:0,z:0),
-    localRotation:.init(x:0,y:0,z:0,w:1)))
- }
- func adjustGripCommand(objectID:String,localOffset:WorldVector3,localRotation:WorldQuaternion) throws -> WorldPropLayoutCommand {
-  guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-  return .adjustGrip(objectID:objectID,avatarAssetID:"pmx.2b-miss-0414-standard",
-   calibration:.init(avatarAssetID:"pmx.2b-miss-0414-standard",hand:.rightHand,
-    normalizedGrip:.init(x:0.5,y:0.2,z:0.5),localOffset:localOffset,localRotation:localRotation))
- }
- func returnHeldCommand(objectID:String) throws -> WorldPropLayoutCommand {
-  guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-  return .returnHeld(objectID:objectID,avatarAssetID:"pmx.2b-miss-0414-standard")
- }
- func commit(_ command:WorldPropLayoutCommand,expectedLayoutRevision:UInt64,requestID:String) throws {
-  guard isCurrent() else { throw ResidentPropPlacementError.inactiveContext }
-  var simulation = WorldSimulation(restoring:context.state)
-  try simulation.applyPropLayout(command,expectedLayoutRevision:expectedLayoutRevision,requestID:requestID)
-  context.state = simulation.state
- }
-}
 @MainActor final class AppGuardHarness {
  final class Spatial {
   var selectedWorldID:String? = "a";var residentPropPreview:WorldObjectState?
@@ -633,10 +610,20 @@ typealias WorldAgentContext = LayoutContext
  var delayPreparation = false
  /// 格子派生好之后，面板该看到的承托面（真机来自 `listedSupportLayers()`）。
  var surfaces:[ResidentPropEditorSurface] = []
+ let residentAuthorityHostSessionID = UUID().uuidString
+ var residentNativePropAuthority:RustWorldPropClient {livingWorldContext!.authority.client}
+ \#(method("private func residentPropUIIdentity(",in:appSource).replacingOccurrences(of:"private func",with:"func"))
+ \#(method("private func residentPropUICommand(",in:appSource).replacingOccurrences(of:"private func",with:"func"))
+ \#(method("private func commitResidentRustPropUI(",in:appSource).replacingOccurrences(of:"private func",with:"func"))
+ func residentRustPropFacts(context:LayoutContext,client:RustWorldPropClient) async throws -> Data {
+  let identity=residentPropUIIdentity(context:context)
+  context.authorityIdentity=identity
+  try await context.authority.ensure(context.state,identity:identity)
+  return try await context.authority.facts(for:context.state)
+ }
  func prepareResidentPropMutation(_ command:WorldPropLayoutCommand,context:LayoutContext) async throws {
   if delayPreparation { isPreparing = true;try await Task.sleep(for:.milliseconds(25));isPreparing = false }
  }
- func residentPropPlacementService(context:LayoutContext,isCurrent:@escaping()->Bool) -> PlacementFixture { .init(context,isCurrent:isCurrent) }
  func residentPropDescriptor(_ state:WorldObjectState) -> WorldObjectState? { state }
  /// 真机：唯一一处把快照推给面板（`updateResidentPropEditor`）。返回**是否真的推成功**。
  @discardableResult
@@ -684,11 +671,16 @@ typealias WorldAgentContext = LayoutContext
 }
 @main struct Test {
  @MainActor static func main() async throws {
+  defer {PrivatePropEditorAuthority.stopAll()}
   let s = ResidentPropEditorState()
   let zero = WorldVector3(x:0,y:0,z:0)
   let identity = WorldTransform(position:zero,rotation:.init(x:0,y:0,z:0,w:1),scale:.init(x:1,y:1,z:1))
+  // The native resident stands beside the cup, within reach and outside its
+  // placement footprint. The old Swift reducer ignored this physical fact.
+  let fixtureAgent = WorldTransform(position:.init(x:0.5,y:0,z:0),rotation:identity.rotation,scale:identity.scale)
   let surface = ResidentPropEditorSurface(id:"floor",name:"地面",position:zero)
-  let prop = WorldGeneratedProp(objectID:"cup",sourceWishID:"wish",assetID:"cup-asset",displayName:"杯子",size:.init(x:0.1,y:0.2,z:0.1),sourceHeight:1)
+  let fixture = try JSONSerialization.jsonObject(with:Data(contentsOf:URL(fileURLWithPath:CommandLine.arguments[2]))) as! [String:Any]
+  let prop = WorldGeneratedProp(objectID:"cup",sourceWishID:"wish",assetID:"sha256:"+(fixture["propHash"] as! String),displayName:"杯子",size:.init(x:0.1,y:0.2,z:0.1),sourceHeight:1)
   let metadata = ["gmgn.generated-prop.v1":String(data:try JSONEncoder().encode(prop),encoding:.utf8)!]
   let object = WorldObjectState(transform:identity, metadata:metadata)
   let snapshot = ResidentPropEditorSnapshot(worldID:"a",revision:3,objects:[object],surfaces:[surface],canUndo:true)
@@ -809,7 +801,7 @@ typealias WorldAgentContext = LayoutContext
   precondition(editEvents == [true,false])
   let handEditor = ResidentPropEditorState()
   var handWorld = WorldState(revision:0,worldID:"a",worldTime:Date(),lastObservedWallTime:Date(),weather:.clear,
-   agentTransform:identity,objectStates:["cup":object])
+   agentTransform:fixtureAgent,objectStates:["cup":object])
   handWorld.layoutRevision = 3
   func handSnapshot() -> ResidentPropEditorSnapshot {
    .init(worldID:"a",revision:handWorld.layoutRevision,objects:Array(handWorld.objectStates.values),surfaces:[surface],
@@ -818,39 +810,35 @@ typealias WorldAgentContext = LayoutContext
   let handCalibration = WorldPropGripCalibration(avatarAssetID:"pmx.2b-miss-0414-standard",hand:.rightHand,
    normalizedGrip:.init(x:0.5,y:0.2,z:0.5),localOffset:.init(x:0,y:0,z:0),
    localRotation:.init(x:0,y:0,z:0,w:1))
+  handWorld.objectStates["cup"]?.metadata["gmgn.prop-grip.v1"] = String(data:try JSONEncoder().encode(handCalibration),encoding:.utf8)!
+  let handContext=LayoutContext(handWorld)
+  let handHost=AppGuardHarness();handHost.livingWorldContext=handContext
+  handHost.setResidentPropEditing(true)
+  func handCommit(_ raw:[String:Any],revision:UInt64,requestID:String) async throws -> ResidentPropEditorSnapshot {
+   do {
+    try await handHost.commitResidentRustPropUI(JSONSerialization.data(withJSONObject:raw),context:handContext,
+     editorID:handHost.residentPropEditingID!,layoutRevision:revision,requestID:requestID)
+   } catch {print("actual hand command failed: \(String(reflecting:error))");throw error}
+   handWorld=handContext.state
+   return handSnapshot()
+  }
   handEditor.preview = { _, _ in object }
   handEditor.hold = { id, point, revision, requestID in
-   var simulation = WorldSimulation(restoring:handWorld)
    // 挂点读**回调参数**：生产 `ResidentPropEditorState.hold` 的类型是
    // `(String, PropAttachmentPoint, UInt64, String)`。以前这里只绑了三个形参名
    // （`id, revision, requestID`），生产插进 `point` 之后 `revision`/`requestID`
    // 全部向前错位一位 —— 形参表一漂，这个替身就是在替另一条签名。
-   let calibration = WorldPropGripCalibration(avatarAssetID:handCalibration.avatarAssetID,
-    hand:point.worldSlot,normalizedGrip:handCalibration.normalizedGrip,
-    localOffset:handCalibration.localOffset,localRotation:handCalibration.localRotation)
-   try simulation.applyPropLayout(.hold(objectID:id,avatarAssetID:"pmx.2b-miss-0414-standard",calibration:calibration),
-    expectedLayoutRevision:revision,requestID:requestID)
-   handWorld = simulation.state
-   return handSnapshot()
+   return try await handCommit(["op":"hold","objectID":id,"slot":point.worldSlot.rawValue],revision:revision,requestID:requestID)
   }
   handEditor.adjustHeldGrip = { id, offset, rotation, revision, requestID in
-   var simulation = WorldSimulation(restoring:handWorld)
-   let calibration = WorldPropGripCalibration(avatarAssetID:"pmx.2b-miss-0414-standard",hand:.rightHand,
-    normalizedGrip:handCalibration.normalizedGrip,localOffset:offset,localRotation:rotation)
-   try simulation.applyPropLayout(.adjustGrip(objectID:id,avatarAssetID:"pmx.2b-miss-0414-standard",calibration:calibration),
-    expectedLayoutRevision:revision,requestID:requestID)
-   handWorld = simulation.state
-   return handSnapshot()
+   return try await handCommit(["op":"adjustGrip","objectID":id,"offset":[offset.x,offset.y,offset.z],
+    "rotation":[rotation.x,rotation.y,rotation.z,rotation.w]],revision:revision,requestID:requestID)
   }
   handEditor.returnHeld = { id, revision, requestID in
-   var simulation = WorldSimulation(restoring:handWorld)
-   try simulation.applyPropLayout(.returnHeld(objectID:id,avatarAssetID:"pmx.2b-miss-0414-standard"),
-    expectedLayoutRevision:revision,requestID:requestID)
-   handWorld = simulation.state
-   return handSnapshot()
+   return try await handCommit(["op":"returnHeld","objectID":id],revision:revision,requestID:requestID)
   }
   handEditor.update(handSnapshot());handEditor.open();await handEditor.select(objectID:"cup");await handEditor.holdSelected()
-  precondition(handEditor.isSelectedHeld && handWorld.objectStates["cup"]?.isEnabled == false,"editor hold must preserve one held identity")
+  precondition(handEditor.isSelectedHeld && handWorld.objectStates["cup"]?.isEnabled == false,"editor hold must preserve one held identity: \(handEditor.notice)")
   await handEditor.nudgeHeld(y:0.02)
   precondition(handWorld.objectStates["cup"]?.gripCalibration?.localOffset.y == 0.02,"editor grip adjustment must persist")
   await handEditor.returnSelected()
@@ -871,7 +859,7 @@ typealias WorldAgentContext = LayoutContext
   while !escaping.isSaving { await Task.yield() }
   escaping.escape();await waitingCommit.value
   let actualHost = AppGuardHarness(), actualController = ControllerHarness()
-  let world = WorldState(revision:0,worldID:"a",worldTime:Date(),lastObservedWallTime:Date(),weather:.clear,agentTransform:identity,objectStates:["cup":object])
+  let world = WorldState(revision:0,worldID:"a",worldTime:Date(),lastObservedWallTime:Date(),weather:.clear,agentTransform:fixtureAgent,objectStates:["cup":object])
   let context = LayoutContext(world);actualHost.livingWorldContext = context
   // 格子派生完成之后面板才看得到承托面（真机：`surfaces` 来自 `listedSupportLayers()`）。
   actualHost.surfaces = [surface];actualHost.residentPropGridDerivation = UUID()
@@ -1817,6 +1805,7 @@ typealias WorldAgentContext = LayoutContext
 """#
 let temp = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-prop-editor-\(UUID().uuidString)")
 try FileManager.default.createDirectory(at:temp,withIntermediateDirectories:true)
+defer {try? FileManager.default.removeItem(at:temp)}
 let source = temp.appendingPathComponent("test.swift"), binary = temp.appendingPathComponent("test")
 try harness.write(to:source,atomically:true,encoding:.utf8)
 // WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
@@ -1836,7 +1825,10 @@ let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let products = URL(fileURLWithPath: worldRuntimeFlags[1]).deletingLastPathComponent()
 let objects = try FileManager.default.contentsOfDirectory(at:products.appendingPathComponent("WorldRuntime.build"),includingPropertiesForKeys:nil).filter { $0.path.hasSuffix(".swift.o") }.map(\.path)
 let compile = Process(); compile.executableURL = URL(fileURLWithPath:"/usr/bin/xcrun")
-compile.arguments = ["swiftc","-j1","-parse-as-library","-swift-version","6","-I",products.appendingPathComponent("Modules").path,source.path,"-o",binary.path] + objects
+compile.arguments = ["swiftc","-j1","-parse-as-library","-swift-version","6","-I",products.appendingPathComponent("Modules").path,source.path,
+ root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift").path,
+ root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RustWorldPropClient.swift").path,
+ root.appendingPathComponent("tools/fixtures/PrivatePropEditorAuthority.swift").path,"-o",binary.path] + objects
 try compile.run();compile.waitUntilExit();guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
 if !CommandLine.arguments.contains("--red-double-submit") {
  // 视图/模型那一趟也**只编真源码**：三份被检查的文件 + 它们真正依赖的三份生产源码。
@@ -1860,4 +1852,16 @@ if !CommandLine.arguments.contains("--red-double-submit") {
   viewSupport.path]
  try viewCheck.run();viewCheck.waitUntilExit();guard viewCheck.terminationStatus == 0 else { exit(viewCheck.terminationStatus) }
 }
-let run = Process();run.executableURL = binary;try run.run();run.waitUntilExit();exit(run.terminationStatus)
+if CommandLine.arguments.contains("--compile-only") {
+ print("PASS: production prop editor large harness compiled; runtime assertions not executed")
+ exit(0)
+}
+func argument(_ name:String) -> String? {
+ guard let i=CommandLine.arguments.firstIndex(of:name), i+1<CommandLine.arguments.count else {return nil}
+ return CommandLine.arguments[i+1]
+}
+guard let daemon=argument("--private-daemon"),let fixture=argument("--private-fixture") else {
+ print("FAIL: runtime requires explicitly verified private daemon and native fixture; no nil authority fallback")
+ exit(1)
+}
+let run = Process();run.executableURL = binary;run.arguments=[daemon,fixture];try run.run();run.waitUntilExit();exit(run.terminationStatus)

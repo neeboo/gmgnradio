@@ -1,4 +1,5 @@
-.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses e2e-acceptance build install install-debug install-universal unregister-product test-icon dedupe verify-registrations verify-helper-manifest verify-screen-link-helper bundle-screen-link-helper
+.PHONY: generate test test-all test-install test-worlds test-daemon test-python test-harnesses _test-harnesses e2e-acceptance build release build-native build-gpui-experimental install install-debug install-universal unregister-product test-icon dedupe verify-registrations verify-helper-manifest verify-screen-link-helper bundle-screen-link-helper
+.DEFAULT_GOAL := build
 
 # 默认 Release：只有 -O 下"承托网格派生"才是 0.5 s 量级（-Onone 是 6.6 s，
 # 真机一次要六秒多，用户等不了）。想最快编译走 make install-debug。
@@ -94,6 +95,11 @@ BUILD_LOCK = $(PYTHON) "$(CURDIR)/tools/with-build-lock.py" --lock "$(BUILD_LOCK
 #
 # 失败不影响构建结果：命令自带 `|| true`，调用处也不改退出码。
 PRODUCT_APP ?= $(DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app
+NATIVE_DERIVED_DATA ?= $(DERIVED_DATA)/NativeHost.noindex
+NATIVE_PRODUCT_APP = $(NATIVE_DERIVED_DATA)/Build/Products/$(CONFIGURATION)/gmgn radio.app
+GPUI_HOST_BUILD_ROOT ?= $(abspath $(DERIVED_DATA))/GPUIHost.noindex
+GPUI_ARCHS ?= $(if $(findstring ONLY_ACTIVE_ARCH=NO,$(ARCH_FLAGS)),arm64 x86_64,$(shell uname -m))
+SCREEN_LINK_HELPER_CACHE ?= $(CURDIR)/tmp/screen-link-helper-cache
 LSREGISTER ?= /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 UNREGISTER_PRODUCT = "$(LSREGISTER)" -u "$(PRODUCT_APP)" >/dev/null 2>&1 || true
 
@@ -128,21 +134,46 @@ RESTORE_ICON = $(ICON_TOOL) --restore "$(PRODUCT_APP)"
 generate:
 	cd apps/macos && $(BUILD_LOCK) xcodegen generate
 
-# Build only: never stop or launch the app or its task daemon.
-build: generate
+# Explicit legacy/native resource carrier and test target. No recursive make
+# build call: supplies resolved production metadata and verified helpers.
+build-native: generate
 	$(BUILD_LOCK) xcodebuild build \
 		-project apps/macos/GMGNRadio.xcodeproj \
 		-scheme GMGNRadio \
 		-configuration "$(CONFIGURATION)" \
 		-destination 'platform=macOS' \
-		-derivedDataPath "$(DERIVED_DATA)" \
+		-derivedDataPath "$(NATIVE_DERIVED_DATA)" \
 		-clonedSourcePackagesDirPath "$(CLONED_SOURCE_PACKAGES)" \
 		-disableAutomaticPackageResolution \
 		-onlyUsePackageVersionsFromResolvedFile \
 		-skipPackageUpdates \
 		$(ARCH_FLAGS) $(COMPILATION_MODE) \
-		CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; \
-	status=$$?; $(APPLY_TEST_ICON); $(UNREGISTER_PRODUCT); exit $$status
+		CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+	$(PYTHON) tools/bundle-screen-link-helper.py --app "$(NATIVE_PRODUCT_APP)" --cache-dir "$(SCREEN_LINK_HELPER_CACHE)" --include deno
+	$(PYTHON) tools/verify-helper-manifest.py --app "$(NATIVE_PRODUCT_APP)" --require-screen-link
+
+# Formal product entry: current Unity Player + embedded GPUI, one native host.
+# Build only; no install, launch, user-data migration or credential signing.
+build:
+	GMGN_UNITY_CONFIGURATION="$(CONFIGURATION)" \
+	GMGN_UNITY_ONLY_ACTIVE_ARCH="$(if $(findstring ONLY_ACTIVE_ARCH=NO,$(ARCH_FLAGS)),NO,YES)" \
+	GMGN_SCREEN_LINK_HELPER_CACHE_DIR="$(SCREEN_LINK_HELPER_CACHE)" \
+	bash tools/build-unity-product-app.sh "$(if $(filter /%,$(firstword $(PRODUCT_APP))),$(PRODUCT_APP),$(CURDIR)/$(PRODUCT_APP))"
+	$(UNREGISTER_PRODUCT)
+
+# Explicit standalone experiment; never the default formal publication path.
+build-gpui-experimental: build-native
+	GMGN_GPUI_BUILD_ROOT="$(GPUI_HOST_BUILD_ROOT)" GMGN_GPUI_CONFIGURATION="$(CONFIGURATION)" \
+	GMGN_GPUI_ONLY_ACTIVE_ARCH="$(if $(findstring ONLY_ACTIVE_ARCH=NO,$(ARCH_FLAGS)),NO,YES)" \
+	GMGN_GPUI_COMPILATION_MODE="$(patsubst SWIFT_COMPILATION_MODE=%,%,$(COMPILATION_MODE))" \
+	GMGN_GPUI_SOURCE_PACKAGES="$(abspath $(CLONED_SOURCE_PACKAGES))" bash tools/build-gpui-product-host.sh
+	GMGN_GPUI_CONFIGURATION="$(CONFIGURATION)" GMGN_GPUI_BUNDLE_MODE=production GMGN_GPUI_SIGNING=none \
+	GMGN_GPUI_ARCHS="$(GPUI_ARCHS)" GMGN_GPUI_SOURCE_APP="$(abspath $(NATIVE_PRODUCT_APP))" \
+	GMGN_GPUI_HOST_PRODUCTS="$(GPUI_HOST_BUILD_ROOT)/DerivedData/Build/Products/$(CONFIGURATION)" \
+	$(BUILD_LOCK) bash tools/build-gpui-product-app.sh "$(abspath $(DERIVED_DATA))/GPUIExperiment.noindex/gmgn radio.app"
+
+release: CONFIGURATION := Release
+release: build
 
 # 可单独执行（`make unregister-product`，例如 daemon/网关之外另跑了一次 xcodebuild）；
 # `build` 末尾调用的就是上面同一条命令。想核对别的配置：CONFIGURATION=Debug。
@@ -155,10 +186,9 @@ test-icon:
 
 # One entry point: build the app + bundled helper, then install and switch both.
 # 日常迭代就用这一条：Release 的 -O 手感 + 单架构 + 增量编译。
-# 拷之前还原原始彩色 logo：`make build` 的黑白测试 logo 只属于构建产物，不该跟着进 /Applications。
+# Unity 正式候选保持已封印的彩色图标；安装前不修改签名资源。
 install: build
-	$(RESTORE_ICON)
-	$(PYTHON) tools/verify-helper-manifest.py --app "$(PRODUCT_APP)"
+	$(PYTHON) tools/unity-product-metadata.py --verify "$(PRODUCT_APP)"
 	python3 tools/install-macos.py --source "$(PRODUCT_APP)"
 	rm -rf "$(PRODUCT_APP)"
 

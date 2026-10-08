@@ -91,11 +91,13 @@ func rederivationProblems(descriptor: String, presentation: String,
     func require(_ value: Bool, _ message: String) { if !value { problems.append(message) } }
 
     guard let syncBody = declaration("private func synchronizeWishMachinePresentation()", in: app),
+          let applyBody = declaration("private func applyWishMachinePresentation() async", in: app),
           let task = declaration("private func wishMachineTaskPresentation(for job: WishMachineJob)", in: app),
           let evidence = declaration("private func wishMachineClaimEvidence(for job: WishMachineJob)", in: app) else {
         return ["找不到 synchronizeWishMachinePresentation / wishMachineTaskPresentation / wishMachineClaimEvidence"]
     }
-    let sync = code(syncBody)
+    require(syncBody.contains("await self.applyWishMachinePresentation()"), "A1: presentation scheduler does not await its authoritative projection")
+    let sync = code(applyBody)
 
     // ── A1：判据只能有一条，而且读的是**现场推导** ─────────────────────────────
     require(descriptor.contains("enum WishMachineOutputReachability"),
@@ -349,11 +351,8 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
         try FileManager.default.createDirectory(at: wishes, withIntermediateDirectories: true)
         try JSONEncoder().encode(SeedArchive(authorizations: [], jobs: [job], events: [event]))
             .write(to: wishes.appendingPathComponent("wishes.json"))
-        let store = PropGenerationStore(directory: scratch,
-            daemonClient: PropTaskDaemonClient(root: scratch,
-                endpointFileURL: scratch.appendingPathComponent("taskd.endpoint.json"),
-                allowsLaunching: false, requestTimeout: 1))
-        let coordinator = WishMachineCoordinator(store: store, directory: wishes, canClaim: { _ in nil })
+        let store = fixtureWishStore(directory: scratch.appendingPathComponent("generation"), session: .shared)
+        let coordinator = try await fixtureWishCoordinator(store: store, directory: wishes, canClaim: { _ in nil })
         check(coordinator.residentJobs(worldID: world, residentScope: scope).count == 1,
             "A1: 真档案没有读回来（重启后连任务都看不见）")
         check(coordinator.outputRenderFailure(id: jobID, worldID: world, residentScope: scope) != nil,
@@ -362,27 +361,27 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
             "A1: ready 产物不再被派生出来（托盘会空着）")
         check(coordinator.readyOutputs(worldID: world).first?.sizeIntent?.meters == 1.443,
             "A1: 托盘描述符没有带上尺寸意图（渲染端拿不到「用户说的哪根轴」）")
-        try coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
+        try await coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
         check(coordinator.outputRenderFailure(id: jobID, worldID: world, residentScope: scope) == nil,
             "A1: 重新推导成功后那条陈旧失败还在（这就是真机那台电视永久领不了的原因）")
-        let secondClear = try coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
+        let secondClear = try await coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
         check(secondClear == false, "A1: 清除不幂等（没有记录时还报告改过）")
         // 现场推导**仍失败** ⇒ 记录必须留下，而且换成这一次的具名原因。
-        try coordinator.recordOutputRenderFailure(id: jobID, worldID: world, residentScope: scope, message: named)
+        try await coordinator.recordOutputRenderFailure(id: jobID, worldID: world, residentScope: scope, message: named)
         let recorded = coordinator.outputRenderFailure(id: jobID, worldID: world, residentScope: scope)
         check(recorded != nil, "A2: 真失败被清掉之后再也没记回来")
         check(recorded?.message?.contains("size_intent.longest.meters") == true
             && recorded?.message?.contains("1443") == true,
             "A2: 记录里的失败没有字段与数值（实测 \(recorded?.message ?? "nil")）")
-        try coordinator.recordOutputRenderFailure(id: jobID, worldID: world, residentScope: scope, message: "第二次推导的具名原因")
+        try await coordinator.recordOutputRenderFailure(id: jobID, worldID: world, residentScope: scope, message: "第二次推导的具名原因")
         let updated = coordinator.outputRenderFailure(id: jobID, worldID: world, residentScope: scope)
         check(updated?.message == "成品场景加载失败：第二次推导的具名原因",
             "A2: 记录没有被替换成最近一次推导的结论（实测 \(updated?.message ?? "nil")）")
         let rendererFailures = coordinator.residentJobs(worldID: world, residentScope: scope).count
         check(rendererFailures == 1, "A1/A2: 重放产生了多余状态变更")
         // 重放"重新推导成功"：仍幂等。
-        try coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
-        try coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
+        try await coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
+        try await coordinator.clearOutputRenderFailure(id: jobID, worldID: world, residentScope: scope)
         check(coordinator.outputRenderFailure(id: jobID, worldID: world, residentScope: scope) == nil,
             "A2: 幂等重放又写出了一条记录")
 
@@ -447,6 +446,7 @@ let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore",
               // 生成确认的退避/预算读这一份唯一策略。
               "Presence/RetryBackoff"]
     .map { sourcesDir.appendingPathComponent($0 + ".swift").path }
+    + [root.appendingPathComponent("tools/fixtures/WishMachineDaemonFixture.swift").path]
 guard inputs.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
     print("FAIL: 许愿机的真源码不全"); exit(1)
 }

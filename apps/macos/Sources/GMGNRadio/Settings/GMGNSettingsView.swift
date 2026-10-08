@@ -45,10 +45,11 @@ enum DefaultSpacePreference: String, CaseIterable, Identifiable {
         }
     }
 
-    static func load(
+    @MainActor static func load(
         defaults: UserDefaults = .standard
     ) -> DefaultSpacePreference {
-        guard let rawValue = defaults.string(forKey: defaultsKey),
+        RustProductSettingsClient.shared.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
+        guard let rawValue = RustProductSettingsClient.shared.confirmed?.values.defaultSpace,
               let preference = DefaultSpacePreference(rawValue: rawValue)
         else {
             return .livingPod
@@ -56,8 +57,10 @@ enum DefaultSpacePreference: String, CaseIterable, Identifiable {
         return preference
     }
 
-    func save(defaults: UserDefaults = .standard) {
-        defaults.set(rawValue, forKey: Self.defaultsKey)
+    @MainActor func save(defaults: UserDefaults = .standard) {
+        let settings = RustProductSettingsClient.shared
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
+        Task { _ = try? await settings.apply(["defaultSpace": rawValue]) }
     }
 }
 

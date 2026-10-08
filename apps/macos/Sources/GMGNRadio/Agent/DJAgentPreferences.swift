@@ -1,11 +1,12 @@
 import Foundation
 
+@MainActor
 struct DJAgentPreferences {
     static let hostPromptKey = "dj.agent.host-prompt"
     static let takeoverEnabledKey = "dj.agent.takeover-enabled"
     static let planningModelKey = "dj.agent.planning-model"
 
-    static let defaultHostPrompt = """
+    nonisolated static let defaultHostPrompt = """
     你是 gmgn radio 的现场 DJ，也是一位有判断力的节目主持人。你负责自主选歌、安排节目结构、串歌和根据反馈及时调整，不等待用户逐首点歌。
 
     策划节目时综合考虑当前时间、正在发生的事、用户此刻的状态、最近听过和跳过的歌、收藏与歌单，以及已经形成的长期偏好。优先从用户自己的音乐库发现合适的歌，也可以为了节目完整性补充新歌。避免短时间重复艺人、专辑和气质过近的歌曲。
@@ -22,50 +23,45 @@ struct DJAgentPreferences {
     串歌要短，说明选择理由；用户说少说点时立即减少主持，只保留必要衔接。
     """
 
-    private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
+    init(defaults: UserDefaults = .standard, settings: RustProductSettingsClient = .shared) {
+        self.settings = settings
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
     }
 
     func hostPrompt() -> String {
         guard
-            let stored = defaults.string(forKey: Self.hostPromptKey),
-            stored != Self.legacyDefaultHostPrompt
+            let stored = settings.confirmed?.values.djHostPrompt,
+            !stored.isEmpty, stored != Self.legacyDefaultHostPrompt
         else {
             return Self.defaultHostPrompt
         }
         return stored
     }
 
-    func saveHostPrompt(_ prompt: String) {
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        defaults.set(
-            trimmed.isEmpty ? Self.defaultHostPrompt : trimmed,
-            forKey: Self.hostPromptKey
-        )
+    func saveHostPrompt(_ prompt: String) async throws {
+        _ = try await settings.apply(["djHostPrompt": prompt])
     }
 
     func takeoverEnabled() -> Bool {
-        guard defaults.object(forKey: Self.takeoverEnabledKey) != nil else {
-            return true
-        }
-        return defaults.bool(forKey: Self.takeoverEnabledKey)
+        settings.confirmed?.values.djTakeover ?? false
     }
 
-    func saveTakeoverEnabled(_ enabled: Bool) {
-        defaults.set(enabled, forKey: Self.takeoverEnabledKey)
+    func saveTakeoverEnabled(_ enabled: Bool) async throws {
+        _ = try await settings.apply(["djTakeover": enabled])
     }
 
     func planningModel() -> String? {
-        normalized(defaults.string(forKey: Self.planningModelKey))
+        settings.confirmed?.values.djPlanningModel
     }
 
-    func savePlanningModel(_ model: String) {
-        defaults.set(
-            normalized(model),
-            forKey: Self.planningModelKey
-        )
+    func savePlanningModel(_ model: String) async throws {
+        _ = try await settings.apply(["djPlanningModel": model])
+    }
+
+    func saveConfiguration(takeover: Bool, model: String) async throws {
+        _ = try await settings.apply(["djTakeover": takeover, "djPlanningModel": model])
     }
 
     private func normalized(_ value: String?) -> String? {

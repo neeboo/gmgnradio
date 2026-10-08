@@ -1,4 +1,5 @@
 //! Taskd HTTP JSON/SSE envelopes shared across host platforms.
+pub mod resident_grant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

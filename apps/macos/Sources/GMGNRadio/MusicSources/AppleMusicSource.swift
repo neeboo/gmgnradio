@@ -65,6 +65,14 @@ struct AppleMusicSource: MusicSource {
         }
     }
 
+    /// Raw MusicKit observations for Rust's account decision, with no playback or device access.
+    func accountAuthorizationFacts(requestAuthorization: Bool) async -> (authorization: String, hasPlayableSubscription: Bool?) {
+        let status = requestAuthorization ? await client.requestAuthorization() : await client.authorizationStatus()
+        let raw: String
+        switch status { case .notDetermined: raw = "notDetermined"; case .denied: raw = "denied"; case .restricted: raw = "restricted"; case .authorized: raw = "authorized" }
+        return (raw, status == .authorized ? try? await client.hasPlayableSubscription() : nil)
+    }
+
     @discardableResult
     func requestAuthorization() async -> MusicSourceAccess {
         _ = await client.requestAuthorization()

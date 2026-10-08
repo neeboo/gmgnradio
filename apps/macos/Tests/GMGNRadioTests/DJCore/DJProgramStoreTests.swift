@@ -4,8 +4,9 @@ import Testing
 
 @MainActor
 @Test
-func programStoreTracksPlanningPublishedAndFailedStates() {
-    let store = DJProgramStore()
+func programStoreTracksPlanningPublishedAndFailedStates() async throws {
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let store = DJProgramStore(client: backend.client)
     let plan = ProgramPlan(
         brief: ProgramBrief(
             id: "night",
@@ -23,7 +24,8 @@ func programStoreTracksPlanningPublishedAndFailedStates() {
     store.beginPlanning()
     #expect(store.status == .planning)
 
-    store.publish(plan)
+    _ = try await backend.seed(plan)
+    try await store.publish(plan)
     #expect(store.status == .ready)
     #expect(store.plan == plan)
 
@@ -34,12 +36,13 @@ func programStoreTracksPlanningPublishedAndFailedStates() {
 
 @MainActor
 @Test
-func programStoreExposesTheActiveSlotForPlaybackAndVisuals() {
-    let store = DJProgramStore()
-    let plan = programPlan(trackIDs: ["one", "two"])
+func programStoreExposesTheActiveSlotForPlaybackAndVisuals() async throws {
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let store = DJProgramStore(client: backend.client)
+    let plan = try await backend.seed(programPlan(trackIDs: ["one", "two"]))
 
-    store.publish(plan)
-    store.activateSlot(at: 1)
+    try await store.publish(plan)
+    try await store.activateSlot(at: 1)
 
     #expect(store.activeSlotIndex == 1)
     #expect(store.activeSlot?.track.id == "two")
@@ -47,14 +50,15 @@ func programStoreExposesTheActiveSlotForPlaybackAndVisuals() {
 
 @MainActor
 @Test
-func programStorePublishesADraftWithoutReplacingTheActiveProgram() {
-    let store = DJProgramStore()
-    let current = programPlan(id: "current", trackIDs: ["one", "two"])
-    let draft = programPlan(id: "city-pop", trackIDs: ["three", "four"])
+func programStorePublishesADraftWithoutReplacingTheActiveProgram() async throws {
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let store = DJProgramStore(client: backend.client)
+    let current = try await backend.seed(programPlan(id: "current", trackIDs: ["one", "two"]))
+    let draft = try await backend.seed(programPlan(id: "city-pop", trackIDs: ["three", "four"]))
 
-    store.publish(current)
-    store.activateSlot(at: 0)
-    store.publishDraft(draft)
+    try await store.publish(current)
+    try await store.activateSlot(at: 0)
+    try await store.publishDraft(draft)
 
     #expect(store.plan == current)
     #expect(store.activeSlotIndex == 0)
@@ -64,18 +68,20 @@ func programStorePublishesADraftWithoutReplacingTheActiveProgram() {
 }
 
 @Test
-func programEditorReplansOnlyTheUpcomingPart() {
-    let current = programPlan(trackIDs: ["one", "two", "three"])
-    let proposal = programPlan(
+@MainActor
+func programEditorReplansOnlyTheUpcomingPart() async throws {
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let current = try await backend.seed(programPlan(trackIDs: ["one", "two", "three"]))
+    let proposal = try await backend.seed(programPlan(
         id: "proposal",
         trackIDs: ["four", "five", "one"]
-    )
+    ))
 
-    let revised = DJProgramEditor.revise(
+    let revised = try await DJProgramEditor.revise(
         current: current,
         activeSlotIndex: 1,
         proposal: proposal,
-        mode: .replanUpcoming
+        mode: .replanUpcoming, client: backend.client
     )
 
     #expect(revised.brief.id == current.brief.id)
@@ -86,18 +92,20 @@ func programEditorReplansOnlyTheUpcomingPart() {
 }
 
 @Test
-func programEditorInsertsOneSongAndKeepsTheExistingRun() {
-    let current = programPlan(trackIDs: ["one", "two", "three"])
-    let proposal = programPlan(
+@MainActor
+func programEditorInsertsOneSongAndKeepsTheExistingRun() async throws {
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let current = try await backend.seed(programPlan(trackIDs: ["one", "two", "three"]))
+    let proposal = try await backend.seed(programPlan(
         id: "proposal",
         trackIDs: ["four", "five"]
-    )
+    ))
 
-    let revised = DJProgramEditor.revise(
+    let revised = try await DJProgramEditor.revise(
         current: current,
         activeSlotIndex: 1,
         proposal: proposal,
-        mode: .insertNext
+        mode: .insertNext, client: backend.client
     )
 
     #expect(revised.slots.map(\.track.id) == [
@@ -108,11 +116,11 @@ func programEditorInsertsOneSongAndKeepsTheExistingRun() {
 @MainActor
 @Test
 func programArchivePersistsThePlanAndPlaybackPosition() async throws {
-    let backend = ProgramStorageRPCFixture()
-    let archive = DJProgramArchive(storage: backend.client)
-    let plan = programPlan(trackIDs: ["one", "two", "three"])
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let archive = DJProgramArchive(storage: backend.storage)
+    let plan = try await backend.seed(programPlan(trackIDs: ["one", "two", "three"]))
 
-    try await archive.save(
+    try await backend.legacy(
         plan: plan,
         activeSlotIndex: 1,
         updatedAt: Date(timeIntervalSince1970: 2_000)
@@ -128,17 +136,17 @@ func programArchivePersistsThePlanAndPlaybackPosition() async throws {
 @MainActor
 @Test
 func programStoreRestoresTheLatestSavedProgramOnRelaunch() async throws {
-    let backend = ProgramStorageRPCFixture()
-    let archive = DJProgramArchive(storage: backend.client)
-    let original = DJProgramStore(archive: archive)
-    let plan = programPlan(trackIDs: ["one", "two"])
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let archive = DJProgramArchive(storage: backend.storage)
+    let original = DJProgramStore(archive: archive, client: backend.client)
+    let plan = try await backend.seed(programPlan(trackIDs: ["one", "two"]))
 
-    original.publish(plan)
-    original.activateSlot(at: 1)
+    try await original.publish(plan)
+    try await original.activateSlot(at: 1)
 
-    let relaunched = DJProgramStore(archive: archive)
+    let relaunched = DJProgramStore(archive: archive, client: backend.client)
     try await original.flush()
-    await relaunched.restoreLatest()
+    try await relaunched.restoreLatest()
 
     #expect(relaunched.status == .ready)
     #expect(relaunched.plan == plan)
@@ -149,23 +157,23 @@ func programStoreRestoresTheLatestSavedProgramOnRelaunch() async throws {
 @MainActor
 @Test
 func programStoreExposesRecentProgramsForTheStageLibrary() async throws {
-    let backend = ProgramStorageRPCFixture()
-    let archive = DJProgramArchive(storage: backend.client)
-    let first = programPlan(id: "first", trackIDs: ["one"])
-    let second = programPlan(id: "second", trackIDs: ["two"])
-    try await archive.save(
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let archive = DJProgramArchive(storage: backend.storage)
+    let first = try await backend.seed(programPlan(id: "first", trackIDs: ["one"]))
+    let second = try await backend.seed(programPlan(id: "second", trackIDs: ["two"]))
+    try await backend.legacy(
         plan: first,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 1_000)
     )
-    try await archive.save(
+    try await backend.legacy(
         plan: second,
         activeSlotIndex: 0,
         updatedAt: Date(timeIntervalSince1970: 2_000)
     )
 
-    let store = DJProgramStore(archive: archive)
-    await store.restoreLatest()
+    let store = DJProgramStore(archive: archive, client: backend.client)
+    try await store.restoreLatest()
 
     #expect(store.recentPrograms.map(\.plan.brief.id) == [
         "second", "first",
@@ -176,34 +184,34 @@ func programStoreExposesRecentProgramsForTheStageLibrary() async throws {
 @MainActor
 @Test
 func programArchiveKeepsRecentProgramsAndUpdatesTheSameProgram() async throws {
-    let backend = ProgramStorageRPCFixture()
-    let archive = DJProgramArchive(storage: backend.client)
-    let first = programPlan(trackIDs: ["one"])
-    let second = programPlan(
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let archive = DJProgramArchive(storage: backend.storage)
+    let first = try await backend.seed(programPlan(trackIDs: ["one"]))
+    let second = try await backend.seed(programPlan(
         id: "second",
         trackIDs: ["two"]
-    )
-    let third = programPlan(
+    ))
+    let third = try await backend.seed(programPlan(
         id: "third",
         trackIDs: ["three"]
-    )
+    ))
 
-    try await archive.save(
+    try await backend.legacy(
         plan: first,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 1_000)
     )
-    try await archive.save(
+    try await backend.legacy(
         plan: second,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 2_000)
     )
-    try await archive.save(
+    try await backend.legacy(
         plan: first,
         activeSlotIndex: 0,
         updatedAt: Date(timeIntervalSince1970: 3_000)
     )
-    try await archive.save(
+    try await backend.legacy(
         plan: third,
         activeSlotIndex: nil,
         updatedAt: Date(timeIntervalSince1970: 4_000)
@@ -273,45 +281,20 @@ private func programPlan(
 }
 
 
-@MainActor
-private final class ProgramStorageRPCFixture {
-    var programs: [SavedDJProgram] = []
-    var pendingIDs: [String] = []
-    var unavailable = false
-    lazy var client = MusicStorageClient(includeDefaultLegacy: false, call: call)
-    func json<T: Encodable>(_ value: T) throws -> PropTaskJSON {
-        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-        return try JSONDecoder().decode(PropTaskJSON.self, from: encoder.encode(value))
-    }
-    func call(_ method: String, _ params: [String: PropTaskJSON]) async throws -> [String: PropTaskJSON] {
-        if unavailable { throw PropTaskDaemonError.unavailable }
-        switch method {
-        case "music_program_save":
-            let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
-            let saved = try decoder.decode(SavedDJProgram.self, from: JSONEncoder().encode(params["program"]!))
-            programs.removeAll { $0.plan.brief.id == saved.plan.brief.id }; programs.append(saved)
-            pendingIDs.removeAll { $0 == saved.plan.brief.id }
-            if params["pending"] == .bool(true) { pendingIDs.append(saved.plan.brief.id) }
-            return ["saved": .bool(true)]
-        case "music_program_list": return ["programs": try json(programs), "pendingIDs": try json(pendingIDs)]
-        default: Issue.record("Unexpected RPC or attempted legacy-file import"); throw PropTaskDaemonError.invalidFrame
-        }
-    }
-}
 
 @MainActor
 @Test
 func programStoragePersistsPendingWithoutSelectingItOnRelaunch() async throws {
-    let backend = ProgramStorageRPCFixture()
-    let archive = DJProgramArchive(storage: backend.client)
-    let original = DJProgramStore(archive: archive)
-    let active = programPlan(id: "active", trackIDs: ["one"])
-    let pending = programPlan(id: "pending", trackIDs: ["two"])
-    original.publish(active)
-    original.publishDraft(pending)
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let archive = DJProgramArchive(storage: backend.storage)
+    let original = DJProgramStore(archive: archive, client: backend.client)
+    let active = try await backend.seed(programPlan(id: "active", trackIDs: ["one"]))
+    let pending = try await backend.seed(programPlan(id: "pending", trackIDs: ["two"]))
+    try await original.publish(active)
+    try await original.publishDraft(pending)
     try await original.flush()
-    let reopened = DJProgramStore(archive: archive)
-    await reopened.restoreLatest()
+    let reopened = DJProgramStore(archive: archive, client: backend.client)
+    try await reopened.restoreLatest()
     #expect(reopened.plan == active)
     #expect(reopened.pendingPlan == pending)
     #expect(reopened.activeSlotIndex == nil)
@@ -320,13 +303,13 @@ func programStoragePersistsPendingWithoutSelectingItOnRelaunch() async throws {
 @MainActor
 @Test
 func programStorageReadCanRecoverAfterVisibleSaveFailure() async throws {
-    let backend = ProgramStorageRPCFixture()
-    let store = DJProgramStore(archive: DJProgramArchive(storage: backend.client))
-    backend.unavailable = true
-    store.publish(programPlan(id: "unsaved", trackIDs: ["one"]))
-    do { try await store.flush(); Issue.record("Unavailable save cannot succeed") } catch { }
+    let backend = try await PrivateMusicAuthorityFixture.start()
+    let store = DJProgramStore(archive: DJProgramArchive(storage: backend.storage), client: backend.client)
+    let unsaved = try await backend.seed(programPlan(id: "unsaved", trackIDs: ["one"]))
+    backend.rejected = true
+    do { try await store.publish(unsaved); Issue.record("Unavailable save cannot succeed") } catch { }
     if case .failed = store.status { } else { Issue.record("Save failure must be visible") }
-    backend.unavailable = false
+    backend.rejected = false
     try await store.refreshRecentPrograms()
     #expect(store.recentPrograms.isEmpty)
 }

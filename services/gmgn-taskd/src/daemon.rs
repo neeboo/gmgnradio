@@ -29,6 +29,15 @@ pub struct Service {
     /// bookkeeping, integrity checks and local storage stay here; the backend
     /// owns only the remote calls behind [`provider::PropProvider`].
     provider: Arc<dyn provider::PropProvider>,
+    agent_runtime: Arc<crate::agent_runtime::RuntimeService>,
+    agent_cli: Arc<crate::agent_cli::CliService>,
+    agent_dsh: Arc<crate::agent_dsh::DshService>,
+    agent_claude: Arc<crate::agent_claude::ClaudeService>,
+    agent_chat: Arc<crate::agent_chat::ChatService>,
+    music_dj: Arc<crate::music_program::ProgramService>,
+    screen_playback: Arc<crate::screen_playback::ScreenPlaybackService>,
+    screen_state: Arc<crate::screen_state::ScreenStateService>,
+    pub(crate) speech_delivery: Arc<crate::speech_delivery::SpeechDeliveryService>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,9 +59,19 @@ impl Service {
     /// Binds the daemon to an explicit backend. Tests use it to drive the same
     /// scheduler and HTTP surface without an external network.
     pub fn with_provider(db: Database, provider: Arc<dyn provider::PropProvider>) -> Result<Self> {
+        let media = crate::media::Media::new(db.clone());
         Ok(Self {
+            agent_runtime: Arc::new(crate::agent_runtime::RuntimeService::new(db.clone())),
+            agent_cli: Arc::new(crate::agent_cli::CliService::new(db.clone())),
+            agent_dsh: Arc::new(crate::agent_dsh::DshService::new(db.clone())),
+            agent_claude: Arc::new(crate::agent_claude::ClaudeService::new(db.clone())),
+            agent_chat: Arc::new(crate::agent_chat::ChatService::new(db.clone())),
+            music_dj: Arc::new(crate::music_program::ProgramService::new(db.clone())),
+            screen_playback: Arc::new(crate::screen_playback::ScreenPlaybackService::new(db.clone(), media.clone())),
+            screen_state: Arc::new(crate::screen_state::ScreenStateService::new(db.clone())),
+            speech_delivery: Arc::new(crate::speech_delivery::SpeechDeliveryService::new(db.clone())),
             db: db.clone(),
-            media: crate::media::Media::new(db.clone()),
+            media,
             credentials: Arc::new(RwLock::new(HashMap::new())),
             memory: Arc::new(memory::Memory::new(db)),
             provider,
@@ -69,16 +88,374 @@ impl Service {
             .iter()
             .any(|token| provider::contains_secret(params, token))
     }
+    pub(crate) async fn accepts_dsh_grant(&self, token: &str) -> bool {
+        self.agent_dsh.accepts_grant(token).await
+    }
+    pub(crate) async fn dsh_host_call(&self, token: &str, params: &Value) -> Result<Value> {
+        self.agent_dsh.host_call(token, params).await
+    }
+    pub(crate) async fn accepts_claude_grant(&self, token: &str) -> bool {
+        self.agent_claude.accepts_grant(token).await
+    }
+    pub(crate) async fn claude_host_call(&self, token: &str, params: &Value) -> Result<Value> {
+        self.agent_claude.host_call(token, params).await
+    }
     pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
         match method {
+            "screen_state_read" | "screen_state_mutate" | "screen_state_import" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                self.screen_state.request(method, &params).await
+            }
+            "speech_delivery_enqueue" | "speech_delivery_read" | "speech_delivery_wait"
+            | "speech_delivery_receipt" | "speech_delivery_cancel" | "chat_speech_event" | "chat_speech_read" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                self.speech_delivery.request(method, params).await
+            }
+            "agent_chat_start" | "agent_chat_read" | "agent_chat_cancel"
+            | "agent_chat_reset" | "agent_chat_import" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.agent_chat.request(method, &params).await
+            }
+            "agent_claude_start" | "agent_claude_read" | "agent_claude_authorize"
+            | "agent_claude_tool_receipt" | "agent_claude_cancel" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.agent_claude.request(method, &params).await
+            }
+            "screen_playback_begin" | "screen_playback_read" | "screen_playback_receipt"
+            | "screen_playback_stop" | "screen_playback_attach" | "screen_playback_resume" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.screen_playback.request(method, &params).await
+            }
+            "agent_dsh_start" | "agent_dsh_read" | "agent_dsh_authorize"
+            | "agent_dsh_tool_receipt" | "agent_dsh_cancel" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.agent_dsh.request(method, &params).await
+            }
+            "resident_intent_restore" | "resident_intent_update" | "resident_intent_pause"
+            | "resident_intent_enqueue" | "resident_intent_drain" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    crate::resident_intent::request(&mut s.connection, &method, &params)
+                }).await
+            }
+            "world_control_bind_catalog" | "world_control_ui_intent" | "world_control_command" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::world_control::request(&mut s.connection, &method, &params)).await
+            }
+            "inbox_control_read" | "inbox_control_deliver" | "inbox_control_post"
+            | "inbox_control_mark_read" | "inbox_control_import" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::inbox_control::request(&mut s.connection, &method, &params)).await
+            }
+            "stage_video_read" | "stage_video_import" | "stage_video_command" | "stage_video_receipt" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::stage_video::request(&s.connection, &method, &params)).await
+            }
+            "marble_control_read" | "marble_control_command" | "marble_control_action_claim"
+            | "marble_control_action_receipt" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let method = method.to_owned();
+                let root = self.db.root.clone();
+                self.db.call(move |s| crate::marble_control::request(&mut s.connection, &root, &method, params)).await
+            }
+            "marble_geometry_sample_plan" => {
+                let count = params["pointCount"].as_u64().and_then(|v| usize::try_from(v).ok())
+                    .ok_or("marble_geometry_invalid_input")?;
+                tokio::task::spawn_blocking(move || crate::marble_geometry::sample_plan(count))
+                    .await.map_err(|_| "marble_geometry_unavailable")?
+            }
+            "marble_geometry_plan" | "marble_geometry_resolve" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let mut refs = HashSet::new();
+                for field in [&params["geometry"]["triangleChunks"], &params["measurementChunks"]] {
+                    if field.is_null() { continue; }
+                    for value in field.as_array().ok_or("marble_geometry_invalid_input")? {
+                        let sha = value.as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .ok_or("marble_geometry_invalid_input")?;
+                        refs.insert(sha.to_owned());
+                    }
+                }
+                if refs.len() > 4096 { return Err("marble_geometry_invalid_input"); }
+                // Only metadata lookup runs on the storage executor. File IO,
+                // hashing and geometry calculation stay off that executor.
+                let descriptors = self.db.call(move |s| {
+                    let mut descriptors = HashMap::new();
+                    for sha in refs {
+                        let (bytes, path): (i64, Option<String>) = s.connection.query_row(
+                            "SELECT bytes, local_path FROM world_blobs WHERE sha256=?1",
+                            [&sha], |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).map_err(|_| "marble_geometry_invalid_proof")?;
+                        let path = path.ok_or("marble_geometry_invalid_proof")?;
+                        if !(0..=4 * 1024 * 1024).contains(&bytes) { return Err("marble_geometry_invalid_proof"); }
+                        descriptors.insert(sha, (bytes as u64, PathBuf::from(path)));
+                    }
+                    Ok(descriptors)
+                }).await?;
+                let root = self.db.root.clone();
+                let method = method.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let root = root.canonicalize().map_err(|_| "marble_geometry_invalid_proof")?;
+                    let mut load = |sha: &str| {
+                        let (expected, path) = descriptors.get(sha).ok_or("marble_geometry_invalid_proof")?;
+                        let path = path.canonicalize().map_err(|_| "marble_geometry_invalid_proof")?;
+                        if !path.starts_with(&root) { return Err("marble_geometry_invalid_proof"); }
+                        let file = std::fs::File::open(path).map_err(|_| "marble_geometry_invalid_proof")?;
+                        let metadata = file.metadata().map_err(|_| "marble_geometry_invalid_proof")?;
+                        if !metadata.is_file() || metadata.len() != *expected { return Err("marble_geometry_invalid_proof"); }
+                        let mut bytes = Vec::new();
+                        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| "marble_geometry_invalid_proof")?;
+                        if bytes.len() as u64 != *expected { return Err("marble_geometry_invalid_proof"); }
+                        Ok(bytes)
+                    };
+                    if method == "marble_geometry_plan" {
+                        crate::marble_geometry::plan_page(&params, &mut load)
+                    } else {
+                        crate::marble_geometry::resolve_chunks(&params, &mut load)
+                    }
+                })
+                    .await.map_err(|_| "marble_geometry_unavailable")?
+            }
+            "world_prop_capability_plan" | "world_prop_capability_resolve" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::world_prop_capability::request(&s.connection, &method, params)).await
+            }
+            "world_activity_approach_plan" | "world_activity_approach_resolve" | "world_activity_approach_places" => {
+                if self.has_configured_secret(&params).await { return Err("secret_in_input"); }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::world_activity_approach::request(&s.connection, &method, params)).await
+            }
+            "world_device_catalog_install" | "world_device_ui_intent" | "world_device_preview"
+            | "world_device_command" | "world_device_refresh" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    let root = s.root.clone();
+                    let tx = s.connection.transaction().map_err(|_| "storage_unavailable")?;
+                    let result = crate::world_device::request(&tx, &root, &method, params)?;
+                    tx.commit().map_err(|_| "storage_unavailable")?;
+                    Ok(result)
+                }).await
+            }
+            "world_prop_read" | "world_prop_observe" | "world_prop_ui_intent"
+            | "world_prop_surfaces" | "world_prop_preview" | "world_prop_command"
+            | "world_prop_register" | "world_prop_rebase" | "world_prop_receipt"
+            | "world_prop_system_avatar_return" | "world_prop_output_preview" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    let root = s.root.clone();
+                    let tx = s.connection.transaction().map_err(|_| "storage_unavailable")?;
+                    let result = crate::world_prop::request(&tx, &root, &method, params)?;
+                    tx.commit().map_err(|_| "storage_unavailable")?;
+                    Ok(result)
+                }).await
+            }
+            "world_activity_read" | "world_activity_bind_catalog" | "world_activity_start"
+            | "world_activity_receipt" | "world_activity_stop" | "world_activity_continue"
+            | "world_activity_move" | "world_activity_replan" | "world_activity_prepare" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    let tx = s.connection.transaction().map_err(|_| "storage_unavailable")?;
+                    let result = crate::world_activity::request(&tx, &method, params)?;
+                    tx.commit().map_err(|_| "storage_unavailable")?;
+                    Ok(result)
+                }).await
+            }
+            "wish_control_open" | "wish_control_read" | "wish_control_commit"
+            | "wish_control_claim" | "wish_control_pause" | "wish_control_resume"
+            | "wish_control_event_ack" | "wish_control_discard_unproven_pauses"
+            | "wish_control_retry_authorize" | "wish_control_command" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    crate::wish_control::request(&mut s.connection, &method, &params)
+                }).await
+            }
+            "agent_cli_start" | "agent_cli_read" | "agent_cli_authorize"
+            | "agent_cli_tool_receipt" | "agent_cli_cancel" | "agent_cli_reset" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.agent_cli.request(method, &params).await
+            }
+            "music_knowledge_read" | "music_knowledge_ingest" | "music_knowledge_event" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::music_knowledge::request(&mut s.connection, &method, &params)).await
+            }
+            "music_program_playback_command" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.db.call(move |s| crate::music_playback::program_request(&mut s.connection, params)).await
+            }
+            "music_playback_read" | "music_playback_begin" | "music_playback_navigate"
+            | "music_playback_commit" | "music_playback_receipt" | "music_playback_clear"
+            | "music_playback_replace_upcoming" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    crate::music_playback::request(&mut s.connection, &method, params)
+                }).await
+            }
+            "agent_runtime_configure" | "agent_runtime_start" | "agent_runtime_read"
+            | "agent_runtime_cancel" | "agent_runtime_tool_receipt" | "agent_runtime_reconcile"
+            | "agent_runtime_authorize" | "agent_runtime_steer" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.agent_runtime.request(method, &params).await
+                    .map_err(|error| crate::agent_runtime::public_error_code(&error))
+            }
+            "agent_tool_begin" | "agent_tool_finish" | "agent_tool_inspect" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    crate::agent_tools::request(&mut s.connection, &method, &params)
+                }).await
+            }
+            "world_activity_route" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                crate::world_activity::route(&params)
+            }
+            "activity_catalog_build" | "activity_manifest_build" | "activity_seat_definition" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                crate::activity::request(method, params)
+            }
+            "agent_loop_configure" | "agent_loop_enqueue" | "agent_loop_claim"
+            | "agent_loop_complete" | "agent_loop_cancel" | "agent_loop_read"
+            | "agent_loop_confirm_cancel" | "agent_loop_reconcile"
+            | "agent_loop_steer_admit" | "agent_loop_steer_finish" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    crate::agent_scheduler::request(&mut s.connection, &method, &params)
+                }).await
+            }
             "media_prepare" | "media_status" | "media_cancel" | "media_release"
             | "media_playlist_commit" | "media_playlist_read" | "media_playlist_advance"
             | "media_playlist_import" | "media_playlist_release" => {
                 if self.has_configured_secret(&params).await {return Err("secret_in_input");}
                 self.media.request(method, params).await
             }
-            "music_program_save" | "music_program_list" | "music_library_read"
-            | "music_library_commit" | "music_import" => {
+            "wish_reference_search" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                crate::wish_reference::search(self.db.clone(), params).await
+            }
+            "wish_reference_prepare" | "wish_reference_complete" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::wish_reference::request(&mut s.connection, &method, &params)).await
+            }
+            "chat_attachments_open" | "chat_attachments_read" | "chat_attachments_register"
+            | "chat_attachments_remove" | "chat_attachments_take" | "chat_attachments_restore"
+            | "chat_attachments_finish" | "chat_attachments_close" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::chat_attachments::request(&mut s.connection, &method, &params)).await
+            }
+            "presence_selection_bind_catalog" | "presence_selection_read" | "presence_selection_event"
+            | "presence_selection_remove_intent" | "presence_selection_remove_claim" | "presence_selection_remove_receipt" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::presence_selection::request(&mut s.connection, &method, &params)).await
+            }
+            "music_dj_plan" => self.music_dj.plan(params).await,
+            "music_dj_discovery" | "music_dj_read" | "music_dj_command"
+            | "music_dj_playlist_plan" | "music_dj_candidates" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::music_program::request(&mut s.connection, &method, params)).await
+            }
+            "product_settings_read" | "product_settings_import" | "product_settings_apply"
+            | "product_settings_stage_event" | "product_settings_stage_import"
+            | "product_settings_bind_catalog" | "product_settings_shortcut_event"
+            | "product_settings_music_receipt" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::product_settings::request(&mut s.connection, &method, &params)).await
+            }
+            "jukebox_begin" | "jukebox_read" | "jukebox_claim" | "jukebox_receipt" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|_| "jukebox_invalid_state")?.as_millis().min(u64::MAX as u128) as u64;
+                    let tx = s.connection.transaction().map_err(|_| "storage_unavailable")?;
+                    let result = crate::jukebox::request(&tx, &method, &params, now)?;
+                    tx.commit().map_err(|_| "storage_unavailable")?;
+                    Ok(result)
+                }).await
+            }
+            "music_cache_prepare" | "music_cache_read" | "music_cache_claim" | "music_cache_receipt" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                crate::music_cache::request(&self.db, &method, params).await
+            }
+            "music_program_save" | "music_library_commit" => {
+                Err("invalid_music_input")
+            }
+            "music_library_edit" | "music_library_page_begin" | "music_library_page_end" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                let method = method.to_owned();
+                self.db.call(move |s| crate::music_library::request(&mut s.connection, &method, params)).await
+            }
+            "music_program_list" | "music_library_read"
+            | "music_import" => {
                 if self.has_configured_secret(&params).await {
                     return Err("secret_in_input");
                 }
@@ -274,6 +651,10 @@ impl Service {
                 }
                 let request: resident::CommitRequest =
                     serde_json::from_value(params).map_err(|_| "invalid_state_commit")?;
+                if (request.domain == "resident" && request.key == "plan")
+                    || (request.domain == "inbox" && request.key == "entries") {
+                    return Err("invalid_state_commit");
+                }
                 self.db
                     .call(move |s| {
                         let tx = s
@@ -1000,8 +1381,8 @@ mod tests {
                 "state_commit",
                 json!({
                     "scope": {"worldID": "world-a", "residentScope": "resident-a"},
-                    "domain": "inbox",
-                    "key": "entries",
+                    "domain": "resident",
+                    "key": "test-projection",
                     "expectedRevision": 0,
                     "requestID": uuid::Uuid::new_v4().to_string(),
                     "value": {"entries": []},

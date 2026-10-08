@@ -1,39 +1,41 @@
 import Foundation
-
-// Fixtures replace only planner/player dependencies. Store, editor and bridge are production sources.
-enum ConversationMode: String, Codable { case ambient }
-struct ProgramBrief: Codable, Equatable {
-    let id: String
-    let targetDuration: Double
-    let moodTags: [String]
-    let energyArc: [Double]
-    let conversationMode: ConversationMode
-    let immediateUserInstruction: String?
-}
-struct Track: Codable, Equatable {
-    let id: String
-    var title: String { id }
-    var artist: String { "fixture" }
-    var duration: Double { 180 }
-}
-struct ProgramSlot: Codable, Equatable { let track: Track }
-struct ProgramPlan: Codable, Equatable {
-    let brief: ProgramBrief
-    let slots: [ProgramSlot]
-    let revision: Int
-    let generatedAt: Date
-    let replanAfterTrackCount: Int
-    let title: String?
-    let direction: String?
-}
+let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+let sources = repository.appendingPathComponent("apps/macos/Sources/GMGNRadio")
+func read(_ file: String) throws -> String { try String(contentsOf: sources.appendingPathComponent(file), encoding: .utf8) }
+let planner = try read("DJCore/ProgramPlanner.swift")
+let planTypes = String(planner[..<planner.range(of: "enum ProgramPlannerError:")!.lowerBound])
+let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-unity-dj-private-\(UUID().uuidString)")
+try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
+defer { try? FileManager.default.removeItem(at: scratch) }
+let harness = #"""
+import Foundation
+\#(try String(contentsOf: repository.appendingPathComponent("tools/fixtures/MusicStorageRPCFixture.swift"), encoding: .utf8))
+\#(planTypes)
+\#(try read("DJCore/AgentShowProposal.swift"))
 struct DJAgentPreferences {}
-struct MusicPlaylistSnapshot: Codable, Equatable { }
 struct CodexTrackRankingAgent { static func live(preferences: DJAgentPreferences) throws -> Self { Self() } }
 @MainActor final class MusicRuntime {
+    func dailyProgramBrief(instruction: String?) async throws -> ProgramBrief { fatalError("Fixture must not invoke live planner") }
     func makeProgramPlan(brief: ProgramBrief, agent: CodexTrackRankingAgent) async throws -> ProgramPlan { fatalError("Fixture must not invoke live planner") }
 }
-func plan(_ id: String, _ tracks: [String]) -> ProgramPlan {
-    .init(brief: .init(id: id, targetDuration: 1800, moodTags: [], energyArc: [], conversationMode: .ambient, immediateUserInstruction: nil), slots: tracks.map { .init(track: .init(id: $0)) }, revision: 1, generatedAt: Date(), replanAfterTrackCount: 5, title: id, direction: nil)
+@MainActor func waitUntil(_ predicate: () -> Bool) async throws {
+    let deadline = Date().addingTimeInterval(10)
+    while !predicate(), Date() < deadline { try await Task.sleep(for: .milliseconds(1)) }
+}
+@MainActor final class OwnedPrograms {
+    let backend = MusicStorageRPCFixture()
+    lazy var client = RustMusicProgramClient(call: backend.call)
+    lazy var library = SyncedMusicLibraryStore(storage: backend.client)
+    private var plans: [String: ProgramPlan] = [:]
+    func plan(_ id: String, _ tracks: [String]) async throws -> ProgramPlan {
+        if let existing = plans[id] { return existing }
+        let facts = tracks.map { MusicCandidate(id: $0, canonicalID: nil, providerID: .local, source: .localLibrary, title: $0, artist: "fixture", album: nil, duration: 180, isPlayable: true, matchScore: 1, userAffinity: 0.5, energy: 0.5, moodTags: [], genres: [], releaseYear: nil) }
+        library.merge(playlists: [MusicPlaylistSnapshot(id: id, providerID: .local, name: id, artworkURL: nil, tracks: facts, totalTrackCount: facts.count)])
+        try await library.flush()
+        let plan = try await client.playlistPlan(playlistID: id)
+        plans[id] = plan
+        return plan
+    }
 }
 enum FixtureFailure: Error { case playback }
 @main struct Test {
@@ -42,11 +44,13 @@ enum FixtureFailure: Error { case playback }
         defer { try? FileManager.default.removeItem(at: root) }
         var calls = 0, activations = 0, failActivation = true
         var notifications: [String] = [], revisedTracks: [String] = []
-        let backend = MusicStorageRPCFixture()
+        let fixture = OwnedPrograms()
+        let backend = fixture.backend
+        let client = fixture.client
         let bridge = UnityDJProgramBridge(archiveRoot: root, hooks: .init(plan: { instruction in
             calls += 1
-            if instruction == "stale" { try? await Task.sleep(for: .milliseconds(50)); return plan("stale", ["stale"]) }
-            return plan("proposal", ["inserted"])
+            if instruction == "stale" { try? await Task.sleep(for: .milliseconds(50)); return try await fixture.plan("stale", ["stale"]) }
+            return try await fixture.plan("proposal", ["inserted"])
         }, activate: { proposal in
             activations += 1
             if failActivation { throw FixtureFailure.playback }
@@ -54,9 +58,9 @@ enum FixtureFailure: Error { case playback }
         }, replaceUpcoming: { revised, index in
             precondition(index == 0)
             revisedTracks = revised.slots.map { $0.track.id }
-        }, notify: { notifications.append($0) }), storage: backend.client)
+        }, notify: { notifications.append($0) }), storage: backend.client, programClient: client)
         try bridge.replan(immediateInstruction: "draft")
-        for _ in 0..<20 where bridge.store.pendingPlan == nil { await Task.yield() }
+        try await waitUntil { bridge.store.pendingPlan != nil }
         precondition(bridge.store.pendingPlan?.brief.id == "proposal")
         precondition(bridge.store.plan == nil && activations == 0)
         do { try await bridge.activate(); preconditionFailure("Failed player must not publish") } catch FixtureFailure.playback {}
@@ -64,20 +68,21 @@ enum FixtureFailure: Error { case playback }
         failActivation = false
         try await bridge.activate()
         precondition(bridge.store.pendingPlan == nil && bridge.store.activeSlotIndex == 0)
-        bridge.store.publish(plan("current", ["playing", "later"]))
-        bridge.activateSlot(at: 0)
+        try await bridge.store.publish(fixture.plan("current", ["playing", "later"]))
+        try await bridge.activateSlot(at: 0)
         try bridge.insert(immediateInstruction: "insert")
-        for _ in 0..<30 where revisedTracks.isEmpty { await Task.yield() }
+        try await waitUntil { !revisedTracks.isEmpty }
         precondition(revisedTracks == ["playing", "inserted", "later"])
         precondition(bridge.store.activeSlot?.track.id == "playing" && activations == 2)
         try bridge.replan(immediateInstruction: "stale")
         await Task.yield()
         try bridge.replan(immediateInstruction: "new")
+        try await waitUntil { bridge.store.pendingPlan != nil }
         try await Task.sleep(for: .milliseconds(80))
         precondition(bridge.store.pendingPlan?.brief.id == "proposal")
         precondition(!notifications.contains { $0.contains("stale，") })
         bridge.shutdown()
-        bridge.store.activateSlot(at: 1)
+        try await bridge.store.activateSlot(at: 1)
         try await bridge.store.flush()
         var restoreCalls = 0
         var rejectHistory = true
@@ -94,7 +99,7 @@ enum FixtureFailure: Error { case playback }
                 if rejectHistory { throw FixtureFailure.playback }
                 historySelections.append(index)
                 return index
-            }), storage: backend.client)
+            }), storage: backend.client, programClient: RustMusicProgramClient(call: backend.call))
         precondition(reopened.activePlaybackPlan == nil)
         let restored = try await reopened.restoreSavedPlayback()
         precondition(restored && restoreCalls == 1 && reopened.activePlaybackPlan?.brief.id == "current")
@@ -116,3 +121,15 @@ enum FixtureFailure: Error { case playback }
         print("PASS: draft does not switch; failed activation retains pending; confirmed activation; insertion preserves current; stale result rejected; shutdown blocks planning")
     }
 }
+"""#
+let input = scratch.appendingPathComponent("main.swift")
+try harness.write(to: input, atomically: true, encoding: .utf8)
+let files = ["MusicSources/MusicSource.swift", "MusicSources/MusicStorageClient.swift", "MusicSources/SyncedMusicLibraryStore.swift", "DJCore/DJProgramStore.swift", "DJCore/RustMusicProgramClient.swift", "MusicKnowledge/TrackKnowledge.swift", "MusicKnowledge/CandidatePoolBuilder.swift", "Domain/PlaybackContext.swift"]
+func run(_ executable: String, _ arguments: [String]) throws -> Int32 {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: executable); p.arguments = arguments
+    try p.run(); p.waitUntilExit(); return p.terminationStatus
+}
+let output = scratch.appendingPathComponent("test")
+let compiled = try run("/usr/bin/swiftc", ["-j1", "-parse-as-library"] + files.map { sources.appendingPathComponent($0).path } + [repository.appendingPathComponent("apps/macos/UnityHost/UnityDJProgramBridge.swift").path, input.path, "-o", output.path])
+guard compiled == 0 else { exit(compiled) }
+exit(try run(output.path, []))

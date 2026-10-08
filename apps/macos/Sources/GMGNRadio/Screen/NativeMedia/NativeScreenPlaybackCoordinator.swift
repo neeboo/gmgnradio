@@ -21,6 +21,8 @@ final class NativeScreenPlaybackCoordinator {
     private let cache: any ScreenMediaCaching
     private let registry: WorldScreenNativeVideoRegistry
     private let device: MTLDevice?
+    private let authority: any ScreenPlaybackAuthorizing
+    private let worldID: @MainActor () -> String?
 
     private struct Session {
         var generation: UInt64
@@ -36,21 +38,29 @@ final class NativeScreenPlaybackCoordinator {
         var playlist: ScreenVideoPlaylist?
         var advancing = false
         var failedGeneration: UInt64?
+        var ticket: RustScreenPlaybackTicket?
+        var playingReceiptSent = false
+        var receiptTask: Task<Void, Never>?
     }
 
     private var sessions: [String: Session] = [:]
     private var nextGeneration: UInt64 = 0
+    private var pendingStarts: [String: String] = [:]
     /// 状态变了（会话内状态或 `read_screen` 读到的内容）。
     var onChange: (@MainActor () -> Void)?
 
     init(
         cache: any ScreenMediaCaching,
         registry: WorldScreenNativeVideoRegistry,
-        device: MTLDevice? = MTLCreateSystemDefaultDevice()
+        device: MTLDevice? = MTLCreateSystemDefaultDevice(),
+        authority: any ScreenPlaybackAuthorizing = RustScreenPlaybackClient(),
+        worldID: @escaping @MainActor () -> String? = { nil }
     ) {
         self.cache = cache
         self.registry = registry
         self.device = device
+        self.authority = authority
+        self.worldID = worldID
     }
 
     // MARK: 读
@@ -161,24 +171,48 @@ final class NativeScreenPlaybackCoordinator {
         objectID: String,
         pageURL: String,
         quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?,
-        continuingPlaylist: ScreenVideoPlaylist? = nil
+        authorizedTicket: RustScreenPlaybackTicket? = nil
     ) async -> WorldScreenCommandOutcome {
-        if continuingPlaylist == nil, let session = sessions[objectID], session.originalURL == pageURL,
-           session.state.isLoading || session.state.isPlaying {
-            return Self.outcome(for: session.state, objectID: objectID)
+        let ticket: RustScreenPlaybackTicket
+        let startRequest = UUID().uuidString
+        pendingStarts[objectID] = startRequest
+        do {
+            if let authorizedTicket { ticket = authorizedTicket }
+            else {
+                guard let world = worldID(), !world.isEmpty else { throw ScreenMediaCacheError.unavailable }
+                let reply = try await authority.begin(worldID: world, screenID: objectID, pageURL: pageURL,
+                    isPlaylist: ScreenMediaCacheClient.isYouTubePlaylist(pageURL), requestID: startRequest)
+                guard let ready = reply.ticket else { throw ScreenMediaCacheError.server("screen_playback_unresolved_begin") }
+                ticket = ready
+            }
+            guard ticket.screenID == objectID, ticket.worldID == worldID() else { throw ScreenMediaCacheError.invalidResponse }
+            guard pendingStarts[objectID] == startRequest else {
+                _ = try? await authority.stop(ticket, requestID: UUID().uuidString)
+                return .failure(.screenNotFound, "这次屏幕操作已停止。")
+            }
+            pendingStarts[objectID] = nil
+            // Rust has granted the exact existing session. This check only
+            // avoids reinstalling this live native executor's identical output;
+            // URL/state projections never bypass the authority begin call.
+            if let session=sessions[objectID], let current=session.ticket,
+               current.worldID==ticket.worldID, current.screenID==ticket.screenID,
+               current.hostSessionID==ticket.hostSessionID, current.sessionID==ticket.sessionID,
+               current.generation==ticket.generation,
+               session.state.isLoading || session.state.isPlaying {
+                return Self.outcome(for:session.state,objectID:objectID)
+            }
+        } catch {
+            let failure = (error as? ScreenMediaCacheError) ?? .unavailable
+            return .failure(.screenLoadFailed, failure.panelText, details: ["screen_id": objectID, "cause": failure.code])
         }
         invalidate(objectID)
         let generation = allocateGeneration()
         sessions[objectID] = Session(
-            generation: generation, originalURL: pageURL, player: nil,
+            generation: generation, originalURL: ticket.pageURL, player: nil,
             state: .loading(url: pageURL), task: nil
         )
-        if let continuingPlaylist {
-            sessions[objectID]?.playlistID = continuingPlaylist.playlistID
-            sessions[objectID]?.playlist = continuingPlaylist
-        } else if ScreenMediaCacheClient.isYouTubePlaylist(pageURL) {
-            sessions[objectID]?.playlistID = "screen-" + UUID().uuidString
-        }
+        sessions[objectID]?.ticket = ticket
+        sessions[objectID]?.playlist = ticket.playlist
         onChange?()
 
         guard let device else {
@@ -195,18 +229,7 @@ final class NativeScreenPlaybackCoordinator {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                var playbackURL = pageURL
-                if let id=self.sessions[objectID]?.playlistID, continuingPlaylist == nil {
-                    let playlist=try await cache.importPlaylist(pageURL:pageURL,playlistID:id)
-                    guard self.isCurrent(objectID,generation) else {
-                        try? await cache.releasePlaylist(playlistID:id)
-                        return
-                    }
-                    self.sessions[objectID]?.playlist=playlist
-                    playbackURL=playlist.currentURL!
-                    self.sessions[objectID]?.originalURL=playbackURL
-                    self.onChange?()
-                }
+                let playbackURL = ticket.pageURL
                 var status = try await cache.prepare(pageURL: playbackURL, maxHeight: 2160, consumerID: consumerID)
                 guard self.isCurrent(objectID, generation) else {
                     self.releaseCache(status.cacheKey, consumerID: consumerID, cancel: status.state != .ready)
@@ -310,12 +333,28 @@ final class NativeScreenPlaybackCoordinator {
         title: String,
         quadProvider: @escaping @MainActor () -> [SIMD3<Float>]?
     ) async -> WorldScreenCommandOutcome {
+        let ticket: RustScreenPlaybackTicket
+        let startRequest = UUID().uuidString
+        pendingStarts[objectID] = startRequest
+        do {
+            guard let world = worldID() else { throw ScreenMediaCacheError.unavailable }
+            let reply = try await authority.begin(worldID: world, screenID: objectID, pageURL: fileURL,
+                isPlaylist: false, requestID: startRequest)
+            guard let ready = reply.ticket else { throw ScreenMediaCacheError.invalidResponse }
+            ticket = ready
+            guard pendingStarts[objectID] == startRequest, ticket.worldID == worldID() else {
+                _ = try? await authority.stop(ticket, requestID: UUID().uuidString)
+                return .failure(.screenNotFound, "这次屏幕操作已停止。")
+            }
+            pendingStarts[objectID] = nil
+        } catch { return .failure(.screenLoadFailed, "屏幕播放服务未连接。") }
         invalidate(objectID)
         let generation = allocateGeneration()
         sessions[objectID] = Session(
             generation: generation, originalURL: fileURL, player: nil,
             state: .loading(url: fileURL), task: nil
         )
+        sessions[objectID]?.ticket = ticket
         onChange?()
         guard let device else {
             publish(objectID, generation, .failed(.nativeLink(Self.mapScreenLinkFailure(.unsupportedPlatform))))
@@ -373,32 +412,28 @@ final class NativeScreenPlaybackCoordinator {
                 self.finishFailure(objectID,generation,.nativeLink(Self.linkFailure(failure)))
             } else if state.isPlaying {
                 self.publish(objectID, generation, .playing(url: descriptor.pageURL))
+                self.reportPlaying(objectID, generation)
             }
         }
         player.onPlaybackEnded = { [weak self] in
             guard let self,self.isCurrent(objectID,generation),!descriptor.isLive,
                   self.sessions[objectID]?.advancing == false else {return}
-            guard let playlist=self.sessions[objectID]?.playlist,playlist.hasNext else {
-                self.stop(objectID)
-                return
-            }
-            NSLog("[ScreenPlaylist] event=advance_requested index=%ld count=%ld revision=%ld", playlist.currentIndex, playlist.items.count, playlist.revision)
+            guard let ticket = self.sessions[objectID]?.ticket else { return }
             self.sessions[objectID]?.advancing=true
             self.sessions[objectID]?.task?.cancel()
             self.sessions[objectID]?.task=Task { @MainActor [weak self] in
                 guard let self else {return}
                 do {
-                    let advanced=try await self.cache.advancePlaylist(playlistID:playlist.playlistID,revision:playlist.revision)
-                    NSLog("[ScreenPlaylist] event=advance_received index=%ld count=%ld revision=%ld", advanced.currentIndex, advanced.items.count, advanced.revision)
-                    let next=ScreenVideoPlaylist(playlistID:advanced.playlistID,revision:advanced.revision,
-                        currentIndex:advanced.currentIndex,items:advanced.items,
-                        truncated:playlist.truncated,itemLimit:playlist.itemLimit)
-                    guard self.isCurrent(objectID,generation) else {try? await self.cache.releasePlaylist(playlistID:playlist.playlistID);return}
-                    // Transfer queue ownership to the next generation; invalidate only the old video pin.
-                    self.sessions[objectID]?.playlistID=nil
-                    self.sessions[objectID]?.playlist=nil
+                    await self.sessions[objectID]?.receiptTask?.value
+                    guard self.isCurrent(objectID, generation) else { return }
+                    let reply = try await self.authority.receipt(ticket, status: "ended", isLive: false,
+                        requestID: "eof-\(ticket.sessionID)-\(ticket.generation)")
+                    guard self.isCurrent(objectID,generation) else { return }
                     self.sessions[objectID]?.task=nil
-                    _ = await self.play(objectID:objectID,pageURL:next.currentURL!,quadProvider:quadProvider,continuingPlaylist:next)
+                    if let next = reply.ticket {
+                        _ = await self.play(objectID: objectID, pageURL: next.pageURL,
+                            quadProvider: quadProvider, authorizedTicket: next)
+                    } else { self.stopOutput(objectID) }
                 } catch {
                     guard self.isCurrent(objectID,generation) else {return}
                     NSLog("[ScreenPlaylist] event=advance_failed code=%@", (error as? ScreenMediaCacheError)?.code ?? "media_playlist_failed")
@@ -418,6 +453,7 @@ final class NativeScreenPlaybackCoordinator {
                 guard let session = sessions[objectID], let current = session.player else { return }
                 if current.decodedFrameCount > 0 || current.state.isPlaying {
                     self.publish(objectID, generation, .playing(url: descriptor.pageURL))
+                    self.reportPlaying(objectID, generation)
                     return
                 }
                 if case let .failed(failure) = current.state {
@@ -432,6 +468,16 @@ final class NativeScreenPlaybackCoordinator {
     // MARK: 停 / 删
 
     func stop(_ objectID: String) {
+        pendingStarts[objectID] = nil
+        if let ticket = sessions[objectID]?.ticket {
+            let authority = self.authority
+            Task { do { _ = try await authority.stop(ticket, requestID: UUID().uuidString) }
+                catch { NSLog("[ScreenPlayback] stop_receipt_failed") } }
+        }
+        stopOutput(objectID)
+    }
+
+    private func stopOutput(_ objectID: String) {
         guard let session = sessions[objectID] else { return }
         session.task?.cancel()
         session.player?.stop()
@@ -449,6 +495,12 @@ final class NativeScreenPlaybackCoordinator {
 
     /// 物件被收回 / 世界切换：**彻底**清掉会话（过期结果不许复活它）。
     func remove(_ objectID: String) {
+        pendingStarts[objectID] = nil
+        if let ticket = sessions[objectID]?.ticket {
+            let authority = self.authority
+            Task { do { _ = try await authority.stop(ticket, requestID: UUID().uuidString) }
+                catch { NSLog("[ScreenPlayback] remove_receipt_failed") } }
+        }
         guard let session = sessions[objectID] else { return }
         session.task?.cancel()
         session.player?.stop()
@@ -460,6 +512,7 @@ final class NativeScreenPlaybackCoordinator {
     }
 
     func stopAll() {
+        pendingStarts.removeAll()
         for objectID in Array(sessions.keys) { remove(objectID) }
     }
 
@@ -490,6 +543,12 @@ final class NativeScreenPlaybackCoordinator {
     private func allocateGeneration() -> UInt64 { nextGeneration &+= 1; return nextGeneration }
     private func finishFailure(_ objectID:String,_ generation:UInt64,_ failure:WorldScreenFailure) {
         guard isCurrent(objectID,generation) else {return}
+        if let ticket = sessions[objectID]?.ticket {
+            let authority = self.authority
+            Task { do { _ = try await authority.receipt(ticket, status: "failed", isLive: false,
+                requestID: "failed-\(ticket.sessionID)-\(ticket.generation)") }
+                catch { NSLog("[ScreenPlayback] failure_receipt_failed") } }
+        }
         let failedGeneration=allocateGeneration()
         sessions[objectID]?.failedGeneration=generation
         sessions[objectID]?.generation=failedGeneration
@@ -504,11 +563,25 @@ final class NativeScreenPlaybackCoordinator {
         publish(objectID,failedGeneration,.failed(failure))
     }
     private func releaseSessionPlaylist(_ objectID:String) {
-        guard let id=sessions[objectID]?.playlistID else {return}
         sessions[objectID]?.playlistID=nil
         sessions[objectID]?.playlist=nil
-        let cache=self.cache
-        Task {try? await cache.releasePlaylist(playlistID:id)}
+    }
+
+    private func reportPlaying(_ objectID: String, _ generation: UInt64) {
+        guard isCurrent(objectID, generation), sessions[objectID]?.playingReceiptSent == false,
+              let ticket = sessions[objectID]?.ticket else { return }
+        sessions[objectID]?.playingReceiptSent = true
+        let authority = self.authority
+        let isLive = sessions[objectID]?.isLive ?? false
+        sessions[objectID]?.receiptTask = Task { @MainActor [weak self] in
+            do { _ = try await authority.receipt(ticket, status: "playing", isLive: isLive,
+                requestID: "playing-\(ticket.sessionID)-\(ticket.generation)") }
+            catch {
+                guard let self, self.isCurrent(objectID, generation) else { return }
+                self.finishFailure(objectID, generation, .nativeLink(NativeLinkFailureInfo(
+                    panelText: "播放状态回执失败，已停止输出。", technicalDescription: "screen_playback_receipt_failed")))
+            }
+        }
     }
 
     private func releaseSessionCache(_ objectID: String) {

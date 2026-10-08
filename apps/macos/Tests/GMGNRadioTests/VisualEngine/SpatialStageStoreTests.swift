@@ -5,6 +5,47 @@ import Testing
 import WorldRuntime
 @testable import GMGNRadio
 
+@MainActor
+final class PrivateStageSettingsFixture {
+    let authority: PrivatePresenceAuthorityFixture
+    let settings: RustProductSettingsClient
+    private init(authority: PrivatePresenceAuthorityFixture) {
+        self.authority = authority
+        self.settings = Self.client(authority: authority)
+    }
+    private static func client(authority: PrivatePresenceAuthorityFixture) -> RustProductSettingsClient {
+        let transport = TaskdHTTPAuthorityClient(endpointFile: authority.root.appendingPathComponent("TaskService/taskd.endpoint.json").path,
+            helperPath: "", allowsLaunching: false, timeout: 5)
+        return RustProductSettingsClient(call: { [authority] method, data in
+            // Retain this exact private daemon until every consumer is released.
+            defer { withExtendedLifetime(authority) {} }
+            guard let params = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw RustProductSettingsClient.SettingsError.invalidProtocol
+            }
+            return try JSONSerialization.data(withJSONObject: transport.call(method: method, params: params))
+        })
+    }
+    static func start(defaults: UserDefaults? = nil) async throws -> PrivateStageSettingsFixture {
+        let fixture = PrivateStageSettingsFixture(authority: try await PrivatePresenceAuthorityFixture.start())
+        let legacy = defaults?.dictionaryRepresentation().filter {
+            $0.key.hasPrefix("ai.gmgn.radio.spatial.avatar-position.") || $0.key == "stage.point-cloud-choice" || $0.key == "stage.particle-size-multiplier"
+        } ?? [:]
+        _ = try await fixture.settings.importStageLegacy(legacy: legacy)
+        return fixture
+    }
+    func reopenedSettings() async throws -> RustProductSettingsClient {
+        let client = Self.client(authority: authority)
+        try await client.ensureLoaded()
+        return client
+    }
+    static func spatial() async throws -> SpatialStageStore {
+        let fixture = try await start()
+        let store = SpatialStageStore(defaults: UserDefaults(suiteName: "private-stage-" + UUID().uuidString)!, settings: fixture.settings)
+        try await store.awaitSettingsReady()
+        return store
+    }
+}
+
 @Test
 func cameraForwardMovementFollowsPitchAtConstantSpeed() {
     let origin = SIMD3<Float>(2, 3, 4)
@@ -97,8 +138,8 @@ func marbleOccluderDepthMatchesTheActiveAvatarRenderer() {
 
 @MainActor
 @Test
-func spatialStagePublishesAndClearsPreparedOccluderTriangles() {
-    let store = SpatialStageStore()
+func spatialStagePublishesAndClearsPreparedOccluderTriangles() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     let triangles = [
         WorldTriangle(.zero, SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0)),
     ]
@@ -117,25 +158,14 @@ func spatialScenePresetsDescribeCompleteRooms() {
     #expect(SpatialScenePreset.allCases == [.djHouse, .cosyWoodHouse])
     #expect(SpatialScenePreset.djHouse.displayName == "DJ House")
     #expect(SpatialScenePreset.cosyWoodHouse.displayName == "Cosy Wood House")
-    #expect(SpatialScenePreset.djHouse.worldDisplayName == "gmgn DJ House")
-    #expect(
-        SpatialScenePreset.djHouse.generationPrompt.contains(
-            "recording studio"
-        )
-    )
-    #expect(SpatialScenePreset.djHouse.imageMediaAssetID != nil)
-    #expect(SpatialScenePreset.cosyWoodHouse.imageMediaAssetID == nil)
-    #expect(
-        SpatialScenePreset.cosyWoodHouse.generationPrompt.contains(
-            "wood cabin"
-        )
-    )
+    // Generation prompt/model/media contracts are asserted against real Rust
+    // claimed actions in MarbleWorldClientTests, not native UI presets.
 }
 
 @MainActor
 @Test
-func spatialEnvironmentEffectsOnlyRenderInsideAnActiveWorld() {
-    let store = SpatialStageStore()
+func spatialEnvironmentEffectsOnlyRenderInsideAnActiveWorld() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     #expect(!store.shouldRenderEnvironmentEffects)
 
     store.setWorldVisible(true)
@@ -150,8 +180,8 @@ func spatialEnvironmentEffectsOnlyRenderInsideAnActiveWorld() {
 
 @MainActor
 @Test
-func selectingAWorldDoesNotReplaceTheStageUntilEntryCompletes() {
-    let store = SpatialStageStore()
+func selectingAWorldDoesNotReplaceTheStageUntilEntryCompletes() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
 
     store.selectWorld(id: "world-1")
     #expect(!store.isWorldPresentationRequested)
@@ -171,8 +201,8 @@ func selectingAWorldDoesNotReplaceTheStageUntilEntryCompletes() {
 
 @MainActor
 @Test
-func worldVisibilityObserversHideTheSpatialSurfaceAfterExit() {
-    let store = SpatialStageStore()
+func worldVisibilityObserversHideTheSpatialSurfaceAfterExit() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     var changes: [Bool] = []
     let observerID = store.observeWorldVisibility { changes.append($0) }
 
@@ -186,8 +216,8 @@ func worldVisibilityObserversHideTheSpatialSurfaceAfterExit() {
 
 @MainActor
 @Test
-func synchronousWorldFinishDoesNotDeliverStaleLoadingToOtherObservers() {
-    let store = SpatialStageStore()
+func synchronousWorldFinishDoesNotDeliverStaleLoadingToOtherObservers() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     var changes = [[Bool](), [Bool]()]
     let observerIDs = (0..<2).map { index in
         store.observeWorldVisibility { visible in
@@ -214,8 +244,8 @@ func synchronousWorldFinishDoesNotDeliverStaleLoadingToOtherObservers() {
 
 @MainActor
 @Test
-func finishingAnAlreadyVisibleWorldDoesNotNotifyObserversAgain() {
-    let store = SpatialStageStore()
+func finishingAnAlreadyVisibleWorldDoesNotNotifyObserversAgain() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     var changes: [Bool] = []
     var didReenterFinish = false
     let observerID = store.observeWorldVisibility { visible in
@@ -235,8 +265,8 @@ func finishingAnAlreadyVisibleWorldDoesNotNotifyObserversAgain() {
 
 @MainActor
 @Test
-func sceneFramingObserversReceiveTheLoadedSPZCalibration() {
-    let store = SpatialStageStore()
+func sceneFramingObserversReceiveTheLoadedSPZCalibration() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     let framing = MarbleSceneFraming(
         positions: [
             SIMD3<Float>(-1, -1, -2),
@@ -289,8 +319,8 @@ func spatialCameraLookClampsPitchAndResetRestoresHome() {
 
 @MainActor
 @Test
-func spatialCameraResetUsesTheLoadedWorldCalibration() {
-    let store = SpatialStageStore()
+func spatialCameraResetUsesTheLoadedWorldCalibration() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     let calibratedHome = SpatialCameraState(
         position: SIMD3<Float>(0.2, 0.82, 1.1),
         yaw: 0.12,
@@ -306,8 +336,8 @@ func spatialCameraResetUsesTheLoadedWorldCalibration() {
 
 @MainActor
 @Test
-func spatialEnvironmentUpdatesWithoutReplacingTheWorld() {
-    let store = SpatialStageStore()
+func spatialEnvironmentUpdatesWithoutReplacingTheWorld() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     store.selectWorld(id: "world-1")
 
     store.selectScene(.cosyWoodHouse)
@@ -321,8 +351,8 @@ func spatialEnvironmentUpdatesWithoutReplacingTheWorld() {
 
 @MainActor
 @Test
-func continuousMovementUsesHeldKeysAndShiftSpeed() {
-    let store = SpatialStageStore()
+func continuousMovementUsesHeldKeysAndShiftSpeed() async throws {
+    let store = try await PrivateStageSettingsFixture.spatial()
     store.setMovement(.forward, active: true)
     let home = store.camera.position
     store.stepCamera(deltaTime: 1, speedBoosted: false)
@@ -448,13 +478,13 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func reenteringTheLoadedKitchenKeepsItsInstalledAvatarCalibration() throws {
+    func reenteringTheLoadedKitchenKeepsItsInstalledAvatarCalibration() async throws {
         let worldID = "world-labs-example-warm-kitchen"
         let calibration = try #require(
             SpatialWorldCalibration.resolve(worldID: worldID)
         )
         let placement = try #require(calibration.avatarPlacement)
-        let store = SpatialStageStore()
+        let store = try await PrivateStageSettingsFixture.spatial()
 
         store.selectScene(.cosyWoodHouse)
         store.selectWorld(id: worldID)
@@ -469,7 +499,7 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func avatarPositionAdjustmentsPersistForTheSelectedWorld() throws {
+    func avatarPositionAdjustmentsPersistForTheSelectedWorld() async throws {
         let suiteName = "SpatialStageStoreTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -480,14 +510,17 @@ struct SpatialWorldCalibrationTests {
             yaw: 0.67
         )
 
-        let firstStore = SpatialStageStore(defaults: defaults)
+        let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+        let firstStore = SpatialStageStore(defaults: defaults, settings: fixture.settings)
+        try await firstStore.awaitSettingsReady()
         firstStore.selectWorld(id: worldID)
         firstStore.installAvatarPlacement(calibrated)
-        firstStore.setAvatarPosition(-0.24, axis: .x)
-        firstStore.setAvatarPosition(-0.18, axis: .y)
-        firstStore.setAvatarPosition(0.76, axis: .z)
+        try await firstStore.setAvatarPosition(rawValue: -0.24, axis: "x")
+        try await firstStore.setAvatarPosition(rawValue: -0.18, axis: "y")
+        try await firstStore.setAvatarPosition(rawValue: 0.76, axis: "z")
 
-        let restoredStore = SpatialStageStore(defaults: defaults)
+        let restoredStore = SpatialStageStore(defaults: defaults, settings: try await fixture.reopenedSettings())
+        try await restoredStore.awaitSettingsReady()
         restoredStore.selectWorld(id: worldID)
         restoredStore.installAvatarPlacement(calibrated)
 
@@ -501,7 +534,7 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func avatarPositionAdjustmentsStayScopedToOneWorld() throws {
+    func avatarPositionAdjustmentsStayScopedToOneWorld() async throws {
         let suiteName = "SpatialStageStoreTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -510,11 +543,13 @@ struct SpatialWorldCalibrationTests {
             scale: 0.6,
             yaw: 0.67
         )
-        let store = SpatialStageStore(defaults: defaults)
+        let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+        let store = SpatialStageStore(defaults: defaults, settings: fixture.settings)
+        try await store.awaitSettingsReady()
 
         store.selectWorld(id: "kitchen-a")
         store.installAvatarPlacement(base)
-        store.setAvatarPosition(0.42, axis: .x)
+        try await store.setAvatarPosition(rawValue: 0.42, axis: "x")
 
         store.selectWorld(id: "kitchen-b")
         store.installAvatarPlacement(base)
@@ -524,7 +559,7 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func resettingAvatarPositionRestoresTheWorldCalibration() throws {
+    func resettingAvatarPositionRestoresTheWorldCalibration() async throws {
         let suiteName = "SpatialStageStoreTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -533,12 +568,14 @@ struct SpatialWorldCalibrationTests {
             scale: 0.6,
             yaw: 0.67
         )
-        let store = SpatialStageStore(defaults: defaults)
+        let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+        let store = SpatialStageStore(defaults: defaults, settings: fixture.settings)
+        try await store.awaitSettingsReady()
 
         store.selectWorld(id: "world-labs-example-warm-kitchen")
         store.installAvatarPlacement(base)
-        store.setAvatarPosition(-0.7, axis: .x)
-        store.resetAvatarPosition()
+        try await store.setAvatarPosition(rawValue: -0.7, axis: "x")
+        try await store.resetAvatarPositionConfirmed()
 
         #expect(store.avatarPlacement == base)
     }
@@ -581,8 +618,8 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func lateWorldCalibrationRebasesTheTransientAvatarOnTheCapturedFloor() {
-        let store = SpatialStageStore()
+    func lateWorldCalibrationRebasesTheTransientAvatarOnTheCapturedFloor() async throws {
+        let store = try await PrivateStageSettingsFixture.spatial()
         store.selectWorld(id: "world-labs-example-warm-kitchen")
         store.setTransientAvatarPlacement(
             StageAvatarPlacement(
@@ -607,8 +644,8 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func transientWorldHeightIsRelativeToTheCapturedFloor() {
-        let store = SpatialStageStore()
+    func transientWorldHeightIsRelativeToTheCapturedFloor() async throws {
+        let store = try await PrivateStageSettingsFixture.spatial()
         store.selectWorld(id: "world-labs-example-warm-kitchen")
         store.installAvatarPlacement(
             StageAvatarPlacement(
@@ -632,11 +669,13 @@ struct SpatialWorldCalibrationTests {
 
     @MainActor
     @Test
-    func worldPlacementUsesTheCalibratedSpawnInsteadOfSavedManualXYZ() {
+    func worldPlacementUsesTheCalibratedSpawnInsteadOfSavedManualXYZ() async throws {
         let suiteName = "SpatialStageStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
-        let store = SpatialStageStore(defaults: defaults)
+        let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+        let store = SpatialStageStore(defaults: defaults, settings: fixture.settings)
+        try await store.awaitSettingsReady()
         store.selectWorld(id: "world-labs-example-warm-kitchen")
         store.installAvatarPlacement(
             StageAvatarPlacement(
@@ -645,8 +684,8 @@ struct SpatialWorldCalibrationTests {
                 yaw: 0.67
             )
         )
-        store.setAvatarPosition(-0.09, axis: .y)
-        store.setAvatarPosition(-0.75, axis: .z)
+        try await store.setAvatarPosition(rawValue: -0.09, axis: "y")
+        try await store.setAvatarPosition(rawValue: -0.75, axis: "z")
 
         store.setWorldAvatarPlacement(
             StageAvatarPlacement(

@@ -1,12 +1,53 @@
 import Foundation
 import Testing
+
+/// Provider observations are inputs to the real private Rust authority.
+@MainActor private struct MarbleTestAuthority {
+    let lifecycle: PrivateMusicAuthorityFixture?
+    let client: RustMarbleControlClient
+    static func start() async throws -> Self {
+        let lifecycle: PrivateMusicAuthorityFixture?
+        let endpoint: String
+        if let injected = ProcessInfo.processInfo.environment["GMGN_MARBLE_TEST_ENDPOINT"] {
+            lifecycle = nil
+            endpoint = injected
+        } else {
+            let fixture = try await PrivateMusicAuthorityFixture.start()
+            lifecycle = fixture
+            endpoint = fixture.root.appendingPathComponent("taskd.endpoint.json").path
+        }
+        return Self(lifecycle: lifecycle, client: RustMarbleControlClient(endpointFile: endpoint,
+            helperPath: "", allowsLaunching: false, owner: "marble-tests-" + UUID().uuidString,
+            hostSessionID: UUID().uuidString))
+    }
+    func plannedGeneration(_ preset: SpatialScenePreset) async throws -> RustMarbleControlClient.Action {
+        let current = try await client.read()
+        let queued = try await client.command("space.marble.generate", expectedRevision: current.revision, presetID: preset.rawValue)
+        let claimed = try await client.claim(taskID: try #require(queued.task).taskID, expectedRevision: queued.revision)
+        let action = try #require(claimed.action)
+        #expect(action.status == "inflight")
+        return action
+    }
+    func list(_ bytes: Data) async throws -> [MarbleWorld] {
+        let current = try await client.read()
+        let queued = try await client.command("refresh", expectedRevision: current.revision, pageSize: 50)
+        let claimed = try await client.claim(taskID: try #require(queued.task).taskID, expectedRevision: queued.revision)
+        let action = try #require(claimed.action)
+        #expect(action.kind == "list" && action.method == "POST" && action.path == "/marble/v1/worlds:list")
+        let receipt = try await client.receipt(action, fact: RustMarbleControlClient.HTTPFact(statusCode: 200, body: bytes))
+        #expect(receipt.task?.status == "completed")
+        return try receipt.worlds.map { try $0.nativeWorld() }
+    }
+}
+
 @testable import GMGNRadio
 
+@MainActor
 @Test
-func marbleGenerationRequestUsesDJHouseV3Image() throws {
-    let data = try JSONEncoder().encode(
-        MarbleGenerateWorldRequest(preset: .djHouse)
-    )
+func marbleGenerationRequestUsesDJHouseV3Image() async throws {
+    let authority = try await MarbleTestAuthority.start()
+    let action = try await authority.plannedGeneration(.djHouse)
+    let data = try #require(try action.bodyData)
     let object = try #require(
         JSONSerialization.jsonObject(with: data) as? [String: Any]
     )
@@ -37,11 +78,12 @@ func marbleGenerationRequestUsesDJHouseV3Image() throws {
     )
 }
 
+@MainActor
 @Test
-func marbleGenerationRequestKeepsTextFallbackForCosyHouse() throws {
-    let data = try JSONEncoder().encode(
-        MarbleGenerateWorldRequest(preset: .cosyWoodHouse)
-    )
+func marbleGenerationRequestKeepsTextFallbackForCosyHouse() async throws {
+    let authority = try await MarbleTestAuthority.start()
+    let action = try await authority.plannedGeneration(.cosyWoodHouse)
+    let data = try #require(try action.bodyData)
     let object = try #require(
         JSONSerialization.jsonObject(with: data) as? [String: Any]
     )
@@ -50,40 +92,36 @@ func marbleGenerationRequestKeepsTextFallbackForCosyHouse() throws {
     #expect(object["model"] as? String == "marble-1.1-plus")
     #expect(prompt["type"] as? String == "text")
     #expect(prompt["image_prompt"] == nil)
+    #expect((prompt["text_prompt"] as? String)?.contains("wood cabin") == true)
 }
 
+@MainActor
 @Test
-func marbleOperationDecodesGenerationProgressAndFailure() throws {
-    let progress = try JSONDecoder().decode(
-        MarbleOperation.self,
-        from: Data(#"""
-        {
-          "done": false,
-          "operation_id": "operation-1",
-          "metadata": {"progress": {"status": "IN_PROGRESS", "percentage": 42}}
-        }
-        """#.utf8)
-    )
-    #expect(progress.id == "operation-1")
-    #expect(progress.isDone == false)
-    #expect(progress.progressPercentage == 42)
+func marbleOperationDecodesGenerationProgressAndFailure() async throws {
+    let progressAuthority = try await MarbleTestAuthority.start()
+    let progressAction = try await progressAuthority.plannedGeneration(.djHouse)
+    let progress = try await progressAuthority.client.receipt(progressAction,
+        fact: RustMarbleControlClient.HTTPFact(statusCode: 200, body: Data(#"""
+        {"done":false,"operation_id":"operation-1","metadata":{"progress":{"status":"IN_PROGRESS","percentage":42}}}
+        """#.utf8)))
+    #expect(progress.task?.operationID == "operation-1")
+    #expect(progress.task?.status == "pending")
+    #expect(progress.task?.progress == 42)
 
-    let failure = try JSONDecoder().decode(
-        MarbleOperation.self,
-        from: Data(#"""
-        {
-          "done": true,
-          "operation_id": "operation-2",
-          "error": {"code": 402, "message": "insufficient credits"}
-        }
-        """#.utf8)
-    )
-    #expect(failure.isDone)
-    #expect(failure.errorMessage == "insufficient credits")
+    let failureAuthority = try await MarbleTestAuthority.start()
+    let failureAction = try await failureAuthority.plannedGeneration(.djHouse)
+    let failure = try await failureAuthority.client.receipt(failureAction,
+        fact: RustMarbleControlClient.HTTPFact(statusCode: 200, body: Data(#"""
+        {"done":true,"operation_id":"operation-2","error":{"code":402,"message":"insufficient credits"}}
+        """#.utf8)))
+    #expect(failure.task?.status == "failed")
+    #expect(failure.task?.errorCode == "marble_control_generation_failed")
+    #expect(failure.task?.errorMessage == "insufficient credits")
 }
 
+@MainActor
 @Test
-func marbleWorldDecodesSpatialAssetsAndPrefersFiveHundredK() throws {
+func marbleWorldDecodesSpatialAssetsAndPrefersFiveHundredK() async throws {
     let data = Data(
         #"""
         {
@@ -112,11 +150,9 @@ func marbleWorldDecodesSpatialAssetsAndPrefersFiveHundredK() throws {
         """#.utf8
     )
 
-    let response = try JSONDecoder().decode(
-        MarbleWorldListResponse.self,
-        from: data
-    )
-    let world = try #require(response.worlds.first)
+    let authority = try await MarbleTestAuthority.start()
+    let worlds = try await authority.list(data)
+    let world = try #require(worlds.first)
 
     #expect(world.id == "world-1")
     #expect(world.name == "Sanctuary")
@@ -130,10 +166,14 @@ func marbleWorldDecodesSpatialAssetsAndPrefersFiveHundredK() throws {
     #expect(world.semantics.groundPlaneOffset == 1.01)
 }
 
+@MainActor
 @Test
-func publicMarbleCatalogUsesOfficialHTTPSExamplesWithoutGeneration() throws {
-    #expect(MarblePublicWorldCatalog.worlds.count == 5)
-    for world in MarblePublicWorldCatalog.worlds {
+func publicMarbleCatalogUsesOfficialHTTPSExamplesWithoutGeneration() async throws {
+    let authority = try await MarbleTestAuthority.start()
+    let snapshot = try await authority.client.read()
+    #expect(snapshot.task == nil)
+    #expect(snapshot.worlds.count == 5)
+    for world in try snapshot.worlds.map({ try $0.nativeWorld() }) {
         #expect(world.isPublicExample)
         #expect(world.preferredSplat?.quality == .fiveHundredK)
         #expect(world.preferredSplat?.url.scheme == "https")
@@ -147,8 +187,9 @@ func publicMarbleCatalogUsesOfficialHTTPSExamplesWithoutGeneration() throws {
     }
 }
 
+@MainActor
 @Test
-func marbleWorldFallsBackToAvailablePreviewSplat() throws {
+func marbleWorldFallsBackToAvailablePreviewSplat() async throws {
     let data = Data(
         #"""
         {
@@ -167,11 +208,9 @@ func marbleWorldFallsBackToAvailablePreviewSplat() throws {
         """#.utf8
     )
 
-    let response = try JSONDecoder().decode(
-        MarbleWorldListResponse.self,
-        from: data
-    )
-    let world = try #require(response.worlds.first)
+    let authority = try await MarbleTestAuthority.start()
+    let worlds = try await authority.list(data)
+    let world = try #require(worlds.first)
 
     #expect(world.preferredSplat?.quality == .oneHundredK)
     #expect(world.preferredSplat?.url.lastPathComponent == "preview.spz")

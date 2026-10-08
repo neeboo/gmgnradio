@@ -14,11 +14,15 @@ import WorldRuntime
     private var cached: [String:Any]
     private var fingerprint: Data?
     private let projectionSessionID: String
+    private let identity: RustWorldPropClient.Identity
+    private let authority: RustWorldPropClient
     var onChange: (@MainActor () -> Void)?
-    init(root: URL,worldID: String,residentScope: String,projectionSessionID: String) {
+    init(root: URL,worldID: String,residentScope: String,projectionSessionID: String,hostSessionID: String) {
         self.worldID=worldID; self.residentScope=residentScope
         self.projectionSessionID=projectionSessionID
-        taskRoot=root.standardizedFileURL.appendingPathComponent("gmgn radio/TaskService",isDirectory:true)
+        taskRoot=root.appendingPathComponent("gmgn radio/TaskService",isDirectory:true)
+        identity = .init(worldID:worldID,residentScope:residentScope,hostSessionID:hostSessionID)
+        authority = RustWorldPropClient(endpointFile: taskRoot.appendingPathComponent("endpoint.json"))
         cached=["worldID":worldID,"generation":UInt64(0),"entries":[[String:Any]]()]
     }
     func update(wishes: [WishMachineJob],jobs: [PropGenerationRecord]) {
@@ -36,6 +40,7 @@ import WorldRuntime
         work=Task { [weak self] in
             guard let self else { return }
             var entries: [[String:Any]]=[]
+            var errors: [[String:String]]=[]
             for wish in ready {
                 if Task.isCancelled { return }
                 let matching=jobs.filter { $0.id == wish.jobID }
@@ -47,7 +52,9 @@ import WorldRuntime
                           path == taskRoot.appendingPathComponent($0+".glb").path
                       }),
                       inspection.sha256.count == 64,inspection.sha256.allSatisfy({ $0.isASCII && $0.isHexDigit }),
-                      inspection.bytes > 0,inspection.bytes <= 32*1024*1024 else { continue }
+                      inspection.bytes > 0,inspection.bytes <= 32*1024*1024 else {
+                    errors.append(["wishID":wish.id.uuidString,"code":"wish_output_asset_unverified"]);continue
+                }
                 do {
                     let hash=inspection.sha256.lowercased(),count=inspection.bytes
                     try await Task.detached(priority:.utility) {
@@ -62,17 +69,31 @@ import WorldRuntime
                         let bytes=try Data(contentsOf:url,options:.mappedIfSafe)
                         guard bytes.count == count,SHA256.hash(data:bytes).map({ String(format:"%02x",$0) }).joined() == hash else { throw WishMachineError.unavailable }
                     }.value
-                    let prop=try await UnityWishInventoryRegistrar.prepareEmbeddedGLB(wish,job)
+                    let sample = try await RustPropNativeMeshSampler.sample(modelURL:URL(fileURLWithPath:path))
+                    guard sample.sha256 == hash else { throw WishMachineError.unavailable }
+                    try await authority.putBlob(localPath:path,sha256:hash)
+                    if let collisionPath = job.localCollisionPath {
+                        let collision = try await RustPropNativeMeshSampler.sample(modelURL:URL(fileURLWithPath:collisionPath))
+                        try await authority.putBlob(localPath:collisionPath,sha256:collision.sha256)
+                    }
+                    struct Snapshot: Decodable { struct Record: Decodable { let state:WorldState;let recordRevision:UInt64 };let record:Record }
+                    struct Preview: Decodable { let prop:WorldGeneratedProp }
+                    let decoder = JSONDecoder();decoder.dateDecodingStrategy = .millisecondsSince1970
+                    let snapshot = try decoder.decode(Snapshot.self,from:await authority.snapshot(identity))
+                    let projected = try await authority.outputPreview(identity,wishID:wish.id.uuidString,
+                        expectedRevision:snapshot.record.recordRevision,layoutRevision:snapshot.record.state.layoutRevision,
+                        blobRef:hash,triangles:sample.trianglesJSON)
+                    let prop = try decoder.decode(Preview.self,from:projected).prop
                     guard !Task.isCancelled,current == epoch else { return }
                     var descriptor=try JSONSerialization.jsonObject(with:JSONEncoder().encode(prop)) as! [String:Any]
                     descriptor.merge(["worldID":worldID,"stage":"ready","wishID":wish.id.uuidString,
                         "projectionSessionID":projectionSessionID,"projectionID":UUID().uuidString,
                         "taskID":job.id.uuidString.lowercased(),"sha256":hash,"bytes":count,"localModelPath":path]) { _,next in next }
                     entries.append(descriptor)
-                } catch { continue }
+                } catch { errors.append(["wishID":wish.id.uuidString,"code":"wish_output_preview_unavailable"]) }
             }
             guard !Task.isCancelled,current == epoch else { return }
-            generation &+= 1; cached=["worldID":worldID,"generation":generation,"entries":entries]; work=nil
+            generation &+= 1; cached=["worldID":worldID,"generation":generation,"entries":entries,"errors":errors]; work=nil
             onChange?()
         }
     }

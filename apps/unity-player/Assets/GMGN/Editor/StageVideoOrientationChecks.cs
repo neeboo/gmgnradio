@@ -58,7 +58,7 @@ namespace GMGN.UnityPlayer.Editor
             settings.targetTexture = backbuffer ? null : target; settings.scaleMode = PanelScaleMode.ConstantPixelSize;
             var document = host.AddComponent<UIDocument>(); document.panelSettings = settings;
             var root = document.rootVisualElement; root.style.width = targetWidth; root.style.height = targetHeight;
-            var controller = host.AddComponent<UnityScreenVideoController>(); controller.Initialize(root, _ => true);
+            var controller = host.AddComponent<UnityScreenVideoController>(); controller.Initialize(root);
             controller.SetWorldVisible(false);
             // The host sends snapshots with no decoded background before its first frame,
             // and after stop. Unity's Image.image=null resets UV to its default rectangle.

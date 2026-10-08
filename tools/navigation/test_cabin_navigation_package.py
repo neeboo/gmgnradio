@@ -76,14 +76,24 @@ class CabinNavigationPackageTests(unittest.TestCase):
     def test_current_authored_navigation_rebuilds_from_real_source_assets(self):
         self.layout = json.loads((ROOT / "authoring/worlds/marble-living-cabin/layout.json").read_text())
         self.assertIn("navigation", self.layout)
-        for name in ["collider.glb", "world-500k.spz"]:
-            path = self.source / "assets" / name
+        # Authoring downloads are local, untracked files and are absent in fresh
+        # worktrees. The committed package contains these exact reviewed assets;
+        # verify their hashes before using them as real build inputs.
+        package = ROOT / "apps/macos/Resources/Worlds/marble-living-cabin"
+        expected = json.loads((package / "world.json").read_text())
+        resources = {resource["path"]: resource for resource in expected["resources"]}
+        for source_name, package_name in [("collider.glb", "collider.glb"), ("world-500k.spz", "scene-500k.spz")]:
+            asset = package / package_name
+            digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+            self.assertEqual(digest, resources[package_name]["sha256"])
+            if source_name == "collider.glb":
+                self.assertEqual(digest, self.layout["navigation"]["source"]["colliderSHA256"])
+            path = self.source / "assets" / source_name
             path.unlink()
-            path.symlink_to(ROOT / "authoring/worlds/marble-living-cabin/assets" / name)
+            path.symlink_to(asset)
         self.write_layout()
         result = self.build()
         self.assertEqual(result.returncode, 0, result.stderr)
-        expected = json.loads((ROOT / "apps/macos/Resources/Worlds/marble-living-cabin/world.json").read_text())
         actual = self.read_manifest()
         self.assertEqual(actual["waypoints"], expected["waypoints"])
         self.assertEqual(actual["routes"], expected["routes"])

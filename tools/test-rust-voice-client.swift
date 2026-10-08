@@ -3,7 +3,7 @@ import Foundation
 let fixture = #"""
 import threading,json,os,sys,uuid,base64,time,queue
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
-path=sys.argv[1];token=str(uuid.uuid4());sessions={};lock=threading.Lock()
+path=sys.argv[1];token=str(uuid.uuid4());sessions={};lock=threading.Lock();delivery=None;revision=0
 class Handler(BaseHTTPRequestHandler):
  protocol_version='HTTP/1.1'
  def log_message(self,*args):pass
@@ -12,6 +12,7 @@ class Handler(BaseHTTPRequestHandler):
   raw=json.dumps({'version':2,'transport':'http'}).encode()
   self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
  def do_POST(self):
+  global delivery,revision
   q=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
   assert self.headers.get('Authorization')=='Bearer '+token and 'auth' not in q
   p=q['params'];m=q['method'];i=q['id'];client=self.headers.get('X-GMGN-Client-ID')
@@ -22,6 +23,14 @@ class Handler(BaseHTTPRequestHandler):
    else:
     self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
   try:
+   if m.startswith('speech_delivery_'):
+    if m=='speech_delivery_enqueue':
+     assert p['scopeID']=='http.fixture' and p['hostSessionID']=='http.host' and p['text']=='delivery'
+     delivery=dict(scopeID=p['scopeID'],hostSessionID=p['hostSessionID'],utteranceID=p['utteranceID'],generation=1)
+    if m=='speech_delivery_receipt':assert p['identity']==delivery and p['kind']=='device_started'
+    revision+=1
+    import hashlib
+    send({'id':i,'result':{'revision':revision,'states':[{'identity':delivery,'status':'queued'}],'ticket':{'identity':delivery,'textSHA256':hashlib.sha256(b'delivery').hexdigest(),'textBytes':8},'stopCommands':[]}});return
    if self.path=='/events':
     assert m in ['voice_tts_start','voice_asr_start']
     sid=p['sessionID'];uuid.UUID(sid);events=queue.Queue()
@@ -30,6 +39,10 @@ class Handler(BaseHTTPRequestHandler):
     send({'id':i,'result':{'started':True,'sessionID':sid}})
     if p.get('text')=='drop':return
     if m=='voice_tts_start':
+     if p.get('text')=='delivery':
+      assert p['delivery']==delivery
+      send({'voice_event':{'sessionID':sid,'type':'audio','audioBase64':base64.b64encode(b'\0\0').decode(),'sampleRate':24000,'channels':1,'encoding':'pcm16le','delivery':delivery,'sequence':0,'frameCount':1}})
+      send({'voice_event':{'sessionID':sid,'type':'input_finished','delivery':delivery}});return
      if p.get('text')=='burst':
       for index in range(64):send({'voice_event':{'sessionID':sid,'type':'audio','audioBase64':base64.b64encode(bytes([index,0])*16384).decode(),'sampleRate':24000,'channels':1,'encoding':'pcm16le'}})
       send({'voice_event':{'sessionID':sid,'type':'finished'}});return
@@ -65,6 +78,15 @@ import Foundation
   var checks=0
   func check(_ ok:Bool,_ message:String) { guard ok else {fatalError(message)};checks+=1 }
   let client=RustVoiceClient(root:endpoint.deletingLastPathComponent(),endpointURL:endpoint,allowsLaunching:false)
+  let authority=RustSpeechDeliveryClient(scopeID:"http.fixture",hostSessionID:"http.host",voiceClient:client)
+  let view=try await authority.enqueue(utteranceID:UUID().uuidString,text:"delivery",mode:"fifo")
+  let ticket=view.ticket!
+  _ = try await authority.receipt(identity:ticket.identity,kind:"device_started")
+  let delivered=try await client.startDeliveryTTS(text:"delivery",configuration:.init(apiKey:"fixture-memory-only"),ticket:ticket)
+  let packet=try await delivered.nextEvent(),eof=try await delivered.nextEvent()
+  check(packet.delivery==ticket.identity && packet.sequence==0 && packet.frameCount==1,"real HTTP/SSE typed delivery packet")
+  check(eof.type=="input_finished" && eof.delivery==ticket.identity,"real SSE provider EOF is distinct")
+  delivered.close()
   let tts=try await client.startTTS(text:"fixture",configuration:.init(apiKey:"fixture-memory-only"))
   let a=try await tts.nextEvent(),b=try await tts.nextEvent(),end=try await tts.nextEvent()
   check(a.type=="audio" && b.type=="audio" && end.type=="finished","bounded audio events arrive in order")
@@ -130,7 +152,7 @@ defer {try? FileManager.default.removeItem(at:scratch)}
 let driver=scratch.appendingPathComponent("main.swift"),binary=scratch.appendingPathComponent("checks"),endpoint=scratch.appendingPathComponent("taskd.endpoint.json")
 try program.write(to:driver,atomically:true,encoding:.utf8)
 let build=Process();build.executableURL=URL(fileURLWithPath:"/usr/bin/env")
-build.arguments=["swiftc","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift","apps/macos/Sources/GMGNRadio/Agent/RustVoiceClient.swift",driver.path,"-o",binary.path]
+build.arguments=["swiftc","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift","apps/macos/Sources/GMGNRadio/Agent/RustVoiceClient.swift","apps/macos/Sources/GMGNRadio/Agent/RustSpeechDeliveryClient.swift","apps/macos/Sources/GMGNRadio/Agent/AgentSpeech.swift","apps/macos/Sources/GMGNRadio/Agent/StreamingPCMPlayer.swift",driver.path,"-o",binary.path]
 try build.run();build.waitUntilExit();guard build.terminationStatus==0 else {exit(build.terminationStatus)}
 let server=Process();server.executableURL=URL(fileURLWithPath:"/usr/bin/python3");server.arguments=["-u","-c",fixture,endpoint.path]
 server.standardOutput=FileHandle.nullDevice

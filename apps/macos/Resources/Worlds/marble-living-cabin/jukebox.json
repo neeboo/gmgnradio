@@ -1,5 +1,6 @@
 {
   "id": "prop.jukebox",
+  "collisionSourceID": "collision.jukebox",
   "kind": "prop.procedural",
   "renderer": "builtin.jukebox",
   "effectiveVisualSize": [0.5, 0.68210784, 0.37967568],
@@ -10,6 +11,7 @@
   ],
   "yaw": 0,
   "activityID": "music.listen",
+  "placeBindings": [{"placeID":"wp.jukebox","role":"interact"}],
   "effect": "player.resume",
   "functionPoints": [
     {

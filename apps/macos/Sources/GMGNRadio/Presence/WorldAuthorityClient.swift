@@ -194,16 +194,28 @@ final class TaskdHTTPAuthorityClient: @unchecked Sendable {
         self.endpointFile = endpointFile; self.helperPath = helperPath
         self.allowsLaunching = allowsLaunching; self.timeout = timeout
     }
+    private func validatedEndpoint(_ endpoint: Endpoint) throws -> Endpoint {
+        let parts = endpoint.address.split(separator: ":")
+        guard endpoint.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
+              let port = UInt16(parts[1]), port > 0,
+              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else {
+            throw WorldAuthorityError.invalidResponse
+        }
+        return endpoint
+    }
+    /// Descriptor-only inspection for the native plugin. No launch, health
+    /// request, or credentials are returned; authenticated RPC remains here.
+    func validatedControlURL() throws -> URL {
+        let endpoint = try validatedEndpoint(JSONDecoder().decode(Endpoint.self,
+            from: Data(contentsOf: URL(fileURLWithPath: endpointFile))))
+        guard let url = URL(string: "http://\(endpoint.address)/rpc") else { throw WorldAuthorityError.invalidResponse }
+        return url
+    }
     private func endpoint() throws -> Endpoint {
         for attempt in 0..<(allowsLaunching ? 50 : 1) {
             if let data = try? Data(contentsOf: URL(fileURLWithPath: endpointFile)),
-               let endpoint = try? JSONDecoder().decode(Endpoint.self, from: data) {
-                let parts = endpoint.address.split(separator: ":")
-                guard endpoint.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
-                      let port = UInt16(parts[1]), port > 0,
-                      let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4" else {
-                    throw WorldAuthorityError.invalidResponse
-                }
+               let decoded = try? JSONDecoder().decode(Endpoint.self, from: data) {
+                let endpoint = try validatedEndpoint(decoded)
                 if try isHealthy(endpoint) { return endpoint }
             }
             if attempt == 1 { launchHelper() }

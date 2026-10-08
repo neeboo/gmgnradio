@@ -24,7 +24,11 @@ serde = { version = "1", features = ["derive"] }
 # Same float-roundtrip setting as gmgn-taskd: the MCP face must hand back the
 # bytes the authority stored, not a one-ulp-different re-encoding.
 serde_json = { version = "1", features = ["float_roundtrip"] }
-tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "io-std", "net", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 strip = true

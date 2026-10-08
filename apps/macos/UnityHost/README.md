@@ -1,7 +1,7 @@
 # Unity macOS host
 
-Unity owns rendering and simple chat/playback controls. The independent GPUI settings
-window owns product configuration; `settings.open` opens it. The host reuses original
+Unity owns rendering. Embedded GPUI owns chat/playback and product settings in the
+same window; `ui.settings.open` opens that panel. The host reuses original
 music, conversation, presence, shortcuts, speech, screens and world services. It does
 not start a second AppDelegate/GPUI product host/SceneKit renderer. The resident loop
 is connected to the shared world session; construction alone does not prove activity.
@@ -11,7 +11,7 @@ is connected to the shared world session; construction alone does not prove acti
 Run `bash tools/build-unity-media-host.sh` from the repository root. Output:
 `tmp/unity-media-host/DerivedData/Build/Products/Release/UnityMediaHost.dylib`.
 Package only a fresh sample App with `bash tools/package-unity-media-host.sh <absolute-app-path>`.
-This includes newly built GPUI settings and Rust `gmgn-taskd`, reuses resolved packages,
+This includes Rust `gmgn-taskd`, reuses resolved packages,
 rejects installed/non-sample Apps and repeated host overwrites, preserves Unity
 provenance before signing, and does not launch the App.
 
@@ -26,8 +26,8 @@ root and must not connect production sockets or replay production jobs.
 Music reads existing account/library sources (optionally
 `GMGN_UNITY_MUSIC_LIBRARY_ROOT`) with a Unity session overlay and nonpersistent web
 cookies. Explicit Unity disconnects preserve original sessions. Speech reads original
-TTS/ASR preferences only as fallback when no local override exists; explicit saves
-use the supplied defaults. Snapshot credentials are presence-only. DSH uses its
+TTS/ASR options from the shared Rust authority; explicit saves require confirmation.
+Voice keys use private native files, not Keychain. Snapshot credentials are presence-only. DSH uses its
 existing native credentials; Codex uses the formal installed adapter and current CLI
 identity. Backend selection neither logs in nor copies identity; login/logout are
 explicit GPUI actions. No second production write authority or Keychain-backed

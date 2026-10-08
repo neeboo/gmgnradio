@@ -9,6 +9,17 @@ import subprocess
 import tempfile
 import threading
 import time
+import argparse
+import os
+import signal
+import sqlite3
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--run", action="store_true")
+parser.add_argument("--daemon", type=Path)
+args = parser.parse_args()
+if args.run and (args.daemon is None or not args.daemon.is_absolute()):
+    parser.error("--run requires an explicit absolute --daemon private-test binary")
 
 repo = Path(__file__).resolve().parents[1]
 products = repo / "tmp/unity-media-host/DerivedData/Build/Products/Release"
@@ -68,18 +79,23 @@ with tempfile.TemporaryDirectory(prefix="gmgn-marble-pipeline-") as directory:
                 self.respond(json.dumps({"world":{"world_id":"world-exact","display_name":"gmgn DJ House","assets":{"mesh":{"collider_mesh_url":base+"/assets/collider.glb"},"splats":{"spz_urls":{"500k":base+"/assets/scene.spz"}}}}}).encode()); return
             self.respond(b"{}",404)
     server = http.server.ThreadingHTTPServer(("127.0.0.1",0),Handler)
-    thread = threading.Thread(target=server.serve_forever,daemon=True); thread.start()
+    thread = threading.Thread(target=server.serve_forever,daemon=True)
+    if args.run: thread.start()
     support = temporary / "support"
     task_root = support / "gmgn radio/TaskService"
-    task_root.mkdir(parents=True)
+    task_root.mkdir(parents=True, mode=0o700)
     endpoint_file = task_root / "taskd.endpoint.json"
-    daemon = subprocess.Popen([str(repo/"target/debug/gmgn-taskd"),"--root",str(task_root),"--endpoint-file",str(endpoint_file),"--concurrency","2"],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+    daemon = None
+    log = open("/tmp/gmgn-marble-pipeline-daemon.log", "w") if args.run else None
+    if args.run:
+        daemon = subprocess.Popen([str(args.daemon),"--root",str(task_root),"--endpoint-file",str(endpoint_file),"--concurrency","2"],stdout=log,stderr=log,start_new_session=True)
+        print(f"PRIVATE daemon PID/PGID={daemon.pid} root={task_root}", flush=True)
     try:
-        for _ in range(200):
+        for _ in range(1500 if args.run else 0):
             if endpoint_file.exists(): break
             assert daemon.poll() is None, "isolated daemon stopped"
             time.sleep(.01)
-        assert endpoint_file.exists(), "isolated authority endpoint not ready"
+        if args.run: assert endpoint_file.exists(), "isolated authority endpoint not ready"
         source = temporary / "types.swift"
         source.write_text(value_types + default + public_catalog + preset + framing + endpoint)
         executable = temporary / "test"
@@ -91,17 +107,50 @@ with tempfile.TemporaryDirectory(prefix="gmgn-marble-pipeline-") as directory:
             str(repo/"apps/macos/Sources/GMGNRadio/Presence/WorldAuthorityClient.swift"),
             str(repo/"apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift"),
             str(repo/"apps/macos/Sources/GMGNRadio/Presence/RetryBackoff.swift"),
+            str(repo/"apps/macos/Sources/GMGNRadio/Presence/RustMarbleControlClient.swift"),
+            str(repo/"apps/macos/Sources/GMGNRadio/Presence/RustMarbleGeometryClient.swift"),
+            str(repo/"apps/macos/Sources/GMGNRadio/Presence/RustProductSettingsClient.swift"),
+            str(repo/"apps/macos/Sources/GMGNRadio/VisualEngine/MarblePackagePreparation.swift"),
             str(repo/"apps/macos/UnityHost/UnitySpaceLibraryBridge.swift"),
-            str(repo/"apps/macos/UnityHost/UnityMarbleRuntimeDocument.swift"),
-            str(repo/"apps/macos/UnityHost/UnityMarbleSPZFormat.swift"),
+            str(repo/"apps/macos/Sources/GMGNRadio/VisualEngine/UnityMarbleRuntimeDocument.swift"),
+            str(repo/"apps/macos/Sources/GMGNRadio/VisualEngine/UnityMarbleSPZFormat.swift"),
             str(repo/"apps/macos/UnityHost/UnityMarbleWorldBridge.swift"),
             str(repo/"apps/macos/UnityHost/UnityMarbleAuthorityRegistration.swift"),
             str(repo/"tools/test-unity-marble-pipeline.swift"),"-o",str(executable)],check=True)
-        subprocess.run([str(executable),str(support),f"http://127.0.0.1:{server.server_port}",str(fixture),str(endpoint_file)],check=True)
-        assert counts["generate"] == 1 and counts["download"] == 2, counts
-        print("PASS production HTTP generate/poll/exact-world lookup + two actual downloads + real isolated taskd registration/readback; no external network or user credentials")
+        if args.run:
+            subprocess.run([str(executable),str(support),f"http://127.0.0.1:{server.server_port}",str(fixture),str(endpoint_file)],check=True)
+            assert counts["generate"] == 1 and counts["download"] == 2, counts
+            database = next(path for path in task_root.glob("*.sqlite*") if not path.name.endswith(("-wal", "-shm")))
+            with sqlite3.connect(database) as db:
+                geometry_blob_count = db.execute("SELECT count(*) FROM world_blobs").fetchone()[0]
+                assert geometry_blob_count >= 2, "native geometry facts did not reach the same actual Rust SQLite authority"
+                assert db.execute("SELECT count(*) FROM world_records").fetchone()[0] == 1
+            print(f"PASS actual shared Rust geometry authority: {geometry_blob_count} SHA fact records, exactly one registered world", flush=True)
+            os.killpg(daemon.pid, signal.SIGTERM)
+            daemon.wait(timeout=5)
+            try: os.killpg(daemon.pid, 0); raise AssertionError("first private daemon process group survived")
+            except ProcessLookupError: pass
+            print(f"REAPED first private daemon PID/PGID={daemon.pid} exit={daemon.returncode}")
+            endpoint_file.unlink(missing_ok=True)
+            daemon = subprocess.Popen([str(args.daemon),"--root",str(task_root),"--endpoint-file",str(endpoint_file),"--concurrency","2"],stdout=log,stderr=log,start_new_session=True)
+            print(f"PRIVATE restart daemon PID/PGID={daemon.pid} root={task_root}", flush=True)
+            for _ in range(1500):
+                if endpoint_file.exists(): break
+                assert daemon.poll() is None, "restarted isolated daemon stopped"
+                time.sleep(.01)
+            assert endpoint_file.exists()
+            subprocess.run([str(executable),str(support),f"http://127.0.0.1:{server.server_port}",str(fixture),str(endpoint_file),"reopen"],check=True)
+            assert counts["generate"] == 1 and counts["download"] == 2, "restart replayed provider work"
+            print("PASS production HTTP generate/poll/exact-world lookup + two actual downloads + real isolated taskd registration/readback; no external network or user credentials")
+        else: print("PASS compile-only actual Unity Marble consumer; no daemon/provider/UI execution")
     finally:
-        server.shutdown(); server.server_close()
-        daemon.terminate()
-        try: daemon.wait(timeout=5)
-        except subprocess.TimeoutExpired: daemon.kill(); daemon.wait(timeout=5)
+        if args.run: server.shutdown()
+        server.server_close()
+        if daemon is not None:
+            os.killpg(daemon.pid, signal.SIGTERM)
+            try: daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired: os.killpg(daemon.pid, signal.SIGKILL); daemon.wait(timeout=5)
+            try: os.killpg(daemon.pid, 0); raise AssertionError("owned daemon process group survived")
+            except ProcessLookupError: pass
+            print(f"REAPED private daemon PID/PGID={daemon.pid} exit={daemon.returncode}")
+        if log is not None: log.close()

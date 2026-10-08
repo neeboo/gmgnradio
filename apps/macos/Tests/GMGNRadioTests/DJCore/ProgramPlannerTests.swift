@@ -3,7 +3,8 @@ import Testing
 @testable import GMGNRadio
 
 @Test
-func programPlannerBuildsPlayableRollingProgramWithArtistSpacing() throws {
+@MainActor
+func programPlannerBuildsPlayableRollingProgramWithArtistSpacing() async throws {
     let candidates = [
         candidate(id: "a1", title: "A One", artist: "Artist A", energy: 0.30),
         candidate(id: "a2", title: "A Two", artist: "Artist A", energy: 0.45),
@@ -19,9 +20,10 @@ func programPlannerBuildsPlayableRollingProgramWithArtistSpacing() throws {
             isPlayable: false
         )
     ]
-    let planner = ProgramPlanner()
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let planner = ProgramPlanner(client: fixture.client)
 
-    let plan = try planner.makePlan(
+    let plan = try await planner.makePlan(
         brief: ProgramBrief(
             id: "late-night",
             targetDuration: 24 * 60,
@@ -46,9 +48,11 @@ func programPlannerBuildsPlayableRollingProgramWithArtistSpacing() throws {
 }
 
 @Test
-func quietInstructionReducesHostTalkWithoutRemovingTrackHints() throws {
-    let planner = ProgramPlanner()
-    let plan = try planner.makePlan(
+@MainActor
+func quietInstructionReducesHostTalkWithoutRemovingTrackHints() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let planner = ProgramPlanner(client: fixture.client)
+    let plan = try await planner.makePlan(
         brief: ProgramBrief(
             id: "focus",
             targetDuration: 20 * 60,
@@ -74,9 +78,11 @@ func quietInstructionReducesHostTalkWithoutRemovingTrackHints() throws {
 }
 
 @Test
-func programPlannerExcludesBlockedAndRecentlySkippedTracks() throws {
-    let planner = ProgramPlanner()
-    let plan = try planner.makePlan(
+@MainActor
+func programPlannerExcludesBlockedAndRecentlySkippedTracks() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let planner = ProgramPlanner(client: fixture.client)
+    let plan = try await planner.makePlan(
         brief: ProgramBrief(
             id: "recovery",
             targetDuration: 20 * 60,

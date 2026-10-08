@@ -26,7 +26,10 @@ import Foundation
         check(try store.load() == nil, "missing configuration is not configured")
         let config = try PropGenerationConfiguration(endpoint: URL(string: "http://127.0.0.1:8191/")!, token: "local-test-token")
         check(config.endpoint.absoluteString == "http://127.0.0.1:8191", "origin is normalized by client rules")
-        try store.save(config)
+        // Explicit historical-file fixture; production has no JSON configuration writer.
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try JSONSerialization.data(withJSONObject: ["endpoint": config.endpoint.absoluteString, "token": config.token]).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         check(try store.load() == config, "configuration survives reload")
         let directoryMode = try FileManager.default.attributesOfItem(atPath: file.deletingLastPathComponent().path)[.posixPermissions] as! NSNumber
         let fileMode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as! NSNumber

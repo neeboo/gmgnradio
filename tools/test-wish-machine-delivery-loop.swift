@@ -4,7 +4,10 @@ import Foundation
 
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let sources = root.appendingPathComponent("apps/macos/Sources/GMGNRadio")
-let products = root.appendingPathComponent("apps/macos/Build.noindex/Build/Products/Debug")
+let derivedData = URL(fileURLWithPath: ProcessInfo.processInfo.environment["GMGN_WISH_DERIVED_DATA"]
+    ?? root.appendingPathComponent("tmp/unity-media-host/DerivedData").path)
+let configuration = ProcessInfo.processInfo.environment["GMGN_WISH_BUILD_CONFIGURATION"] ?? "Release"
+let products = derivedData.appendingPathComponent("Build/Products/\(configuration)")
 // WorldRuntime 的模块搜索路径 + 目标文件**只有一处定义**：tools/world-runtime-harness-flags.sh。
 // 不要在这里拼 `.build/...`：27 份各自拼写正是 SwiftPM 与 xcodebuild 两份模块并存的根因。
 // `worldBuild` 由那唯一一份定义**推出来**（= Modules 的上一级），本文件不持有路径字面量。
@@ -231,14 +234,14 @@ struct ResidentWorldContext { let worldID: String?; let sessionScope: String }
     }
     func currentResidentWorldContext() -> ResidentWorldContext { selectedScope }
     \#(recovery)
-    func grant(_ objectID: String, _ placement: WorldPropPlacement, worldID: String, resident: String) throws -> ResidentPropDelegatedGrant {
-        try residentWishPlacementGrant(objectID: objectID, placement: placement, worldID: worldID, residentScope: resident)
+    func grant(_ objectID: String, _ placement: WorldPropPlacement, worldID: String, resident: String) async throws -> ResidentPropDelegatedGrant {
+        try await residentWishPlacementGrant(objectID: objectID, placement: placement, worldID: worldID, residentScope: resident)
     }
-    func record(_ grant: ResidentPropDelegatedGrant, _ placement: WorldPropPlacement, worldID: String, resident: String) throws {
-        try recordResidentWishPlacement(grant, placement: placement, worldID: worldID, residentScope: resident)
+    func record(_ grant: ResidentPropDelegatedGrant, _ placement: WorldPropPlacement, worldID: String, resident: String) async throws {
+        try await recordResidentWishPlacement(grant, placement: placement, worldID: worldID, residentScope: resident)
     }
-    func recover(worldID: String, resident: String) throws {
-        try reconcileResidentWishPlacements(.init(worldID: worldID, sessionScope: resident))
+    func recover(worldID: String, resident: String) async throws {
+        try await reconcileResidentWishPlacements(.init(worldID: worldID, sessionScope: resident))
     }
 }
 final class RecordedService: URLProtocol {
@@ -312,7 +315,8 @@ final class RecordedService: URLProtocol {
 
     @MainActor static func runRecorded(_ recordedArguments: [String]) async throws {
         func check(_ ok: Bool, _ label: String) { precondition(ok, label) }
-        let proof = URL(fileURLWithPath: "tmp/wish-machine-service-proof-20260906/core")
+        let proof = URL(fileURLWithPath: ProcessInfo.processInfo.environment["GMGN_WISH_RECORDED_CORE"]
+            ?? "tmp/wish-machine-service-proof-20260906/core")
         let record = try JSONDecoder().decode([PropGenerationRecord].self, from: Data(contentsOf: proof.appendingPathComponent("tasks.json")))[0]
         let receipt = record.receipt!
         RecordedService.receipt = try JSONSerialization.jsonObject(with: JSONEncoder().encode(receipt)) as! [String: Any]
@@ -326,13 +330,13 @@ final class RecordedService: URLProtocol {
         let sessionConfig = URLSessionConfiguration.ephemeral; sessionConfig.protocolClasses = [RecordedService.self]
         let fixtureSession = URLSession(configuration: sessionConfig)
         let daemon = WishMachineDaemonFixture(directory: directory.appendingPathComponent("core"), session: fixtureSession)
-        let store = PropGenerationStore(directory: directory.appendingPathComponent("core"), session: fixtureSession, daemonClient: daemon)
+        let store = fixtureWishStore(directory: directory.appendingPathComponent("core"), session: fixtureSession, daemonClient: daemon)
         try store.configure(endpoint: URL(string: "http://127.0.0.1:8191")!, token: "fixture-only")
         let evidenceDirectory = recordedArguments.first.map { URL(fileURLWithPath: $0) }
         if let evidenceDirectory { try FileManager.default.createDirectory(at: evidenceDirectory, withIntermediateDirectories: true) }
         let capturer = FrameCapturer(evidenceDirectory: evidenceDirectory)
         let worldID = manifest.worldID, resident = "isolated-delivery-resident"
-        let coordinator = WishMachineCoordinator(store: store, directory: directory.appendingPathComponent("wishes"), canClaim: { job in
+        let coordinator = try await fixtureWishCoordinator(store: store, directory: directory.appendingPathComponent("wishes"), canClaim: { job in
             let p = context.snapshot.agentTransform.position
             // 取物点 = 运行时注册出来的锚点（声明 × 摆放）；没注册出来就没有领取依据。
             guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
@@ -349,15 +353,15 @@ final class RecordedService: URLProtocol {
             support: { deliverySupport(triangles: triangles, manifest: manifest) })
         let host = RecoveryHost(context, coordinator, resident: resident)
         var preCompletionJournal: Data?
-        let journalURL = directory.appendingPathComponent("wishes/wishes.json")
+        let wishDirectory = directory.appendingPathComponent("wishes")
         // Construct once, before submission and pickup. Its dynamic callbacks
         // must admit only the same claimed and host-registered item later on.
         let delegated = ResidentPropToolBridge(service: service, allowsMutation: false, isCurrent: { true },
             resolveDelegatedGrant: { objectID, placement in
-                try host.grant(objectID, placement, worldID: worldID, resident: resident)
+                try await host.grant(objectID, placement, worldID: worldID, resident: resident)
             }, recordDelegatedPlacement: { grant, placement in
-                preCompletionJournal = try Data(contentsOf: journalURL)
-                try host.record(grant, placement, worldID: worldID, resident: resident)
+                preCompletionJournal = try fixtureWishArchive(directory: wishDirectory)
+                try await host.record(grant, placement, worldID: worldID, resident: resident)
             })
         let attachment = ResidentImageAttachment(id: UUID(), url: URL(fileURLWithPath: record.imagePath), displayName: "coffee.png")
         let authorization = UUID()
@@ -367,7 +371,7 @@ final class RecordedService: URLProtocol {
         try JSONSerialization.data(withJSONObject: ["authorization_id": authorization.uuidString, "input": "recorded-fixture",
             "created_at": Date().timeIntervalSince1970], options: .sortedKeys).write(to: intentMarker, options: .withoutOverwriting)
         do { try Data("rival".utf8).write(to: intentMarker, options: .withoutOverwriting); check(false, "submission intent marker creation is exclusive") } catch {}
-        try coordinator.authorize(attachments: [attachment], worldID: worldID, residentScope: resident,
+        try await coordinator.authorize(attachments: [attachment], worldID: worldID, residentScope: resident,
             authorizationID: authorization, source: record.source)
         let tools = ResidentWishMachineTools(coordinator: coordinator, worldID: worldID, residentScope: resident,
             authorizationID: authorization, isCurrent: { true }).tools
@@ -393,6 +397,12 @@ final class RecordedService: URLProtocol {
         let job = coordinator.residentJobs(worldID: worldID, residentScope: resident).first!
         RecordedService.complete = true
         await daemon.pushBackendChanges()
+        // Observation is now an async Rust transaction. Wait for its projection,
+        // without invoking refresh/snapshot or issuing another provider request.
+        for _ in 0..<250 {
+            if coordinator.jobs.first(where: { $0.id == job.id })?.stage == .ready { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
         let downloaded = try coordinator.read(id: job.id, worldID: worldID, residentScope: resident)
         check(downloaded.stage == .ready, "daemon push makes the same downloaded job visible without coordinator polling")
         let pushed = coordinator.unpublishedEvents(worldID: worldID, residentScope: resident)
@@ -423,10 +433,18 @@ final class RecordedService: URLProtocol {
         let initialPosition = context.snapshot.agentTransform.position
         for _ in 0..<900 {
             try context.tick(deltaTime: 1.0/30)
-            if context.snapshot.activeActivity?.phase == .loop { break }
+            if context.snapshot.activeActivity?.phase == .enter { break }
         }
-        check(context.snapshot.agentTransform.position != initialPosition && context.snapshot.activeActivity?.phase == .loop,
-            "resident actually advances through collider, without assigning arrival coordinates")
+        check(context.snapshot.agentTransform.position != initialPosition && context.snapshot.activeActivity?.phase == .enter,
+            "resident actually advances through collider, without assigning arrival coordinates; initial=\(initialPosition), current=\(context.snapshot.agentTransform.position), activity=\(String(describing: context.snapshot.activeActivity)), running=\(String(describing: context.runningActivity))")
+        // This harness draws the generated GLB, not an avatar clip. Simulate the
+        // explicit native renderer completion receipt; ticks cannot finish a
+        // duration-less authored enter operation.
+        let enterRequest = context.currentActivityRequestID!
+        try context.completeActivityPlayback(requestID: "stale-" + enterRequest, phase: .enter)
+        check(context.snapshot.activeActivity?.phase == .enter, "stale renderer completion cannot finish the operation")
+        try context.completeActivityPlayback(requestID: enterRequest, phase: .enter)
+        check(context.snapshot.activeActivity?.phase == .loop, "matching explicit renderer completion enters the collection loop")
         _ = await capturer.frame()
         try capturer.saveFrame("02-output-at-arrival-offscreen")
         let claim = try await invoke("claim_wish_output", "claim-same-output", ["wish_id": job.id.uuidString])
@@ -466,11 +484,11 @@ final class RecordedService: URLProtocol {
             exit(1)
         }
         let placement = WorldPropPlacement(surfaceID: surface.id, position: surface.position, yaw: 0)
-        do { _ = try host.grant(job.objectID, placement, worldID: worldID, resident: resident); check(false, "asset absent from host registry accepted") }
+        do { _ = try await host.grant(job.objectID, placement, worldID: worldID, resident: resident); check(false, "asset absent from host registry accepted") }
         catch WishMachineError.unauthorized {}
         host.residentOwnedPropAssets[job.objectID] = true
         host.selectedScope = .init(worldID: worldID, sessionScope: "another-resident")
-        do { _ = try host.grant(job.objectID, placement, worldID: worldID, resident: resident); check(false, "changed resident accepted") }
+        do { _ = try await host.grant(job.objectID, placement, worldID: worldID, resident: resident); check(false, "changed resident accepted") }
         catch WishMachineError.unauthorized {}
         host.selectedScope = .init(worldID: worldID, sessionScope: resident)
         let before = context.state
@@ -492,18 +510,18 @@ final class RecordedService: URLProtocol {
         // Restore only this test journal's pre-marker checkpoint: this models a
         // crash after the atomic world commit, before the separate wish marker.
         // The production world remains untouched and contains its real receipt.
-        try preCompletionJournal!.write(to: journalURL, options: .atomic)
-        let recoveryCoordinator = WishMachineCoordinator(store: store, directory: directory.appendingPathComponent("wishes"), canClaim: { _ in nil })
+        try fixtureWishReplaceArchive(directory: wishDirectory, data: preCompletionJournal!)
+        let recoveryCoordinator = try await fixtureWishCoordinator(store: store, directory: directory.appendingPathComponent("wishes"), canClaim: { _ in nil })
         let recoveredWorld = try WorldAgentContext(manifest: manifest, persistence: persistence)
         check(recoveredWorld.state.layoutReceipts == context.state.layoutReceipts, "world command receipts were loaded from disk")
         check(recoveredWorld.state.objectStates[job.objectID] == context.state.objectStates[job.objectID]
             && recoveredWorld.state.layoutRevision == context.state.layoutRevision, "persisted placement matches before recovery")
         let recoveryHost = RecoveryHost(recoveredWorld, recoveryCoordinator, resident: resident)
         let committedState = recoveredWorld.state
-        try recoveryHost.recover(worldID: worldID, resident: resident)
+        try await recoveryHost.recover(worldID: worldID, resident: resident)
         check(recoveredWorld.state == committedState && recoveryCoordinator.placementDelegation(worldID:worldID,residentScope:resident,objectID:job.objectID)?.state == .placed,
             "production host reconciles the committed receipt after a missed completion marker without moving again")
-        try recoveryHost.recover(worldID: worldID, resident: resident)
+        try await recoveryHost.recover(worldID: worldID, resident: resident)
         check(recoveredWorld.state == committedState, "recovery is idempotent")
         // 旋转改成 **90° 步进**（这是编辑器现在提供的粒度：R / Shift+R）。
         // 旧 harness 用的是 45°：真实舱体地面并不平整（相邻列高差中位 0.55 cm、90 分位 1.86 cm），
@@ -656,7 +674,7 @@ final class RecordedService: URLProtocol {
         try store.configure(endpoint: configuration.endpoint, token: configuration.token)
         let capturer = FrameCapturer(evidenceDirectory: evidenceDirectory)
         let worldID = manifest.worldID, resident = "isolated-delivery-resident"
-        let coordinator = WishMachineCoordinator(store: store, directory: stateDirectory.appendingPathComponent("wishes"), canClaim: { job in
+        let coordinator = try await fixtureWishCoordinator(store: store, directory: stateDirectory.appendingPathComponent("wishes"), canClaim: { job in
             let p = context.snapshot.agentTransform.position
             // 取物点 = 运行时注册出来的锚点（声明 × 摆放）；没注册出来就没有领取依据。
             guard let target = context.propAnchorRegistry.entry(activityID: WishMachineScene.activityID)?.position
@@ -674,12 +692,12 @@ final class RecordedService: URLProtocol {
         let host = RecoveryHost(context, coordinator, resident: resident)
         let delegated = ResidentPropToolBridge(service: service, allowsMutation: false, isCurrent: { true },
             resolveDelegatedGrant: { objectID, placement in
-                try host.grant(objectID, placement, worldID: worldID, resident: resident)
+                try await host.grant(objectID, placement, worldID: worldID, resident: resident)
             }, recordDelegatedPlacement: { grant, placement in
-                try host.record(grant, placement, worldID: worldID, resident: resident)
+                try await host.record(grant, placement, worldID: worldID, resident: resident)
             })
         // Resume first: a committed-but-unmarked placement completes without moving again.
-        try host.recover(worldID: worldID, resident: resident)
+        try await host.recover(worldID: worldID, resident: resident)
         let intentMarker = stateDirectory.appendingPathComponent("submission-intent.json")
         var job: WishMachineJob
         // The facade starts empty: inspect Rust's durable snapshot before deciding
@@ -690,7 +708,8 @@ final class RecordedService: URLProtocol {
         }
         switch Self.resumeState(store: store, coordinator: coordinator, worldID: worldID, resident: resident) {
         case .fresh:
-            guard !FileManager.default.fileExists(atPath: stateDirectory.appendingPathComponent("core/tasks.json").path),
+            guard coordinator.jobs.isEmpty && store.jobs.isEmpty,
+                  !FileManager.default.fileExists(atPath: stateDirectory.appendingPathComponent("core/tasks.json").path),
                   !FileManager.default.fileExists(atPath: stateDirectory.appendingPathComponent("wishes/wishes.json").path) else {
                 liveStatus("existing-journal", "a prior submission journal exists without one resumable task; refusing a new submission", exitCode: 2)
             }
@@ -708,7 +727,7 @@ final class RecordedService: URLProtocol {
             catch { liveStatus("intent-marker-exists", "an exclusive submission-intent marker exists without a resumable task; refusing a second submission", exitCode: 2) }
             do {
                 // Durable grant and job identity precede any network submission.
-                try coordinator.authorize(attachments: [attachment], worldID: worldID, residentScope: resident,
+                try await coordinator.authorize(attachments: [attachment], worldID: worldID, residentScope: resident,
                     authorizationID: authorization, source: .init(author: "用户提供", license: "未核验，仅限个人测试"))
                 let tools = ResidentWishMachineTools(coordinator: coordinator, worldID: worldID, residentScope: resident,
                     authorizationID: authorization, isCurrent: { true }).tools
@@ -926,10 +945,10 @@ let bundle = products.appendingPathComponent("VRMMetalKit_GLTFMetalKit.bundle")
 try FileManager.default.copyItem(at: bundle, to: directory.appendingPathComponent(bundle.lastPathComponent))
 var objects = try FileManager.default.contentsOfDirectory(at: worldBuild.appendingPathComponent("WorldRuntime.build"), includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 for module in ["GLTFMetalKit", "GLTFCore"] {
-    let path = root.appendingPathComponent("apps/macos/Build.noindex/Build/Intermediates.noindex/VRMMetalKit.build/Debug/\(module).build/Objects-normal/arm64")
+    let path = derivedData.appendingPathComponent("Build/Intermediates.noindex/VRMMetalKit.build/\(configuration)/\(module).build/Objects-normal/arm64")
     objects += try FileManager.default.contentsOfDirectory(at: path, includingPropertiesForKeys: nil).filter { $0.pathExtension == "o" }.map(\.path)
 }
-let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "Presence/PropTaskDaemonClient", "Presence/PropImagePreparation",
+let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "Presence/PropTaskDaemonClient", "Presence/TaskdHTTPTransport", "Presence/PropImagePreparation",
     "Presence/PropGenerationConfiguration",
     // `ResidentPropPlacementService` 的拒绝词汇里就有挂点（`PropAttachmentPoint` / `worldSlot`）
     // 与握点推断（`PropGripInference`）。与上面那条同源：清单漏了真源码，整条门禁就红在
@@ -939,7 +958,8 @@ let inputs = ["Presence/PropGenerationClient", "Presence/PropGenerationStore", "
     // `WishMachineCoordinator` 判连通性那一行读的就是这里面的 `ResidentConnectivityFact`：
     // 这一份**从来没挂进过**编译清单，于是这个 harness 从 0899bd4 起一直红在
     // `cannot find 'ResidentConnectivityFact' in scope` —— 一条从不跑的门禁等于没有门禁。
-    "Presence/WishMachineTaskPresentation",
+    "Presence/WishMachineTaskPresentation", "Presence/RetryBackoff", "Presence/ResidentOwnershipProjection",
+    "Presence/RustActivityCatalogClient", "Presence/RustWorldActivityClient", "Presence/WorldAuthorityClient", "Presence/AuthorityWorldStatePersistence",
     "Presence/WishMachineScene", "Presence/ResidentPropPlacementService", "Presence/ResidentPropPlacementConfiguration",
     "Presence/ResidentPerformanceMotionPolicy",
     "Agent/WishMachineContract", "Agent/ResidentWishMachineTools", "Agent/ResidentPropToolBridge", "Agent/WorldAgentContext", "Agent/WorldAgentToolContract", "Agent/WorldAgentToolDispatcher"]
@@ -953,7 +973,8 @@ func run(_ path: String, _ arguments: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: path); process.arguments = arguments
     try process.run(); process.waitUntilExit(); return process.terminationStatus
 }
-let status = try run("/usr/bin/swiftc", ["-j1", "-target", "arm64-apple-macosx26.0", "-parse-as-library", "-I", products.path,
-    "-I", worldBuild.appendingPathComponent("Modules").path] + inputs + [file.path] + objects + ["-o", binary.path])
+let status = try run("/usr/bin/swiftc", ["-j1", "-target", "arm64-apple-macosx26.0", "-parse-as-library",
+    "-I", worldBuild.appendingPathComponent("Modules").path, "-I", products.path]
+    + inputs + [file.path] + objects + ["-o", binary.path])
 guard status == 0 else { exit(status) }
 exit(try run(binary.path, Array(CommandLine.arguments.dropFirst())))

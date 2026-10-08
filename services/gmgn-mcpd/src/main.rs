@@ -19,6 +19,8 @@ mod catalog;
 mod grant;
 mod server;
 mod taskd;
+mod resident_claude;
+mod resident_claude_schema;
 
 use grant::GrantSource;
 use server::GmgnMcpServer;
@@ -49,6 +51,9 @@ OPTIONS:
 ";
 
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("resident-claude") {
+        return resident_claude::main(std::env::args().skip(2));
+    }
     let mut endpoint_file: Option<PathBuf> = None;
     let mut grant: Option<PathBuf> = None;
     let mut server_name = "gmgn".to_owned();

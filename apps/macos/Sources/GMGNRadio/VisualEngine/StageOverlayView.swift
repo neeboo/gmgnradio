@@ -28,26 +28,32 @@ final class StageResidentChatState: ObservableObject {
 
     init() { images.onChange = { [weak self] in self?.objectWillChange.send() } }
 
-    func takeMessage() -> ResidentChatSubmission? {
+    func takeMessage() async -> ResidentChatSubmission? {
+        let originalDraft = draft
         let message = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard images.canSubmit, !message.isEmpty || !images.attachments.isEmpty else { return nil }
-        draft = ""
+        let submission: ResidentChatSubmission
+        do {submission = try await images.takeSubmission(text:message)}
+        catch {showFailureStatus(error.localizedDescription);return nil}
+        if draft == originalDraft {draft = ""}
         recovery = ResidentDraftRecovery()
         begin()
-        return ResidentChatSubmission(text: message, attachments: images.takeAttachments())
+        return submission
     }
 
     func restore(_ submission: ResidentChatSubmission, error: Error) {
-        restore(submission, notice: error.localizedDescription)
+        restore(submission, notice:error.localizedDescription)
     }
 
     func restore(_ submission: ResidentChatSubmission, notice: String) {
+        Task { [self] in
+        guard await images.restoreSubmission(submission) else {showFailureStatus("图片恢复状态待确认。");return}
         let recovered = recovery.restore(submission, text: draft, attachments: images.attachments)
         draft = recovered.text
-        images.restore(recovered.attachments)
         setThinking(false)
         // 失败回填是失败提示，不能被下一条普通应用信息盖掉。
         showFailureStatus(notice + "\n文字和图片已保留。")
+        }
     }
 
     func begin() { reply = ""; applyStatus(nil, kind: .info); isThinking = true }
@@ -484,8 +490,8 @@ struct StageResidentComposer: View {
     }
 
     private func submit() {
-        guard let message = state.takeMessage() else { return }
         Task {
+            guard let message = await state.takeMessage() else {return}
             do { try await onSendMessage(message) }
             catch { state.restore(message, error: error) }
         }
@@ -915,12 +921,7 @@ private struct StageLyricsView: View {
             )
         ) { context in
             let playbackTime = playbackPosition()
-            let resolvedMode = StageLyricModeDirector.resolve(
-                configuredMode: lyrics.visualMode,
-                trackID: lyrics.trackID,
-                lines: lyrics.lines,
-                playbackTime: playbackTime
-            )
+            let resolvedMode = lyrics.resolvedVisualMode
             let audioMotion = StageLyricAudioMotion(
                 features: audioFeatures.current,
                 animationTime: context.date.timeIntervalSinceReferenceDate,
@@ -3041,7 +3042,7 @@ struct StageVisualPickerView: View {
                         symbol: mode.symbolName,
                         isSelected: lyrics.visualMode == mode
                     ) {
-                        lyrics.setVisualMode(mode)
+                        Task { try? await lyrics.setVisualMode(mode) }
                     }
                 }
             }
@@ -3189,7 +3190,7 @@ struct StageVisualPickerView: View {
                                 ? "video.fill"
                                 : "video.slash"
                         )
-                        Text(videos.activeAsset?.displayName ?? "未加载视频")
+                        Text(videos.assets.first(where: { $0.id == videos.activeAssetID })?.displayName ?? "未加载视频")
                             .lineLimit(1)
                         Spacer()
                         Text(

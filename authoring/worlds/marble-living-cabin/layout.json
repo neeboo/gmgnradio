@@ -47,6 +47,12 @@
   ],
   "musicYaw": -1.5707963267948966,
   "jukebox": {
+    "placeBindings": [
+      {
+        "placeID": "wp.jukebox",
+        "role": "interact"
+      }
+    ],
     "position": [
       2,
       0.024776516,
@@ -67,6 +73,12 @@
     ]
   },
   "wishMachine": {
+    "placeBindings": [
+      {
+        "placeID": "wish_machine.pickup",
+        "role": "pickup"
+      }
+    ],
     "id": "wish_machine.device",
     "position": [
       0.8,
@@ -76,7 +88,7 @@
     "yaw": 0,
     "size": [
       0.9,
-      0.5,
+      0.12,
       0.8
     ],
     "functionPoints": [
@@ -96,7 +108,7 @@
         "kind": "emitter",
         "position": [
           0,
-          0.75,
+          0.37,
           0
         ]
       },
@@ -105,7 +117,7 @@
         "kind": "interaction",
         "position": [
           0,
-          0.5,
+          0.12,
           -0.4
         ]
       }
@@ -116,12 +128,12 @@
       "id": "wish_machine.collision",
       "center": {
         "x": 0.8,
-        "y": 0.232,
+        "y": 0.042,
         "z": -2.6
       },
       "halfExtents": {
         "x": 0.45,
-        "y": 0.25,
+        "y": 0.06,
         "z": 0.4
       },
       "rotation": {
@@ -21408,12 +21420,12 @@
         {
           "center": {
             "x": 0.8,
-            "y": 0.232,
+            "y": 0.042,
             "z": -2.6
           },
           "halfExtents": {
             "x": 0.45,
-            "y": 0.25,
+            "y": 0.06,
             "z": 0.4
           },
           "id": "wish_machine.collision",

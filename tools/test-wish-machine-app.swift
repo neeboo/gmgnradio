@@ -16,10 +16,10 @@ check(app.contains("!input.isBackground") && app.contains("registered.loopID == 
 check(app.contains("loop.receiveContinuationEvent(observation)"), "verified output completion must be a delegated continuation event")
 check(app.contains("spatialStage.wishMachineOutputStatus == .ready(id: event.objectID)"), "no ready notification before the matching mesh is rendered")
 check(app.contains("acknowledgeWishEvents(input.events"), "durable completion is acknowledged only from a consumed resident turn")
-check(app.contains("PropGenerationConfigurationStore().load()") && app.contains("propGenerationStore.clearConfiguration()"), "missing or invalid configuration must remove the old in-memory credentials")
+check(app.contains("PropGenerationConfigurationStore(") && app.contains("PropGenerationConfigurationStore.defaultFileURL\n            ).load()") && app.contains("propGenerationStore.clearConfiguration()"), "missing or invalid configuration must remove the old in-memory credentials")
 check(settings.contains("PropGenerationSettingsSection()"), "space settings must expose service configuration")
 check(app.contains("synchronizeOwnedResidentProps()") && app.contains("read_owned_props 核对入库"), "claim hands the verified asset to durable inventory before support-surface placement")
-check(app.contains("onUserStop: { [weak self] in self?.pauseResidentWishContinuations() }"),
+check(app.contains("onUserStop: { [weak self] in Task { @MainActor in await self?.pauseResidentWishContinuations() } }"),
       "only an explicit user stop persists the durable automatic pickup pause")
 check(app.components(separatedBy: "pauseResidentWishContinuations").count == 3,
       "the task-level pause has exactly one wiring site (its definition plus the user-stop callback) and never hangs off the generic cancellation channel")

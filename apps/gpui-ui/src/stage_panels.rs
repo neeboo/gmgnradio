@@ -36,9 +36,12 @@ fn video_asset_actions(player:&Value,asset:&Value)->Vec<(&'static str,Value,bool
     actions.push(("移出素材库",json!({"op":"stage.video.remove","id":id}),true));
     actions
 }
+pub(crate) fn video_authority_notice(player:&Value)->Option<&str> {
+    player["videoNotice"].as_str().filter(|s|!s.trim().is_empty())
+}
 #[cfg(test)]
 mod video_menu_tests{
-    use super::video_asset_actions;
+    use super::{video_asset_actions,video_authority_notice};
     use serde_json::json;
     #[test]
     fn asset_submenu_preserves_active_toggle_and_bound_track_commands(){
@@ -56,6 +59,13 @@ mod video_menu_tests{
         assert_eq!(actions[1].1,json!({"op":"stage.video.remove","id":"asset"}));
         let actions=video_asset_actions(&json!({"trackID":"track","boundVideoID":"other"}),&json!({"id":"asset"}));
         assert_eq!(actions[1].0,"绑定到当前歌曲");assert_eq!(actions[1].1["op"],"stage.video.bind");
+    }
+    #[test]
+    fn video_authority_failure_is_projected_without_inventing_success(){
+        let waiting=json!({"videoNotice":"视频执行状态待核验；未重放旧动作。"});
+        assert_eq!(video_authority_notice(&waiting),Some("视频执行状态待核验；未重放旧动作。"));
+        assert_eq!(video_authority_notice(&json!({"videoNotice":null})),None);
+        assert_eq!(video_authority_notice(&json!({"videoNotice":"  "})),None);
     }
 }
 
@@ -551,6 +561,13 @@ impl StagePanelsPane {
             }
         }
         if !self.embedded || self.section=="视频" {
+        if let Some(notice)=video_authority_notice(player) {
+            form=form.child(div().id("stage-video-authority-notice").text_xs()
+                .text_color(cx.theme().danger).child(notice.to_owned()));
+        }
+        if player["videoCanRecoverStop"].as_bool()==Some(true) {
+            form=form.child(self.button("stage-video-recover-stop","停止并核验",json!({"op":"stage.video.recoverStop"}),false,cx));
+        }
         form = form.child(
             div()
                 .flex()

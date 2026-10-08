@@ -21,14 +21,39 @@ guard !cancelClosure.contains("pauseResidentWishContinuations()"),
 }
 let harness = #"""
 import Foundation
+@MainActor final class PrivateStateTransport:ResidentStateTransport {
+    let rpc:PrivateRPC
+    init(_ rpc:PrivateRPC) {self.rpc=rpc}
+    func call(method:String,params:[String:ResidentStateJSON]) async throws -> [String:ResidentStateJSON] {
+        let bytes=try JSONEncoder().encode(params),rpc=self.rpc
+        let data=try await Task.detached {try rpc.call(method,bytes)}.value
+        return try JSONDecoder().decode([String:ResidentStateJSON].self,from:data)
+    }
+}
 @MainActor final class Coordinator {
     var pauses=0
-    func pauseContinuations(worldID:String,residentScope:String)throws{pauses += 1}
+    let rpc:PrivateRPC
+    init(_ rpc:PrivateRPC) {self.rpc=rpc}
+    func pauseContinuations(worldID:String,residentScope:String) async throws {
+        let bytes=try JSONSerialization.data(withJSONObject:["scope":["worldID":worldID,"residentScope":residentScope],"action":"userStop","requestID":UUID().uuidString])
+        let rpc=self.rpc
+        _ = try await Task.detached {try rpc.call("resident_intent_pause",bytes)}.value
+        pauses += 1
+    }
 }
 @MainActor final class App {
     var residentPropTemporaryCancellation=false
     var residentAgentLoop:ResidentAgentLoop?
-    let wishMachineCoordinator=Coordinator()
+    let wishMachineCoordinator:Coordinator
+    let rpc:PrivateRPC
+    let scheduler:RustResidentSchedulerClient
+    let memory:ResidentMemoryStore
+    var cancelledInvocations=0
+    init(_ rpc:PrivateRPC) {
+        self.rpc=rpc;wishMachineCoordinator=Coordinator(rpc)
+        scheduler=RustResidentSchedulerClient(worldID:"room",residentScope:"resident",hostSessionID:"fixture-host",call:rpc.call)
+        memory=ResidentMemoryStore(client:ResidentStateClient(transport:PrivateStateTransport(rpc)))
+    }
     private var residentWishScope:ResidentWishScope?
     var runs=0
     var now=Date(timeIntervalSince1970:100)
@@ -36,29 +61,53 @@ import Foundation
     \#(methods)
     func prepare() {
         let loop=ResidentAgentLoop(now:{[weak self] in self?.now ?? Date()},configuration:.init(minimumWakeInterval:1),run:{[weak self] input in
-            self?.runs += 1
-            try await Task.sleep(for:.seconds(30));return "done"
-        },steer:{_ in .notDelivered},onReply:{_ in},onFailure:{_ in},onChange:{},onCancel:{},onUserStop:{[weak self] in self?.pauseResidentWishContinuations()})
+            guard let self,let binding=self.residentAgentLoop?.claimedRustBinding(runID:input.runID) else {preconditionFailure("invocation started without real durable claim")}
+            let state=try await self.readScheduler()
+            precondition((state["events"] as! [[String:Any]]).contains { $0["runID"] as? String == input.runID.uuidString && $0["hostSessionID"] as? String == "fixture-host" && $0["state"] as? String == "claimed" },"claim must be persisted before execution")
+            self.runs += 1
+            do {try await Task.sleep(for:.seconds(30));return "done"}
+            catch is CancellationError {
+                // This fixture owns exactly this sleep invocation and has no
+                // external side effects. Its actual return proves termination.
+                _ = try await binding.scheduler.finish(binding.ticket,outcome:"cancelled",invocationStarted:true,cancellationConfirmed:true)
+                self.cancelledInvocations += 1
+                throw CancellationError()
+            }
+        },steer:{_ in .notDelivered},onReply:{_ in},onFailure:{_ in},onChange:{},onCancel:{},onUserStop:{[weak self] in Task {await self?.pauseResidentWishContinuations()}},rustScheduler:scheduler,rustSchedulerAvailability:{true})
         residentAgentLoop=loop
+        loop.bindMemory(store:memory,scope:.init(worldID:"room",residentScope:"resident"))
         residentWishScope=ResidentWishScope(loopID:ObjectIdentifier(loop),worldID:"room",residentScope:"resident")
     }
     func beginEditing() { temporarilyPauseResidentForPropEditing() }
+    func readScheduler() async throws -> [String:Any] {
+        let bytes=try JSONSerialization.data(withJSONObject:["worldID":"room","residentScope":"resident"]),rpc=self.rpc
+        let reply=try await Task.detached {try rpc.call("agent_loop_read",bytes)}.value
+        return try JSONSerialization.jsonObject(with:reply) as! [String:Any]
+    }
 }
 @main struct Tests {
     @MainActor static func main() async throws {
-        let app=App();app.prepare();let loop=app.residentAgentLoop!
-        loop.setBackgroundEnabled(true);loop.tick()
+        let app=App(try PrivateRPC(CommandLine.arguments[1]));app.prepare();let loop=app.residentAgentLoop!
+        func eventually(_ label:String,_ condition:()->Bool) async throws {
+            for _ in 0..<500 {if condition() {return};try await Task.sleep(for:.milliseconds(10))}
+            preconditionFailure("real authority condition timed out: \(label); loop=\(loop.snapshot); runs=\(app.runs) cancelled=\(app.cancelledInvocations) pauses=\(app.wishMachineCoordinator.pauses)")
+        }
+        loop.setBackgroundEnabled(true);_ = await loop.restoreMemory();loop.tick()
         await Task.yield()
+        try await eventually("first claim") {loop.tick();return app.runs==1}
         precondition(loop.snapshot.isBackgroundRun && loop.snapshot.isRunning,"real background turn started")
         app.beginEditing()
         precondition(app.wishMachineCoordinator.pauses == 0,"temporary editor cancellation never persists wish pause")
         precondition(!loop.snapshot.isStopped && !loop.snapshot.intentPausedByUser,"editor never becomes user stop")
+        try await eventually("first cancellation") {app.cancelledInvocations==1}
         loop.setBackgroundEnabled(true)
         loop.receiveContinuationEvent(.init(id:"ready",kind:"wish.ready",summary:"ready"))
         app.now=app.now.addingTimeInterval(2);loop.tick();await Task.yield()
+        try await eventually("continuation claim") {app.runs==2}
         precondition(app.runs == 2 && loop.snapshot.isBackgroundRun,"ready continuation actually resumes a new observation turn after editing")
         app.beginEditing()
         loop.stop()
+        try await eventually("stop pause receipt") {app.wishMachineCoordinator.pauses==1 && app.cancelledInvocations==2 && loop.snapshot.intentPausedByUser}
         precondition(app.wishMachineCoordinator.pauses == 1,"explicit stop during editing persists pause")
         loop.setBackgroundEnabled(true)
         precondition(loop.snapshot.isStopped && loop.snapshot.intentPausedByUser,"editor exit never undoes explicit stop")
@@ -67,6 +116,9 @@ import Foundation
         precondition(app.wishMachineCoordinator.pauses == 1,"context switch or quit never persists a wish pause")
         precondition(loop.snapshot.isStopped && loop.snapshot.intentPausedByUser,
                      "context switch or quit never fabricates or clears a user stop")
+        let events=try await app.readScheduler()["events"] as! [[String:Any]]
+        precondition(events.count==2 && events.allSatisfy{$0["state"] as? String == "cancelled" && $0["receipt"] is [String:Any]},"actual cancellation receipts retain both charged invocations")
+        print("ACTUAL Rust: persistedClaims=2 confirmedCancelledInvocations=2 explicitPauseCallbacks=1; no third invocation")
         print("PASS: actual loop editor temporary cancellation and explicit stop")
     }
 }
@@ -77,6 +129,8 @@ defer{try? FileManager.default.removeItem(at:dir)}
 let file=dir.appendingPathComponent("Test.swift"),exe=dir.appendingPathComponent("test")
 try harness.write(to:file,atomically:true,encoding:.utf8)
 func run(_ path:String,_ args:[String]) throws->Int32{let p=Process();p.executableURL=URL(fileURLWithPath:path);p.arguments=args;try p.run();p.waitUntilExit();return p.terminationStatus}
-let code=try run("/usr/bin/swiftc",["-j1","-parse-as-library","apps/macos/Sources/GMGNRadio/Agent/ResidentSteeringDelivery.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentAgentLoop.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentMemoryStore.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentStateClient.swift",file.path,"-o",exe.path])
+let code=try run("/usr/bin/swiftc",["-j1","-swift-version","6","-parse-as-library","apps/macos/Sources/GMGNRadio/Presence/TaskdHTTPTransport.swift","tools/fixtures/PrivateAttachmentAuthority.swift","apps/macos/Sources/GMGNRadio/Presence/RustResidentSchedulerClient.swift","apps/macos/Sources/GMGNRadio/Agent/RustResidentIntentClient.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentSteeringDelivery.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentAgentLoop.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentMemoryStore.swift","apps/macos/Sources/GMGNRadio/Agent/ResidentStateClient.swift",file.path,"-o",exe.path])
 guard code == 0 else {exit(code)}
-exit(try run(exe.path,[]))
+if CommandLine.arguments.contains("--compile-only") {print("PASS: actual editor loop fixture compiled; runtime not executed");exit(0)}
+guard CommandLine.arguments.count>=3 else {print("FAIL: requires private endpoint and root; no nil scheduler fallback");exit(1)}
+exit(try run(exe.path,Array(CommandLine.arguments.dropFirst())))

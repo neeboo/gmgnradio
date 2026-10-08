@@ -385,6 +385,8 @@ import CoreFoundation
 
 
     private func handle(name: String, callID: String, data: Data) async -> RealtimeDJToolResult {
+        do { try await coordinator.waitUntilReady() }
+        catch { return failure(callID, code: "unavailable", message: "许愿服务尚未就绪。") }
         guard !Task.isCancelled, isCurrent() else {
             return failure(callID, code: WishMachineContract.Code.staleWishSession.rawValue, message: "本轮空间操作已停止。")
         }
@@ -395,7 +397,7 @@ import CoreFoundation
             guard Self.validate(arguments, name: name) else {
                 return failure(callID, code: WishMachineContract.Code.invalidArguments.rawValue, message: "只读参数接口不接受任何参数。")
             }
-            return self.contract(callID: callID)
+            return await self.contract(callID: callID)
         }
         // 尺寸判据**先于**结构性校验：`validate` 只能答 Bool，说不出"缺什么、该问哪一句"。
         // 畸形 → 可读错误；信息不足 → 结构化成功返回（不发提交）。
@@ -415,7 +417,7 @@ import CoreFoundation
         guard Self.validate(arguments, name: name) else {
             return failure(callID, code: WishMachineContract.Code.invalidArguments.rawValue, message: "许愿工具参数不符合当前契约。")
         }
-        if name == "read_wish_generation" && arguments.isEmpty { return discovery(callID: callID) }
+        if name == "read_wish_generation" && arguments.isEmpty { return await discovery(callID: callID) }
         do {
             let job: WishMachineJob
             // 这次提交用的是哪一份授权（续办时是**草稿**那一对，而不是本轮新开的），
@@ -437,7 +439,7 @@ import CoreFoundation
                 let destination = Self.destination(arguments)
                 // 这次调用是"回答上一句问话"，还是新的一次委托？答案决定用哪一份授权：
                 // 续办**必须**用草稿里的原授权 + 原 requestID，否则就是另一次委托。
-                let resolution = resolveDraft(arguments, attachmentID: attachmentID, name: name)
+                let resolution = try await resolveDraft(arguments, attachmentID: attachmentID, name: name)
                 if case let .ambiguous(options) = resolution {
                     return await needsInput(callID: callID, need: .pendingId, reason: .ambiguousDelegation,
                         drafts: options, arguments: arguments)
@@ -464,7 +466,7 @@ import CoreFoundation
                             attachmentID: attachmentID, name: name,
                             heightMeters: heightMeters, sizeIntent: sizeIntent, worldID: worldID,
                             residentScope: residentScope, destination: destination)
-                        try? coordinator.markPendingDraftSubmitted(id: draft.id, jobID: job.id)
+                        try? await coordinator.markPendingDraftSubmitted(id: draft.id, jobID: job.id)
                     }
                 } else {
                     // 新的一次委托：用**本轮**授权，走今天的路径（同授权第二次不同 requestID
@@ -487,7 +489,7 @@ import CoreFoundation
                 guard let continuationResumeAuthorizationID else { throw WishMachineError.continuationResumeUnauthorized }
                 let id = UUID(uuidString: arguments["wish_id"] as! String)!
                 let existing = try coordinator.read(id: id, worldID: worldID, residentScope: residentScope)
-                job = try coordinator.resumeContinuations(id: id, worldID: worldID, residentScope: residentScope,
+                job = try await coordinator.resumeContinuations(id: id, worldID: worldID, residentScope: residentScope,
                     authorizationID: continuationResumeAuthorizationID,
                     placementAlreadyCompleted: existing.stage == .claimed ? resumePlacementStatus(existing) : nil)
             default:
@@ -582,13 +584,15 @@ import CoreFoundation
     ///
     /// 唯一的真相在 `WishMachineContract`；这里只负责把**当前**的动态部分（服务是否配置、
     /// 服务声明的轴能力、本 scope 的草稿）拼上去。
-    private func contract(callID: String) -> RealtimeDJToolResult {
+    private func contract(callID: String) async -> RealtimeDJToolResult {
+        let drafts: [WishMachinePendingDraft]
+        do { drafts = try await coordinator.pendingDrafts(worldID: worldID, residentScope: residentScope) }
+        catch { return failure(callID, code: WishMachineContract.Code.wishOperationFailed.rawValue, message: error.localizedDescription) }
         let facts = serviceFacts()
         let payload = WishMachineContract.readOnlyPayload(
             serviceConfigured: facts.configured, serviceNotice: facts.notice,
             capability: sizeIntentCapability(),
-            openDrafts: coordinator.pendingDrafts(worldID: worldID, residentScope: residentScope, now: now())
-                .map(Self.draftPayload))
+            openDrafts: drafts.map(Self.draftPayload))
         return .init(callID: callID,
             resultJSON: (try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)) ?? Data("{}".utf8),
             isError: false)
@@ -604,28 +608,12 @@ import CoreFoundation
     }
 
     /// 这次调用是"回答上一句问话"（续同一份委托）还是"新的一次委托"？
-    enum DraftResolution: Equatable {
-        case fresh
-        case resume(WishMachinePendingDraft)
-        /// 说不清是哪一件：**不猜**，把候选交回去让 agent 先问用户。
-        case ambiguous([WishMachinePendingDraft])
-    }
+    typealias DraftResolution = WishMachineDraftResolution
 
-    private func resolveDraft(_ arguments: [String: Any], attachmentID: UUID, name: String) -> DraftResolution {
-        let drafts = coordinator.pendingDrafts(worldID: worldID, residentScope: residentScope, now: now())
-        guard !drafts.isEmpty else { return .fresh }
-        if let text = arguments["pending_id"] as? String, let id = UUID(uuidString: text) {
-            // 给了编号就必须逐项对上：对不上就是"把回答当成了另起一件"，宁可再问一次。
-            guard let match = drafts.first(where: { $0.id == id }),
-                  match.attachmentID == attachmentID, match.name == name else { return .ambiguous(drafts) }
-            return .resume(match)
-        }
-        // 只自动命中**还没提交**的草稿：已提交的那份只认显式 pending_id（否则用户
-        // 过一会儿真心想再做一件同名同图的，会被当成重放）。
-        let matches = drafts.filter { $0.attachmentID == attachmentID && $0.name == name && $0.submittedJobID == nil }
-        if matches.count == 1 { return .resume(matches[0]) }
-        if matches.isEmpty { return .fresh }
-        return .ambiguous(matches)
+    private func resolveDraft(_ arguments: [String: Any], attachmentID: UUID, name: String) async throws -> DraftResolution {
+        try await coordinator.resolvePendingDrafts(
+            pendingID: (arguments["pending_id"] as? String).flatMap(UUID.init(uuidString:)),
+            attachmentID: attachmentID, name: name, worldID: worldID, residentScope: residentScope)
     }
 
     /// 信息不足的**结构化成功**回执：不发提交、不填默认值，并把原委托记成草稿。
@@ -642,7 +630,9 @@ import CoreFoundation
         // 有了原授权与原图才能把"同一个委托"钉下来：钉的是**原来**那一对
         // (authorityID, requestID)，不是本轮的 —— 否则用户回答的那一轮就变成新授权。
         if let attachmentID = (arguments["attachment_id"] as? String).flatMap(UUID.init(uuidString:)) {
-            let resolution = resolveDraft(arguments, attachmentID: attachmentID, name: objectName)
+            let resolution: DraftResolution
+            do { resolution = try await resolveDraft(arguments, attachmentID: attachmentID, name: objectName) }
+            catch { return failure(callID, code: WishMachineContract.Code.wishOperationFailed.rawValue, message: error.localizedDescription) }
             let existing: WishMachinePendingDraft?
             let authorityID: UUID
             let requestID: String
@@ -659,13 +649,17 @@ import CoreFoundation
                 authorityID = authorizationID; requestID = callID
             }
             if !requestID.isEmpty {
-                if let draft = try? coordinator.recordPendingDraft(
+                do {
+                    let draft = try await coordinator.recordPendingDraft(
                     id: existing?.id ?? UUID(), authorityID: authorityID, requestID: requestID,
                     attachmentID: attachmentID, name: objectName, destination: Self.destination(arguments),
-                    needs: [need.rawValue], worldID: worldID, residentScope: residentScope, now: now()) {
+                    needs: [need.rawValue], worldID: worldID, residentScope: residentScope, now: now())
                     pendingID = draft.id
                     attempt = draft.attempt
                     draftPayload = Self.draftPayload(draft)
+                } catch {
+                    return failure(callID, code: WishMachineContract.Code.wishOperationFailed.rawValue,
+                        message: error.localizedDescription)
                 }
             }
         }
@@ -694,10 +688,16 @@ import CoreFoundation
         return .init(surfaceIDs: surfaces, explicitTarget: explicit)
     }
 
-    private func discovery(callID: String) -> RealtimeDJToolResult {
+    private func discovery(callID: String) async -> RealtimeDJToolResult {
+        let drafts: [WishMachinePendingDraft]
+        do { drafts = try await coordinator.pendingDrafts(worldID: worldID, residentScope: residentScope) }
+        catch { return failure(callID, code: WishMachineContract.Code.wishOperationFailed.rawValue, message: error.localizedDescription) }
         let jobs = coordinator.residentJobs(worldID: worldID, residentScope: residentScope)
         let choices = authorizationID.map { coordinator.attachmentChoices(authorizationID: $0, worldID: worldID, residentScope: residentScope) } ?? []
-        let available = authorizationID.map { grant in !choices.isEmpty && !jobs.contains { $0.authorizationID == grant } } ?? false
+        let available = authorizationID.map { grant in
+            coordinator.isGenerationAuthorized(authorizationID: grant, worldID: worldID,
+                residentScope: residentScope)
+        } ?? false
         let payload: [String: Any] = ["ok": true, "generation_authorized": available,
             "attachments": choices.map { choice -> [String: Any] in
                 let reference = coordinator.webReference(attachmentID: choice.id)
@@ -713,8 +713,7 @@ import CoreFoundation
                  "object_id": delegation.objectID ?? "", "state": delegation.state.rawValue,
                  "allowed_surfaces": delegation.allowedSurfaceIDs, "last_error": delegation.lastError ?? ""]
             },
-            "open_drafts": coordinator.pendingDrafts(worldID: worldID, residentScope: residentScope, now: now())
-                .map(Self.draftPayload),
+            "open_drafts": drafts.map(Self.draftPayload),
             "total_jobs": jobs.count]
         return .init(callID: callID, resultJSON: (try? JSONSerialization.data(withJSONObject: payload, options: .sortedKeys)) ?? Data("{}".utf8), isError: false)
     }
@@ -734,7 +733,7 @@ import CoreFoundation
             guard humanOrderedClaim() || current.autoContinuationPaused != true else { throw WishMachineError.automaticContinuationPaused }
             guard let evidence = try coordinator.claimEvidence(id: id, worldID: worldID, residentScope: residentScope),
                   evidence.worldID == worldID, evidence.activityID == "wish_machine.collect" else { throw WishMachineError.notAtMachine }
-            do { return try coordinator.claim(id: id, worldID: worldID, residentScope: residentScope) }
+            do { return try await coordinator.claim(id: id, worldID: worldID, residentScope: residentScope) }
             catch WishMachineError.notAtMachine { /* The already-started collection activity may still be approaching. */ }
             try await Task.sleep(for: .milliseconds(250))
         }

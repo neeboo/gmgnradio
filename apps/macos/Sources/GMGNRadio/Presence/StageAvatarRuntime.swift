@@ -366,6 +366,7 @@ final class StageAvatarRuntimeStore {
     private(set) var locomotion = StageAvatarLocomotionTelemetry.standing
     private var residentThinkingRunID: UUID?
     private var installedResidentMotions: [StageMotionAsset] = []
+    private var selectionAuthorityRevision: Int64?
 
     var isResidentThinking: Bool { residentThinkingRunID != nil }
 
@@ -429,6 +430,11 @@ final class StageAvatarRuntimeStore {
     }
 
     func refresh(forcePlaybackReload: Bool = false) {
+        guard let authority = packageStore?.selectionAuthority,
+              let selection = authority.confirmed else {
+            status = .loading("正在读取角色选择"); return
+        }
+        selectionAuthorityRevision = selection.revision
         var avatar = snapshot.avatar
         var motion = snapshot.motion
         var refreshError: Error?
@@ -446,7 +452,7 @@ final class StageAvatarRuntimeStore {
         if let motionPackageStore {
             do {
                 installedResidentMotions = try motionPackageStore.listMotions()
-                motion = try motionPackageStore.activeMotion()
+                motion = selection.effectiveMotionID.flatMap { id in installedResidentMotions.first { $0.id == id } }
             } catch {
                 installedResidentMotions = []
                 refreshError = refreshError ?? error
@@ -458,10 +464,6 @@ final class StageAvatarRuntimeStore {
 
         // Preserve the user's verified selection, including VRMA and imported
         // clips. Only natural/procedural idle needs a humanoid idle resource.
-        if motion == nil || motion?.format == .procedural {
-            motion = residentLoopMotion("idle-loop", avatarFormat: avatar?.format)
-        }
-
         setSnapshot(avatar: avatar, motion: motion, forcePlaybackReload: forcePlaybackReload)
         if let refreshError {
             status = .failed(refreshError.localizedDescription)
@@ -480,11 +482,11 @@ final class StageAvatarRuntimeStore {
         else {
             return
         }
-        do {
-            try motionPackageStore.activate(id: MotionPackageStore.naturalIdleID)
-            refresh()
-        } catch {
-            status = .failed(error.localizedDescription)
+        let motionID = snapshot.motion?.id
+        Task { [weak self] in
+            guard let self, let motionID else { return }
+            do { _ = try await motionPackageStore.selectionAuthority.event("motion_finished", id: motionID); refresh() }
+            catch { status = .failed(error.localizedDescription) }
         }
     }
 
@@ -604,10 +606,25 @@ final class StageAvatarRuntimeStore {
     func markReady() {
         guard let name = snapshot.name else { return }
         status = .ready(name)
+        reportSelectionRenderer(success: true)
     }
 
     func markFailed(_ error: Error) {
         status = .failed(error.localizedDescription)
+        reportSelectionRenderer(success: false)
+    }
+    private func reportSelectionRenderer(success: Bool) {
+        guard let authority=packageStore?.selectionAuthority,
+              let state=authority.confirmed,state.policy=="native",state.pendingRenderer,
+              let revision=selectionAuthorityRevision else{return}
+        let runtimeRevision=snapshot.revision
+        Task { [weak self] in
+            guard let self, snapshot.revision==runtimeRevision else{return}
+            do {
+                _ = try await authority.event("renderer_ack",success:success,expectedRevision:revision)
+                if !success { refresh() }
+            } catch { status = .failed(error.localizedDescription) }
+        }
     }
 
     private func setSnapshot(

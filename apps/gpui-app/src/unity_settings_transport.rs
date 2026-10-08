@@ -29,9 +29,16 @@ pub fn start(path: &str) -> Result<SettingsTransport, String> {
                         continue;
                     }
                     let result = request(port, &token, "POST", "/command", Some(&command));
-                    if !result.as_ref().is_ok_and(|value| value["accepted"] == true) {
-                        if updates.send(Err("Unity 没有接受这次设置，原设置保持不变。".into())).is_err() { break; }
-                        continue;
+                    match result {
+                        Ok(value) if value["accepted"] == true => {}
+                        Ok(_) => {
+                            if updates.send(Err("Unity 没有接受这次设置。".into())).is_err() { break; }
+                        }
+                        Err(_) => {
+                            // The command may have committed before its reply was lost.
+                            // The next snapshot reads the authority; never replay the write.
+                            if updates.send(Err("设置回执未收到，正在重新读取当前设置。".into())).is_err() { break; }
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -45,7 +52,7 @@ pub fn start(path: &str) -> Result<SettingsTransport, String> {
 fn request(port: u16, token: &str, method: &str, path: &str, value: Option<&Value>) -> Result<Value, String> {
     let failure = || "Unity 设置连接已断开，请关闭后从 Unity 重新打开。".to_owned();
     let mut stream = TcpStream::connect_timeout(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(), Duration::from_secs(2)).map_err(|_| failure())?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_| failure())?;
+    stream.set_read_timeout(Some(response_timeout(method, path))).map_err(|_| failure())?;
     stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|_| failure())?;
     let body = value.map(Value::to_string).unwrap_or_default();
     let header = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
@@ -56,6 +63,14 @@ fn request(port: u16, token: &str, method: &str, path: &str, value: Option<&Valu
     let header = std::str::from_utf8(&bytes[..boundary]).map_err(|_| failure())?;
     if header.lines().next().and_then(|line| line.split_whitespace().nth(1)) != Some("200") { return Err(failure()); }
     serde_json::from_slice(&bytes[boundary + 4..]).map_err(|_| failure())
+}
+
+fn response_timeout(method: &str, path: &str) -> Duration {
+    if method == "POST" && path == "/command" {
+        Duration::from_secs(7)
+    } else {
+        Duration::from_secs(2)
+    }
 }
 
 /// Every selected value and catalog comes from the live Unity host, never a
@@ -71,6 +86,11 @@ pub fn project_snapshot(value: Value) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test] fn command_waits_for_authority_while_snapshot_remains_bounded() {
+        assert_eq!(response_timeout("POST", "/command"), Duration::from_secs(7));
+        assert_eq!(response_timeout("GET", "/snapshot"), Duration::from_secs(2));
+        assert_eq!(response_timeout("POST", "/snapshot"), Duration::from_secs(2));
+    }
     #[test] fn projection_uses_live_selection_and_catalog() {
         let input = json!({"version":1,"settings":{"agent":{"residentPersona":"真实设置"}},"supportedCommands":["agent.save"],"stage":{"player":{"lyricID":"monet_poster","lyrics":[{"id":"monet_poster","name":"莫奈"}],"clouds":[{"id":"orbitalShell","name":"星球"}],"cloudID":"orbitalShell","particleScale":1.2}}});
         let state = project_snapshot(input.clone()).unwrap();
@@ -101,6 +121,30 @@ mod tests {
             client.write_all(header.as_bytes()).unwrap(); client.write_all(body).unwrap();
         });
         assert_eq!(request(port, "private-test-token", "POST", "/command", Some(&json!({"op":"stage.player.lyrics", "id":"monet_poster"}))).unwrap()["accepted"], true);
+        task.join().unwrap();
+    }
+    #[test] fn delayed_command_receipt_is_read_without_replaying_write() {
+        let server = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let task = std::thread::spawn(move || {
+            let (mut client, _) = server.accept().unwrap();
+            let mut header = Vec::new();
+            loop {
+                let mut byte = [0];
+                client.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                if header.ends_with(b"\r\n\r\n") { break; }
+            }
+            let text = String::from_utf8(header).unwrap();
+            let length: usize = text.lines().find_map(|row| row.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+            let mut body = vec![0; length];
+            client.read_exact(&mut body).unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["op"], "agent.backend");
+            // A real response beyond the former two-second timeout.
+            std::thread::sleep(Duration::from_millis(2200));
+            client.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"accepted\":true}").unwrap();
+        });
+        assert_eq!(request(port, "private-test-token", "POST", "/command", Some(&json!({"op":"agent.backend","id":"codex"}))).unwrap()["accepted"], true);
         task.join().unwrap();
     }
 }

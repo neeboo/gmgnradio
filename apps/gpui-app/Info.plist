@@ -1,14 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>ai.gmgn.radio.e2e</string>
+<!-- Packaging inherits all resolved metadata from the formal native carrier;
+     this template describes the formal launcher, never an E2E default. -->
+<key>CFBundleIdentifier</key><string>ai.gmgn.radio</string>
 <key>CFBundleExecutable</key><string>gmgn-gpui-app</string>
 <key>CFBundleName</key><string>gmgn radio</string>
 <key>CFBundleDisplayName</key><string>gmgn radio</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSMicrophoneUsageDescription</key><string>按住说话时使用麦克风。</string>
+<key>LSUIElement</key><true/>
+<key>NSMicrophoneUsageDescription</key><string>gmgn radio uses the microphone so you can talk with your DJ.</string>
+<key>NSAppleMusicUsageDescription</key><string>gmgn radio uses your Apple Music account to search and play music for your DJ program.</string>
+<key>NSLocalNetworkUsageDescription</key><string>gmgn radio connects to your local motion-generation computer to list and download character actions.</string>
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

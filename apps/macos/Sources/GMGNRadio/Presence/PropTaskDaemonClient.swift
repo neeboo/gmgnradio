@@ -1,5 +1,23 @@
 import Foundation
 
+@MainActor protocol PropTaskControlConnecting: AnyObject {
+    func controlRequest(method: String, params: Data) async throws -> Data
+}
+
+private final class PropTaskControlReply: @unchecked Sendable {
+    let done = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var data = Data()
+    private var failure: Error?
+    func receive(_ bytes: Data) { lock.lock(); data = bytes; lock.unlock() }
+    func finish(_ error: Error?) { lock.lock(); failure = error; lock.unlock(); done.signal() }
+    func result() throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        if let failure { throw failure }
+        return data
+    }
+}
+
 struct PropTaskDaemonSnapshot: Codable, Sendable {
     let jobs: [PropGenerationRecord]
     let sequence: UInt64
@@ -100,7 +118,7 @@ enum PropTaskDaemonError: LocalizedError {
 }
 
 /// Local HTTP only. Task files and persistence belong to Rust.
-@MainActor final class PropTaskDaemonClient: PropTaskDaemonConnecting, PropTaskMessageConnecting {
+@MainActor final class PropTaskDaemonClient: PropTaskDaemonConnecting, PropTaskMessageConnecting, PropTaskControlConnecting {
     var onEvent: ((PropTaskDaemonEvent) -> Void)?
     var onSnapshot: ((PropTaskDaemonSnapshot) -> Void)?
     var onDisconnect: ((String) -> Void)?
@@ -134,7 +152,7 @@ enum PropTaskDaemonError: LocalizedError {
     private var mode: ConnectionMode = .command
     private var stateConnection: PropTaskDaemonClient?
     private var helperProcess: Process?
-    private static let maxFrame = 12 * 1024 * 1024
+    nonisolated private static let maxFrame = 12 * 1024 * 1024
     private struct Configuration: Codable, Equatable { let endpoint: URL; let token: String }
     private struct Request<P: Encodable>: Encodable { let id: String; let method: String; let params: P }
     private struct Endpoint: Decodable { let version: Int; let address: String; let token: String }
@@ -176,6 +194,53 @@ enum PropTaskDaemonError: LocalizedError {
         _ = try normalizedEndpoint(endpoint)
         guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !token.contains("\n"), !token.contains("\r") else { throw PropGenerationError.missingToken }
+    }
+
+    /// Local transactions run off the main actor; no helper launch or health probe.
+    func controlRequest(method: String, params: Data) async throws -> Data {
+        let endpointFileURL = self.endpointFileURL
+        return try await Task.detached(priority: .userInitiated) {
+            try Self.performControlRequest(endpointFileURL: endpointFileURL, method: method, params: params)
+        }.value
+    }
+
+    nonisolated private static func performControlRequest(endpointFileURL: URL, method: String, params: Data) throws -> Data {
+        guard method.hasPrefix("wish_control_"),
+              let descriptor = try? Data(contentsOf: endpointFileURL), descriptor.count <= 64 * 1024,
+              let endpoint = try? JSONDecoder().decode(Endpoint.self, from: descriptor) else {
+            throw PropTaskDaemonError.unavailable
+        }
+        let parts = endpoint.address.split(separator: ":")
+        guard endpoint.version == 2, parts.count == 2, parts[0] == "127.0.0.1",
+              let port = UInt16(parts[1]), port > 0,
+              let token = UUID(uuidString: endpoint.token), token.uuidString.dropFirst(14).first == "4",
+              let url = URL(string: "http://\(endpoint.address)/rpc") else {
+            throw PropTaskDaemonError.unavailable
+        }
+        let id = UUID().uuidString
+        guard let fields = try JSONSerialization.jsonObject(with: params) as? [String: Any] else {
+            throw PropTaskDaemonError.invalidFrame
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": fields])
+        guard body.count <= Self.maxFrame else { throw PropTaskDaemonError.invalidFrame }
+        let reply = PropTaskControlReply()
+        let transport = TaskdHTTPTransport(streaming: false, maximumBytes: Self.maxFrame,
+            receive: { reply.receive($0) }, completion: { reply.finish($0) })
+        var request = URLRequest(url: url, timeoutInterval: 1)
+        request.httpMethod = "POST"; request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
+        request.setValue(id, forHTTPHeaderField: "X-GMGN-Client-ID")
+        transport.start(request)
+        defer { transport.cancel() }
+        guard reply.done.wait(timeout: .now() + 1) == .success else { throw PropTaskDaemonError.timedOut }
+        guard let envelope = try JSONSerialization.jsonObject(with: reply.result()) as? [String: Any],
+              envelope["id"] as? String == id else { throw PropTaskDaemonError.invalidFrame }
+        if let error = envelope["error"] as? [String: Any], let code = error["code"] as? String {
+            throw PropTaskDaemonError.requestRejectedWith(code: code)
+        }
+        guard let result = envelope["result"] as? [String: Any] else { throw PropTaskDaemonError.invalidFrame }
+        return try JSONSerialization.data(withJSONObject: result)
     }
     static func normalizedEndpoint(_ endpoint: URL) throws -> URL {
         guard var c = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),

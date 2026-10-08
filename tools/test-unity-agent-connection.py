@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix="gmgn-agent-selection-") as temporary:
     definitions = directory / "Account.swift"
     definitions.write_text(protocol + stub)
     executable = directory / "connection-check"
-    subprocess.run(["swiftc", "-parse-as-library", str(definitions),
+    subprocess.run(["swiftc", "-swift-version", "6", "-j1", "-parse-as-library", str(definitions),
         str(repo / "apps/macos/UnityHost/UnityAgentConnectionBridge.swift"),
         str(repo / "tools/test-unity-agent-connection.swift"), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

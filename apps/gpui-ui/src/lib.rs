@@ -10,9 +10,68 @@ pub mod ui_tokens;
 
 use gpui_kit::component::input::InputEvent;
 use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::alert::Alert;
 use gpui_kit::component::{button::*, input::*, scroll::ScrollableElement, *};
 use gpui_kit::*;
 use state::{ChatAttachment, ChatCommand, ChatState, TranscriptLine};
+use base64::Engine as _;
+use image::ImageDecoder as _;
+use std::{collections::HashMap, sync::Arc};
+
+/// Only fixed host diagnostic codes may reach the UI. Provider payloads,
+/// URLs and arbitrary error descriptions are never rendered here.
+pub fn safe_asr_error_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some("asr_service_unavailable")=>"asr_service_unavailable",
+        Some("asr_protocol_failed")=>"asr_protocol_failed",
+        Some("asr_configuration_missing")=>"asr_configuration_missing",
+        Some("asr_connect_failed")=>"asr_connect_failed",
+        Some("asr_timeout")=>"asr_timeout",
+        Some("asr_provider_failed")=>"asr_provider_failed",
+        Some("asr_send_failed")=>"asr_send_failed",
+        Some("asr_commit_failed")=>"asr_commit_failed",
+        Some("asr_empty")=>"asr_empty",
+        Some("capture_backpressure")=>"capture_backpressure",
+        Some("capture_failed")=>"capture_failed",
+        Some("capture_empty")=>"capture_empty",
+        Some("microphone_permission")=>"microphone_permission",
+        Some("microphone_permission_pending")=>"microphone_permission_pending",
+        _=>"asr_failed",
+    }
+}
+fn asr_error_notice(state:Option<&str>,code:Option<&str>)->Option<String> {
+    if state!=Some("error") {return None;}
+    let code=safe_asr_error_code(code);
+    let message=match code {
+        "microphone_permission"=>"麦克风权限未开启，请检查系统隐私设置。",
+        "microphone_permission_pending"=>"麦克风授权尚未完成，请确认系统授权提示。",
+        "asr_configuration_missing"=>"语音识别尚未配置，请检查按住说话设置。",
+        "asr_service_unavailable"=>"语音识别服务暂不可用，请稍后重试。",
+        "asr_timeout"=>"语音识别超时，请重新按住说话。",
+        "asr_empty"|"capture_empty"=>"没有识别到语音，请重新按住说话。",
+        "capture_failed"|"capture_backpressure"=>"录音未完成，请检查麦克风后重试。",
+        _=>"语音识别未完成，请检查设置或稍后重试。",
+    };
+    Some(format!("{message}（{code}）"))
+}
+
+/// Host thumbnails are at most 96 pixels and 32 KiB. This UI decoder accepts
+/// that contract only; attachment import/send validation remains in the host.
+fn decode_attachment_thumbnail(encoded: &str) -> Result<Arc<RenderImage>, &'static str> {
+    if encoded.len() > 43_692 { return Err("无预览"); }
+    let bytes=base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_|"无预览")?;
+    if bytes.len()>32*1024 { return Err("无预览"); }
+    let decoder=image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes)).map_err(|_|"无预览")?;
+    let (width,height)=decoder.dimensions();
+    if width==0 || height==0 || width>96 || height>96 {return Err("无预览");}
+    let rgba=image::DynamicImage::from_decoder(decoder).map_err(|_|"无预览")?.to_rgba8();
+    projective_card::RgbaTexture {width,height,pixels:rgba.into_raw()}.into_render_image()
+}
+
+struct AttachmentThumbnail {
+    encoded: String,
+    image: Result<Arc<RenderImage>, &'static str>,
+}
 
 fn compact_composer_height(state: &ChatState) -> f32 {
     if !state.attachments.is_empty() || state.attachments_preparing || state.attachments_error.is_some() {
@@ -27,6 +86,8 @@ pub struct ResidentChatPane {
     state: ChatState,
     _subscription: Subscription,
     compact: bool,
+    thumbnails: HashMap<String, AttachmentThumbnail>,
+    asr_error: Option<String>,
 }
 
 impl ResidentChatPane {
@@ -61,6 +122,8 @@ impl ResidentChatPane {
             state: ChatState::default(),
             _subscription: subscription,
             compact: false,
+            thumbnails: HashMap::new(),
+            asr_error: None,
         }
     }
     pub fn compact(mut self, compact: bool) -> Self {
@@ -78,6 +141,16 @@ impl ResidentChatPane {
     }
     pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.input.read(cx).focus_handle(cx), cx);
+    }
+    /// A native ASR result edits the current composer; it never submits a turn.
+    pub fn append_voice_transcript(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim();
+        if text.is_empty() { return; }
+        let current = self.input.read(cx).value().to_string();
+        let draft = if current.is_empty() { text.to_owned() } else { format!("{current}\n{text}") };
+        self.state.edit(draft.clone());
+        self.input.update(cx, |input, cx| input.set_value(draft, window, cx));
+        cx.notify();
     }
     pub fn accepted(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.accepted(id) {
@@ -115,6 +188,7 @@ impl ResidentChatPane {
         cx.notify();
     }
     pub fn update_snapshot(&mut self, snapshot: serde_json::Value, cx: &mut Context<Self>) {
+        self.asr_error=asr_error_notice(snapshot["voiceState"].as_str(),snapshot["voiceErrorCode"].as_str());
         let attachments = snapshot["attachments"]
             .as_array()
             .map(|items| {
@@ -125,6 +199,7 @@ impl ResidentChatPane {
                             id: item["id"].as_str()?.to_string(),
                             file_name: item["fileName"].as_str().unwrap_or("图片").to_string(),
                             preview_path: item["previewPath"].as_str().map(str::to_string),
+                            thumbnail_png: item["thumbnailPNG"].as_str().map(str::to_string),
                         })
                     })
                     .collect()
@@ -134,6 +209,16 @@ impl ResidentChatPane {
             attachments,
             snapshot["attachmentsPreparing"].as_bool().unwrap_or(false),
         );
+        self.thumbnails.retain(|id,_|self.state.attachments.iter().take(4).any(|a|&a.id==id));
+        for attachment in self.state.attachments.iter().take(4) {
+            if let Some(encoded)=&attachment.thumbnail_png {
+                if !self.thumbnails.get(&attachment.id).is_some_and(|cached|&cached.encoded==encoded) {
+                    self.thumbnails.insert(attachment.id.clone(),AttachmentThumbnail {
+                        encoded:encoded.clone(),image:decode_attachment_thumbnail(encoded),
+                    });
+                }
+            } else {self.thumbnails.remove(&attachment.id);}
+        }
         self.state.attachments_error = snapshot["attachmentError"].as_str().map(str::to_string);
         self.state.voice_active = snapshot["voiceActive"].as_bool().unwrap_or(false);
         self.state.is_speaking = snapshot["isSpeaking"].as_bool().unwrap_or(false);
@@ -160,6 +245,7 @@ impl ResidentChatPane {
     }
     pub fn reset_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.reset_context();
+        self.asr_error=None;
         let draft = self.state.draft.clone();
         self.input
             .update(cx, |input, cx| input.set_value(draft, window, cx));
@@ -204,13 +290,20 @@ impl Render for ResidentChatPane {
         for attachment in self.state.attachments.clone() {
             let id = attachment.id.clone();
             let mut card = div().relative().w(px(54.)).h(px(46.)).flex_shrink_0();
-            if let Some(path) = &attachment.preview_path {
+            if let Some(thumbnail) = self.thumbnails.get(&id) {
+                card=match &thumbnail.image {
+                    Ok(image)=>card.child(img(image.clone()).w(px(54.)).h(px(46.)).object_fit(ObjectFit::Contain)),
+                    Err(message)=>card.child(div().text_xs().child(*message)),
+                };
+            } else if let Some(path) = &attachment.preview_path {
                 card = card.child(
                     img(std::path::PathBuf::from(path))
                         .w(px(54.))
                         .h(px(46.))
                         .object_fit(ObjectFit::Contain),
                 );
+            } else {
+                card=card.child(div().text_xs().child("无预览"));
             }
             previews = previews.child(
                 card.child(
@@ -456,6 +549,9 @@ impl Render for ResidentChatPane {
         if let Some(error) = &self.state.attachments_error {
             pane = pane.child(div().text_xs().text_color(rgb(0xfb923c)).child(error.clone()));
         }
+        if let Some(error)=&self.asr_error {
+            pane=pane.child(Alert::error("resident-asr-error",error.clone()).small().title("语音识别未完成"));
+        }
         pane.child(input).child(controls)
     }
 }
@@ -475,10 +571,64 @@ mod compact_attachment_tests {
         assert_eq!(compact_composer_height(&state), 140.);
         state.attachments_error = None;
         state.attachments.push(ChatAttachment {
-            id: "one".into(), file_name: "one.png".into(), preview_path: None,
+            id: "one".into(), file_name: "one.png".into(), preview_path: None, thumbnail_png: None,
         });
         assert_eq!(compact_composer_height(&state), 140.);
         state.attachments.clear();
         assert_eq!(compact_composer_height(&state), 70.);
+    }
+}
+
+#[cfg(test)]
+mod attachment_thumbnail_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use image::ImageEncoder as _;
+
+    fn png(width:u32,height:u32)->String {
+        let mut bytes=vec![];
+        image::codecs::png::PngEncoder::new(&mut bytes).write_image(
+            &vec![255;width as usize*height as usize*4],width,height,image::ExtendedColorType::Rgba8).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+    #[test]
+    fn native_inline_png_decodes_without_disk_or_uri_loader() {
+        assert!(decode_attachment_thumbnail(&png(96,80)).is_ok());
+    }
+    #[test]
+    fn malformed_and_oversized_thumbnails_have_explicit_no_preview() {
+        assert!(decode_attachment_thumbnail("not base64").is_err());
+        assert!(decode_attachment_thumbnail(&base64::engine::general_purpose::STANDARD.encode(b"not PNG")).is_err());
+        assert!(decode_attachment_thumbnail(&png(97,1)).is_err());
+        assert!(decode_attachment_thumbnail(&"A".repeat(43_693)).is_err());
+    }
+    #[test]
+    fn invalid_thumbnail_does_not_block_valid_attachment_submission() {
+        let mut state=ChatState::default();
+        state.set_attachments(vec![ChatAttachment {
+            id:"verified-host-id".into(),file_name:"照片.png".into(),preview_path:None,
+            thumbnail_png:Some("invalid".into()),
+        }],false);
+        assert!(state.can_send());
+    }
+}
+
+#[cfg(test)]
+mod asr_projection_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    #[test]
+    fn error_notice_is_safe_and_clears_on_new_capture_or_success() {
+        let error=asr_error_notice(Some("error"),Some("microphone_permission")).unwrap();
+        assert!(error.contains("麦克风权限"));
+        assert!(error.contains("microphone_permission"));
+        for state in [None,Some("idle"),Some("connecting"),Some("listening"),Some("transcribing")] {
+            assert!(asr_error_notice(state,Some("microphone_permission")).is_none());
+        }
+        let unsafe_description="https://provider.example/token=secret /private/credential";
+        let error=asr_error_notice(Some("error"),Some(unsafe_description)).unwrap();
+        assert!(error.contains("asr_failed"));
+        assert!(!error.contains("secret")&&!error.contains("provider.example")&&!error.contains("/private"));
+        assert_eq!(safe_asr_error_code(None),"asr_failed");
     }
 }

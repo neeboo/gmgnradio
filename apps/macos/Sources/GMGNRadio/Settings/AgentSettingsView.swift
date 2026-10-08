@@ -39,12 +39,10 @@ private struct RustSpeechConfigurationFields: View {
         .onChange(of: provider) { _, selection in
             cancelPreviewAndList()
             // Load that provider's saved credentials, never silently reuse another provider's key.
-            let defaults = E2ERuntime.defaults
-            let prefix = "speech.rust.\(selection.rawValue)."
-            apiKey = defaults.string(forKey: prefix + "apiKey")
-                ?? (selection == .bailian ? defaults.string(forKey: "voice.bailian.apiKey") ?? "" : "")
-            voiceID = defaults.string(forKey: prefix + "voiceID") ?? (selection == .bailian ? "Cherry" : "")
-            model = defaults.string(forKey: prefix + purpose + ".model") ?? ""
+            let configuration = preferences.configuration(provider: selection, for: purpose, includesEnvironment: false)
+            apiKey = configuration.apiKey
+            voiceID = configuration.voiceID
+            model = configuration.model ?? ""
             if model.isEmpty { model = defaultModelID ?? "" }
             saved = false
             voices = []; voiceMessage = nil
@@ -105,11 +103,12 @@ private struct RustSpeechConfigurationFields: View {
         }
         HStack {
             Button("保存配置") {
-                preferences.save(RustVoiceConfiguration(provider: provider,
+                let configuration = RustVoiceConfiguration(provider: provider,
                     apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
                     voiceID: voiceID.trimmingCharacters(in: .whitespacesAndNewlines),
-                    model: model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : model), for: purpose)
-                saved = true
+                    model: model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : model)
+                Task { do { try await preferences.save(configuration, for: purpose); saved = true }
+                    catch { saved = false; capabilityMessage = "设置未保存，请检查后台连接。" } }
             }
             .disabled(!modelSelectionIsValid)
             if saved { Text("已保存").font(.caption).foregroundStyle(.secondary) }
@@ -459,80 +458,6 @@ struct AgentSettingsView: View {
         )
     }
 
-    @ViewBuilder
-    private var providerConfigurationFields: some View {
-        switch model.realtimeProvider {
-        case .elevenLabs:
-            TextField(
-                "Agent ID",
-                text: $model.elevenLabsAgentID,
-                prompt: Text("agent_...")
-            )
-            SecureField(
-                "API Key（私有 Agent）",
-                text: $model.voiceAPIKey,
-                prompt: Text("sk_...")
-            )
-            SecureField(
-                "会话令牌（可选）",
-                text: $model.elevenLabsConversationToken,
-                prompt: Text("已有短期令牌时填写")
-            )
-            TextField(
-                "音色 ID（可选）",
-                text: $model.elevenLabsVoiceID,
-                prompt: Text("留空则使用 Agent 默认音色")
-            )
-        case .bailian:
-            SecureField(
-                "API Key",
-                text: $model.voiceAPIKey,
-                prompt: Text("sk-...")
-            )
-            LabeledContent("转写模型", value: "Qwen3 ASR Flash")
-            Picker(
-                "麦克风",
-                selection: $model.voiceMicrophoneDeviceID
-            ) {
-                Text(model.systemMicrophoneLabel)
-                    .tag("")
-                ForEach(model.voiceMicrophoneDevices) { device in
-                    Text(device.name)
-                        .tag(device.id)
-                }
-            }
-        case .doubao:
-            TextField(
-                "RTC App ID",
-                text: $model.voiceAppID
-            )
-            SecureField(
-                "Access Token",
-                text: $model.voiceAccessToken
-            )
-            TextField(
-                "Resource ID",
-                text: $model.voiceResourceID
-            )
-            TextField(
-                "音色",
-                text: $model.voiceID,
-                prompt: Text("供应商音色 ID")
-            )
-        }
-    }
-
-    private var providerHelpText: String {
-        switch model.realtimeProvider {
-        case .elevenLabs:
-            "这个服务还不能转写语音，请选百炼，或直接打字。"
-        case .bailian:
-            "密钥只存在这台电脑上。百炼只用来说话转文字，不用再配别的。"
-        case .doubao:
-            "这个服务还不能转写语音，请选百炼，或直接打字。"
-        }
-    }
-
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text("Agent 与语音")
@@ -600,34 +525,6 @@ struct AgentSettingsView: View {
         case .disconnected, .connecting:
             .secondary
         }
-    }
-}
-
-private extension RealtimeDJProvider {
-    var displayName: String {
-        switch self {
-        case .bailian:
-            "阿里云百炼"
-        case .doubao:
-            "豆包实时语音"
-        case .elevenLabs:
-            "ElevenLabs"
-        }
-    }
-
-    var transportLabel: String {
-        switch capabilities.transport {
-        case .streamingWebSocket:
-            "实时 WebSocket"
-        case .rtcRoom:
-            "RTC"
-        case .webRTC:
-            "WebRTC"
-        }
-    }
-
-    var canConnectLocally: Bool {
-        self == .bailian
     }
 }
 

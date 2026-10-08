@@ -35,6 +35,7 @@ pub struct ChatAttachment {
     pub id: String,
     pub file_name: String,
     pub preview_path: Option<String>,
+    pub thumbnail_png: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +375,7 @@ mod tests {
             id: id.into(),
             file_name: format!("{id}.png"),
             preview_path: None,
+            thumbnail_png: None,
         }
     }
     #[test]

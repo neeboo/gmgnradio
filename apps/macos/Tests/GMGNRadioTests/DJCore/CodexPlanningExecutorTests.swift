@@ -3,76 +3,53 @@ import Testing
 @testable import GMGNRadio
 
 @Test
+@MainActor
 func codexPlanningExecutorRequestsTheStructuredShowSchema() async throws {
-    let runner = StructuredOutputCodexRunner()
-    let executor = CodexCLIPlanningExecutor(runner: runner)
-
-    let output = try await executor.execute(prompt: "排一档节目")
-
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    try fixture.mockOutput(structuredShowOutput)
+    let proposal = try await fixture.client.modelProposal(
+        brief: structuredShowBrief, candidates: [structuredShowCandidate],
+        configuration: fixture.configuration()
+    )
+    let output = String(decoding: try JSONEncoder().encode(proposal), as: UTF8.self)
     #expect(output.contains(#""title":"测试节目""#))
-    let schema = try #require(await runner.capturedSchema())
+    let schema = try #require(fixture.capturedSchema)
     #expect(schema.contains(#""title""#))
     #expect(schema.contains(#""direction""#))
     #expect(schema.contains(#""selection_reason""#))
     #expect(schema.contains(#""should_talk_before""#))
     #expect(schema.contains(#""transition_intent""#))
     #expect(schema.contains(#""visual""#))
-    #expect(schema.contains(#""additionalProperties": false"#))
+    let decoded = try #require(JSONSerialization.jsonObject(with: Data(schema.utf8)) as? [String: Any])
+    #expect(decoded["additionalProperties"] as? Bool == false)
 }
 
 @Test
+@MainActor
 func codexPlanningExecutorUsesTheConfiguredModel() async throws {
-    let runner = StructuredOutputCodexRunner()
-    let executor = CodexCLIPlanningExecutor(
-        runner: runner,
-        model: "gpt-5.4"
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    try fixture.mockOutput(structuredShowOutput)
+    let base = fixture.configuration()
+    let configuration = DJPlanningConfiguration(hostPrompt: base.hostPrompt, executable: base.executable,
+                                                environment: base.environment, model: "gpt-5.4")
+    _ = try await fixture.client.modelProposal(
+        brief: structuredShowBrief, candidates: [structuredShowCandidate], configuration: configuration
     )
-
-    _ = try await executor.execute(prompt: "排一档节目")
-
-    #expect(await runner.capturedArguments().contains(
-        ["--model", "gpt-5.4"]
-    ))
+    #expect(fixture.capturedArguments.contains(["--model", "gpt-5.4"]))
 }
 
-private actor StructuredOutputCodexRunner: CodexCommandRunning {
-    private var schema: String?
-    private var arguments: [String] = []
-
-    func run(
-        arguments: [String],
-        standardInput: String?
-    ) async throws -> CodexCommandResult {
-        self.arguments = arguments
-        let schemaIndex = try #require(arguments.firstIndex(of: "--output-schema"))
-        let outputIndex = try #require(
-            arguments.firstIndex(of: "--output-last-message")
-        )
-        let schemaURL = URL(filePath: arguments[schemaIndex + 1])
-        let outputURL = URL(filePath: arguments[outputIndex + 1])
-        schema = try String(contentsOf: schemaURL, encoding: .utf8)
-        try Data(
-            """
-            {"title":"测试节目","direction":"测试方向","slots":[]}
-            """.utf8
-        ).write(to: outputURL)
-        return CodexCommandResult(exitCode: 0, output: "")
-    }
-
-    func capturedSchema() -> String? {
-        schema
-    }
-
-    func capturedArguments() -> [String] {
-        arguments
-    }
-}
-
+private let structuredShowOutput = #"{"title":"测试节目","direction":"测试方向","slots":[{"track_id":"1","selection_reason":"候选曲目","should_talk_before":true,"transition_intent":"开场","visual":{"mood":"夜晚","palette":"蓝","motion":"缓慢","intensity":0.3}}]}"#
+private let structuredShowBrief = ProgramBrief(id: "structured-private", targetDuration: 1_800,
+                                             moodTags: [], energyArc: [0.5], conversationMode: .ambient,
+                                             immediateUserInstruction: "排一档节目")
+private let structuredShowCandidate = MusicCandidate(
+    id: "1", canonicalID: nil, providerID: .netease, source: .streaming,
+    title: "测试歌曲", artist: "测试艺人", album: nil, duration: 240, isPlayable: true,
+    matchScore: 0.8, userAffinity: 0.7, energy: 0.5, moodTags: [], genres: [], releaseYear: nil
+)
 private extension Array where Element == String {
     func contains(_ sequence: [String]) -> Bool {
-        guard !sequence.isEmpty, count >= sequence.count else {
-            return false
-        }
+        guard !sequence.isEmpty, count >= sequence.count else { return false }
         return indices.dropLast(sequence.count - 1).contains { index in
             Array(self[index ..< index + sequence.count]) == sequence
         }

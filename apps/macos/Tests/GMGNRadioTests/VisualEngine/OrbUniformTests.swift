@@ -36,25 +36,32 @@ func privacyStateRemovesVisibleEnergy() {
 }
 
 @Test
-func orbAppearanceIsClampedAndRestoredLocally() {
+@MainActor
+func orbAppearanceIsClampedAndRestoredLocally() async throws {
     let suiteName = "orb-appearance-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
     defer { defaults.removePersistentDomain(forName: suiteName) }
 
-    var appearance = OrbAppearance.load(from: defaults)
+    let settings=RustProductSettingsClient(call: { method,_ in
+        var values:[String:Any]=["locale":"zh-CN","residentPersona":"fixture","backgroundTurnsPerHour":6,"autoSpeak":true,"autonomyEnabled":true,"agentBackend":"codex","selectedWorldID":NSNull(),"defaultSpace":"living-pod","djHostPrompt":"","djTakeover":true,"djPlanningModel":NSNull(),"ttsProvider":"bailian","ttsModel":"fixture","ttsVoice":"Cherry","asrProvider":"bailian","asrModel":"fixture","microphoneDeviceID":NSNull(),"orbRed":0.16,"orbGreen":0.62,"orbBlue":1.0,"orbFlowIntensity":0.82,"remoteMotionCatalogURL":"https://192.168.1.85:8765/catalog.json"]
+        if method=="product_settings_apply" {values["orbRed"]=1;values["orbGreen"]=0;values["orbBlue"]=0.48;values["orbFlowIntensity"]=1.5}
+        return try JSONSerialization.data(withJSONObject:["revision":method=="product_settings_apply" ? 2:1,"imported":true,"values":values])
+    })
+    var appearance = OrbAppearance.load(from: defaults,settings:settings)
     #expect(appearance == .default)
 
     appearance.red = 1.7
     appearance.green = -0.4
     appearance.blue = 0.48
     appearance.flowIntensity = 2.3
-    appearance.save(to: defaults)
+    _ = try await appearance.save(to: defaults,settings:settings)
 
-    let restored = OrbAppearance.load(from: defaults)
+    let restored = OrbAppearance.load(from: defaults,settings:settings)
     #expect(restored.red == 1)
     #expect(restored.green == 0)
     #expect(restored.blue == 0.48)
     #expect(restored.flowIntensity == 1.5)
+    #expect(defaults.object(forKey:"orb.appearance.red")==nil)
 }
 
 @Test

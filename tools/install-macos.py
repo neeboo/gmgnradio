@@ -9,6 +9,7 @@ import plistlib
 import shutil
 import signal
 import http.client
+import importlib.util
 import uuid
 import subprocess
 import sys
@@ -34,10 +35,38 @@ def stage(timings, name):
 
 # Probe the authenticated HTTP authority, without logging service payloads.
 DAEMON_VERIFY_FAILED = 'New daemon HTTP interface verification failed'
+APPLICATION_EXECUTABLES = frozenset(('gmgn radio', 'gmgn-gpui-app'))
+SCREEN_LINK_HELPER_LOCK = Path(__file__).parent / 'helpers/screen-link-helpers.lock.json'
+
+
+def _bundled_media_arguments(helper):
+    """Use the same pinned helpers and argument order as production bootstrap."""
+    directory = Path(helper).parent
+    names = ('yt-dlp', 'deno')
+    if not any((directory / name).exists() or (directory / (name + '.sha256')).exists()
+               for name in names):
+        return []  # Historical bundles did not ship screen-link helpers.
+    spec = importlib.util.spec_from_file_location(
+        'installer_screen_link_helpers', Path(__file__).with_name('bundle-screen-link-helper.py'))
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    lock = verifier.load_lock(SCREEN_LINK_HELPER_LOCK)
+    entries = {entry['name']: entry for entry in lock['helpers']}
+    arguments = []
+    for name, flag in (('yt-dlp', '--media-helper'), ('deno', '--media-deno')):
+        target = directory / name
+        manifest = directory / (name + '.sha256')
+        if target.is_symlink() or manifest.is_symlink():
+            raise RuntimeError('Invalid bundled media helper')
+        digest = verifier.verify_installed(entries[name], directory)
+        if manifest.read_text(encoding='utf-8').split() != [digest, name]:
+            raise RuntimeError('Invalid bundled media helper manifest')
+        arguments.extend([flag, str(target), flag + '-sha256', digest])
+    return arguments
 
 
 def _daemon_command_tails(root, sock):
-    """The three exact daemon invocations this installer owns.
+    """The exact historical daemon invocations this installer owns.
 
     Process replacement accepts these command lines and nothing else. A command
     that merely shares this prefix but adds any argument (including a duplicate
@@ -51,7 +80,16 @@ def _daemon_command_tails(root, sock):
 
 
 def _daemon_commands(helper, root, sock):
-    return {f'{helper}{tail}' for tail in _daemon_command_tails(root, sock)}
+    commands = {f'{helper}{tail}' for tail in _daemon_command_tails(root, sock)}
+    media = _bundled_media_arguments(helper)
+    if media:
+        # PropTaskDaemonClient appends legacy-root AFTER the media arguments;
+        # WorldAuthorityClient omits legacy-root. Do not accept permutations.
+        base = f'{helper} --root {root} --endpoint-file {sock} --concurrency 2'
+        media_command = base + ' ' + ' '.join(media)
+        commands.update((media_command,
+                         media_command + f' --legacy-root {root.parent / "PropGeneration"}'))
+    return commands
 
 
 def _valid_health_probe_response(response):
@@ -76,13 +114,15 @@ class Runtime:
 
     def start(self, helper, root, sock):
         return subprocess.Popen([str(helper), '--root', str(root), '--endpoint-file', str(sock),
-                                 '--concurrency', '2', '--legacy-root', str(root.parent / 'PropGeneration')], stdin=subprocess.DEVNULL,
+                                 '--concurrency', '2', *_bundled_media_arguments(helper),
+                                 '--legacy-root', str(root.parent / 'PropGeneration')], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
 
     def verify(self, child, sock, timeout):
         deadline = time.monotonic() + timeout
         descriptor = Path(sock)
+        expected = _daemon_commands(Path(child.args[0]), descriptor.parent, descriptor)
         while time.monotonic() < deadline:
             if child.poll() is not None:
                 raise RuntimeError('New daemon exited before verification')
@@ -97,7 +137,6 @@ class Runtime:
                 # Retain exact process scope checks; a PID alone cannot prove
                 # that the installed helper owns this root and descriptor.
                 rows = self.processes()
-                expected = _daemon_commands(Path(child.args[0]), descriptor.parent, descriptor)
                 if not any(pid == child.pid and command in expected for pid, command in rows):
                     raise RuntimeError('Daemon HTTP endpoint belongs to a different process')
                 owners = subprocess.check_output(['/usr/sbin/lsof', '-nP', '-a', '-iTCP:' + port,
@@ -137,14 +176,46 @@ def validate(app, require_helper=True):
             info = plistlib.load(stream)
     except (OSError, ValueError) as error:
         raise RuntimeError(f'Invalid app bundle: {app}') from error
-    if info.get('CFBundleIdentifier') != BUNDLE_IDENTIFIER or info.get('CFBundleExecutable') != 'gmgn radio':
+    if not isinstance(info, dict):
         raise RuntimeError('Unexpected application identity')
-    for relative in ['Contents/MacOS/gmgn radio', 'Contents/Helpers/gmgn-taskd',
+    executable = info.get('CFBundleExecutable')
+    unity = info.get('CFBundleIdentifier') == 'ai.gmgn.unity-sample.player' and executable == 'GMGN Unity Sample'
+    if not unity and (info.get('CFBundleIdentifier') != BUNDLE_IDENTIFIER or not isinstance(executable, str) or executable not in APPLICATION_EXECUTABLES):
+        raise RuntimeError('Unexpected application identity')
+    if unity:
+        executable_path = app / 'Contents/MacOS' / executable
+        if executable_path.is_symlink() or not executable_path.is_file() or not executable_path.resolve().is_relative_to(app.resolve()) or not os.access(executable_path, os.X_OK):
+            raise RuntimeError('Missing Unity executable')
+        if require_helper:
+            spec = importlib.util.spec_from_file_location('unity_product_metadata', Path(__file__).with_name('unity-product-metadata.py'))
+            verifier = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(verifier)
+            try:
+                verifier.verify(app)
+            except (OSError, ValueError, KeyError) as error:
+                raise RuntimeError('Invalid Unity product manifest') from error
+            # Pinned public-link verification uses the existing command; no download.
+            subprocess.run([sys.executable, str(Path(__file__).with_name('bundle-screen-link-helper.py')), '--destination', str(app / 'Contents/Helpers'), '--verify-only', '--include', 'deno'], check=True, capture_output=True)
+        return executable
+    for relative in [f'Contents/MacOS/{executable}', 'Contents/Helpers/gmgn-taskd',
                      'Contents/Helpers/gmgn-mcpd']:
         if not require_helper and relative.startswith('Contents/Helpers/'):
             continue
-        if not (app / relative).is_file() or not os.access(app / relative, os.X_OK):
+        path = app / relative
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(app.resolve()) or not os.access(path, os.X_OK):
             raise RuntimeError(f'Missing executable app/helper: {relative}')
+    if require_helper:
+        for name in ('gmgn-taskd', 'gmgn-mcpd'):
+            manifest = app / 'Contents/Helpers' / (name + '.sha256')
+            if manifest.is_symlink() or not manifest.is_file() or not manifest.resolve().is_relative_to(app.resolve()):
+                raise RuntimeError(f'Invalid helper manifest: {manifest}')
+        spec = importlib.util.spec_from_file_location('gmgn_helper_manifest', Path(__file__).with_name('verify-helper-manifest.py'))
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        report = verifier.verify(app)
+        if not report['ok']:
+            raise RuntimeError('Invalid helper manifest: ' + '; '.join(report['errors']))
+    return executable
 
 
 def ensure_signature(app, timings=None):
@@ -242,9 +313,14 @@ def registered_paths(app, lsregister=None):
     app = Path(app)
     identifier = bundle_identifier(app)
     dump = _lsregister(lsregister_path(lsregister), ['-dump'])
+    if dump.returncode != 0:
+        raise RuntimeError('LaunchServices registration readback failed')
     paths = []
     for block in dump.stdout.split('\n----------'):
-        if identifier not in block:
+        identifiers = [line.strip().split(':', 1)[1].strip()
+                       for line in block.splitlines()
+                       if line.strip().startswith('identifier:')]
+        if identifier not in identifiers:
             continue
         for line in block.splitlines():
             stripped = line.strip()
@@ -282,10 +358,10 @@ def ensure_single_registration(app, extra_paths=(), lsregister=None, verify=True
 
     顺序与死注册：
       * 文件还在的注册 `lsregister -u` 就能清掉；
-      * 路径已经不在磁盘上的（产物被删后留下的）`-u` 会失败 —— 只能重建数据库；
+      * 路径已经不在磁盘上的记录可能无法注销，保留在返回值里；
       * `extra_paths`（安装工作区/回滚备份）**无论 dump 里有没有**都注销一次：它们是
         同一 bundle id 的第二份候选，不该出现在任何"打开方式"列表里。
-    尽力而为：任何一步失败都不影响安装结果，返回值告诉调用方还剩什么。
+    注销尽力而为，返回值报告残留；验证读回失败则抛出错误，不宣称清理成功。
     """
     app = Path(app)
     lsregister = lsregister_path(lsregister)
@@ -300,31 +376,14 @@ def ensure_single_registration(app, extra_paths=(), lsregister=None, verify=True
             _lsregister(lsregister, ['-u', str(path)], timeout=30)
         except Exception:
             pass
-    # `lsregister -u` 对**已经不在磁盘上**的路径是拒绝的（它会说
-    # "Bundle node not found on disk"），所以死注册只能靠重建数据库清掉。
-    # 正规安装自己也算：装机被删/回滚掉之后，它那条记录同样清不掉。
-    #
-    # 2026-09-30：这里过去是"只要 stale 非空就重建"，而装机时最常见的 stale
-    # 恰恰是 **xcodebuild 刚注册、文件还在** 的构建产物（`lsregister -u` 对它
-    # 有效）。为它重建整个 LaunchServices 数据库，每次装机白付约 8 s
-    # （实测 registration 阶段 15.0 s 对 6.9 s）。现在只有"文件已不在磁盘上"
-    # 的死注册才触发重建。
-    if any(not path.exists() for path in [*stale, app]):
-        try:
-            _lsregister(lsregister, ['-kill', '-r', '-domain', 'local',
-                                     '-domain', 'system', '-domain', 'user'], timeout=120)
-        except Exception:
-            pass
     try:
         _lsregister(lsregister, ['-f', str(app)], timeout=30)
     except Exception:
         pass
     if not verify:
         return []
-    try:
-        return [path for path in registered_paths(app, lsregister) if path != app]
-    except Exception:
-        return []
+    # 读回失败必须暴露错误，不能用空列表声称注册清理成功。
+    return [path for path in registered_paths(app, lsregister) if path != app]
 
 
 def seal_rollback_backup(backup, lsregister=None):
@@ -431,10 +490,11 @@ def install(source, destination, root, runtime=None, timeout=15, timings=None, l
     if source == destination or source in destination.parents or destination in source.parents:
         raise RuntimeError('Source and destination must be separate bundles')
     with stage(timings, 'validate_source'):
-        validate(source)
+        source_executable = validate(source)
+    destination_executable = None
     if destination.exists():
         with stage(timings, 'validate_destination'):
-            validate(destination, require_helper=False)
+            destination_executable = validate(destination, require_helper=False)
     runtime = runtime or Runtime()
     sock = root / 'taskd.endpoint.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -444,16 +504,24 @@ def install(source, destination, root, runtime=None, timeout=15, timings=None, l
     swapped = False
     try:
         with stage(timings, 'copy_bundle'):
-            shutil.copytree(source, staged, symlinks=True)
+            # Preserve macOS code-signature metadata on signed text helpers and
+            # manifests as well as Mach-O signatures. copytree loses those
+            # extended attributes and needlessly invalidates a valid release.
+            subprocess.run(['/usr/bin/ditto', '--rsrc', '--extattr', str(source), str(staged)],
+                           check=True, capture_output=True)
         with stage(timings, 'validate_staged'):
             validate(staged)
         # 先补签暂存副本再替换：装出去的 bundle 一定是自洽的；中途失败也不会
         # 留下一个签坏了的正式安装。
         with stage(timings, 'signature'):
             signature_repaired = ensure_signature(staged, timings)
+        with stage(timings, 'validate_signed_staged'):
+            validate(staged)
         with stage(timings, 'scan_processes'):
             rows = runtime.processes()
-        executables = {str(app / 'Contents/MacOS/gmgn radio') for app in (source, destination)}
+        executables = {str(source / 'Contents/MacOS' / source_executable)}
+        if destination_executable is not None:
+            executables.add(str(destination / 'Contents/MacOS' / destination_executable))
         apps = [(pid, command) for pid, command in rows if command in executables]
         with stage(timings, 'stop_app'):
             for pid, command in apps:

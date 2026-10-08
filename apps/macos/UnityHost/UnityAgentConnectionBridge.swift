@@ -7,7 +7,7 @@ final class UnityAgentConnectionBridge {
     private let account: any CodexAccountServicing
     private let backends: () -> [[String: Any]]
     private let currentBackend: () -> String
-    private let selectBackend: (String) -> Bool
+    private let selectBackend: @MainActor (String) async -> Bool
     private var task: Task<Void, Never>?
     private var state: CodexAccountState = .unavailable
     private var notice: String?
@@ -17,12 +17,12 @@ final class UnityAgentConnectionBridge {
 
     init(account: any CodexAccountServicing = CodexAgentAccountService(),
          backends: @escaping () -> [[String: Any]], currentBackend: @escaping () -> String,
-         selectBackend: @escaping (String) -> Bool) {
+         selectBackend: @escaping @MainActor (String) async -> Bool) {
         self.account = account; self.backends = backends
         self.currentBackend = currentBackend; self.selectBackend = selectBackend
     }
 
-    func refresh() { _ = command(["op": "agent.status"]) }
+    func refresh() { _ = accountCommand(["op": "agent.status"]) }
     func stop() { task?.cancel(); task = nil }
 
     var snapshot: [String: Any] {
@@ -39,13 +39,17 @@ final class UnityAgentConnectionBridge {
                 "notice": notice as Any? ?? NSNull(), "hasError": hasError]
     }
 
-    func command(_ value: [String: Any]) -> Bool {
+    func command(_ value: [String: Any]) async -> Bool {
         guard let op = value["op"] as? String else { return false }
         if op == "agent.backend" || (op == "agent.save" && value["backendID"] != nil) {
-            guard let id = (value["backendID"] ?? value["id"]) as? String,
-                  selectBackend(id), currentBackend() == id else { return false }
+            guard let id = (value["backendID"] ?? value["id"]) as? String else { return false }
+            guard await selectBackend(id), currentBackend() == id else { return false }
             return true
         }
+        return accountCommand(value)
+    }
+    private func accountCommand(_ value: [String: Any]) -> Bool {
+        guard let op = value["op"] as? String else { return false }
         guard ["agent.status", "agent.login", "agent.logout"].contains(op), task == nil else { return false }
         hasError = false; notice = nil
         task = Task { [weak self] in

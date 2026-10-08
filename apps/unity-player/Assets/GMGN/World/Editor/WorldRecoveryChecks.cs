@@ -16,7 +16,6 @@ namespace GMGN.UnityPlayer.World.Editor
         public static async void RunFormalSofa()
         {
             GameObject probeRoot = null;
-            BuiltinDeviceCatalogPanel panel = null;
             try {
                 var fixturePath = Environment.GetEnvironmentVariable("GMGN_ASSET_PROBE_FIXTURE");
                 Require(!string.IsNullOrEmpty(fixturePath), "Explicit read-only catalog/state fixture required");
@@ -43,18 +42,15 @@ namespace GMGN.UnityPlayer.World.Editor
                 typeof(WorldRuntimeBridge).GetMethod("PublishInventory", binding).Invoke(bridge, new object[] { state["objectStates"] });
                 Require(inventory?.Count == 1 && (bool?)inventory[0]["modelReady"] == true,
                     "Actual PublishInventory must publish modelReady for the recovered inventory");
-                var ui = new UnityEngine.UIElements.VisualElement();
-                panel = new BuiltinDeviceCatalogPanel(ui); panel.SetInventory(inventory);
-                var button = ui.Query<UnityEngine.UIElements.Button>().ToList().Single(value => value.text == (string)inventory[0]["name"]);
-                Require(button.enabledSelf, "Actual inventory panel button must be enabled");
-                Debug.Log("[FormalSofaProbe] PASS actual catalog resolve -> RestoreState inventory inactive model -> PublishInventory modelReady -> enabled inventory button; no placement or formal writes");
+                Require(!string.IsNullOrEmpty((string)inventory[0]["objectID"]), "GPUI inventory projection retains the actual recovered identity");
+                Debug.Log("[FormalSofaProbe] PASS actual catalog resolve -> RestoreState inventory inactive model -> PublishInventory modelReady and identity; no placement or formal writes");
                 GMGN.UnityPlayer.Editor.CameraKeyboardChecks.Validate();
                 UnityEditor.EditorApplication.Exit(0);
             } catch (Exception error) {
                 Debug.LogError("[FormalSofaProbe] code=" + WorldAssetFailureDiagnostics.Code(error));
                 Debug.LogException(error);
                 UnityEditor.EditorApplication.Exit(1);
-            } finally { panel?.Dispose(); if (probeRoot != null) UnityEngine.Object.DestroyImmediate(probeRoot); }
+            } finally { if (probeRoot != null) UnityEngine.Object.DestroyImmediate(probeRoot); }
         }
         public static void RunPreparedGrip()
         {

@@ -33,7 +33,9 @@ struct ScreenPanelView: View {
         VStack(alignment: .leading, spacing: 10) {
             header
             ScreenContentField(draftURL: $draftURL)
-            if store.snapshots.isEmpty {
+            if store.persistenceStatus != "ready" {
+                Text(store.persistenceNotice).font(.system(size: 12)).foregroundStyle(.secondary)
+            } else if store.snapshots.isEmpty {
                 Text("这个空间里还没有电视。生成一件电视（名字里带 TV / 屏幕 / 电视），或者在下面手动指定一件物件。")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
@@ -180,18 +182,26 @@ struct ScreenPanelView: View {
             }
             HStack(spacing: 6) {
                 Button("就按这个大小") {
-                    lastNotice = store.calibrateScreen(
+                    guard !isBusy else { return }; isBusy = true
+                    Task { @MainActor in
+                    lastNotice = await store.calibrateScreen(
                         objectID: snapshot.objectID,
                         widthMeters: Float(widthDraft),
                         heightMeters: Float(heightDraft),
                         centerHeightMeters: Float(centerDraft)
                     ).message
                     calibratingObjectID = nil
+                    isBusy = false
+                    }
                 }
                 .buttonStyle(.plain).font(.system(size: 11))
                 Button("让系统自己认") {
-                    lastNotice = store.designateScreen(objectID: snapshot.objectID, size: nil).message
+                    guard !isBusy else { return }; isBusy = true
+                    Task { @MainActor in
+                    lastNotice = await store.designateScreen(objectID: snapshot.objectID, size: nil).message
                     calibratingObjectID = nil
+                    isBusy = false
+                    }
                 }
                 .buttonStyle(.plain).font(.system(size: 11))
             }

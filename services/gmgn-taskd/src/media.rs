@@ -1719,7 +1719,7 @@ async fn bounded_output<R: tokio::io::AsyncRead + Unpin>(mut stream: R) -> Resul
         output.extend_from_slice(&buf[..n]);
     }
 }
-fn youtube_playlist_input(input: &Value) -> Result<(String, Option<String>, usize, usize)> {
+pub(crate) fn youtube_playlist_input(input: &Value) -> Result<(String, Option<String>, usize, usize)> {
     let url = reqwest::Url::parse(input["pageURL"].as_str().ok_or("invalid_media_input")?).map_err(|_| "invalid_media_input")?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some()
         || url.port().is_some() || !matches!(url.host_str(), Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be")) {
@@ -2574,16 +2574,25 @@ mod tests {
         server.abort();
     }
 
+    struct DownloadBodyGate {
+        current: watch::Sender<bool>,
+        next: watch::Sender<bool>,
+        release: tokio::sync::Semaphore,
+    }
     struct Fixture {
         root: PathBuf,
         media: Arc<Media>,
         helpers: Helpers,
         bytes: Vec<u8>,
         requests: Arc<AtomicUsize>,
+        body_gate: Option<Arc<DownloadBodyGate>>,
         server: tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
+            if let Some(gate) = &self.body_gate {
+                gate.release.close();
+            }
             self.server.abort();
         }
     }
@@ -2612,12 +2621,21 @@ mod tests {
             let data = bytes.clone();
             let mode = mode.to_owned();
             let helper_mode = mode.clone();
+            let body_gate = (mode == "gated_download").then(|| {
+                Arc::new(DownloadBodyGate {
+                    current: watch::channel(false).0,
+                    next: watch::channel(false).0,
+                    release: tokio::sync::Semaphore::new(0),
+                })
+            });
+            let server_gate = body_gate.clone();
             let server = tokio::spawn(async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
                     let bytes = data.clone();
                     let requests = requests_inner.clone();
                     let mode = mode.clone();
+                    let body_gate = server_gate.clone();
                     tokio::spawn(async move {
                         let mut stream = stream;
                         if mode.starts_with("source_eof") {
@@ -2637,6 +2655,7 @@ mod tests {
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
                         reader.read_line(&mut line).await.unwrap();
+                        let request_path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
                         let mut range = None;
                         loop {
                             line.clear();
@@ -2680,6 +2699,20 @@ mod tests {
                         let socket = reader.get_mut();
                         if socket.write_all(header.as_bytes()).await.is_err() {
                             return;
+                        }
+                        // The 64KiB index probe must remain a real, unblocked
+                        // read. Hold only the first full-download range body:
+                        // both jobs stay downloading until the test releases
+                        // or cancels them, independent of runner load.
+                        if let Some(gate) = &body_gate {
+                            if start == 0 && data.len() == RANGE_BYTES as usize {
+                                match request_path.as_str() {
+                                    "/current" => { gate.current.send_replace(true); }
+                                    "/next" => { gate.next.send_replace(true); }
+                                    _ => panic!("unexpected gated download source"),
+                                }
+                                let Ok(_permit) = gate.release.acquire().await else { return; };
+                            }
                         }
                         if mode == "truncated" {
                             let _ = socket.write_all(&data[..data.len() / 2]).await;
@@ -2732,6 +2765,16 @@ mod tests {
                 let metadata=json!({"title":"fixture list","entries":[{"id":"aaaaaaaaaaa"},{"id":"bbbbbbbbbbb"},{"id":"ccccccccccc"}]});
                 std::fs::write(&helper,format!("#!/bin/sh\nprintf x >> '{}'\ncase \" $* \" in *' --flat-playlist '*) printf '%s' '{}' ;; *) printf '%s' '{}' ;; esac\n",count.display(),metadata,info)).unwrap();
             }
+            if helper_mode == "gated_download" {
+                let mut current = info.clone();
+                current["url"] = json!(format!("http://{address}/current"));
+                let mut next = info.clone();
+                next["url"] = json!(format!("http://{address}/next"));
+                std::fs::write(&helper, format!(
+                    "#!/bin/sh\nprintf x >> '{}'\ncase \" $* \" in *aaaaaaaaaaa*) printf '%s' '{}' ;; *) printf '%s' '{}' ;; esac\n",
+                    count.display(), current, next
+                )).unwrap();
+            }
             std::fs::write(&deno, "#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
             {
@@ -2768,6 +2811,7 @@ mod tests {
                 helpers,
                 bytes,
                 requests,
+                body_gate,
                 server,
             }
         }
@@ -2824,7 +2868,8 @@ mod tests {
                 assert_eq!(result["descriptor"]["video"]["bytes"], 128);
                 assert!(result["descriptor"]["audio"].is_null());
                 assert_eq!(paths.len(), 1);
-                assert_eq!(f.requests.load(Ordering::SeqCst), 5);
+                // Each of the two source resolutions also probes the video index prefix.
+                assert_eq!(f.requests.load(Ordering::SeqCst), 7);
                 f.media
                     .set_state(queued["cacheKey"].as_str().unwrap(), "resolving", None)
                     .await
@@ -2846,7 +2891,8 @@ mod tests {
             } else {
                 assert_eq!(result["error"], "media_download_connect");
                 assert!(paths.is_empty());
-                assert_eq!(f.requests.load(Ordering::SeqCst), 8);
+                // Two video index probes, two video downloads, and six audio attempts.
+                assert_eq!(f.requests.load(Ordering::SeqCst), 10);
             }
         }
     }
@@ -2863,7 +2909,8 @@ mod tests {
         let track = &ready["descriptor"]["video"];
         assert_eq!(track["bytes"], f.bytes.len());
         assert_eq!(track["sha256"], format!("{:x}", Sha256::digest(&f.bytes)));
-        assert_eq!(f.requests.load(Ordering::SeqCst), 3);
+        // One video index prefix probe precedes the three full-download ranges.
+        assert_eq!(f.requests.load(Ordering::SeqCst), 4);
         assert_eq!(f.helper_calls(), 1);
         assert_eq!(f.prepare("abcdefghijk", "screen-a").await["state"], "ready");
         assert_eq!(f.helper_calls(), 1);
@@ -2894,7 +2941,8 @@ mod tests {
     async fn wrong_range_truncated_eof_and_item_limit_never_publish_ready() {
         for (mode, limit, expected) in [
             ("wrong_range", ITEM_LIMIT, "media_invalid_range"),
-            ("truncated", ITEM_LIMIT, "media_download_body"),
+            // The index prefix probe rejects the truncated body before full download.
+            ("truncated", ITEM_LIMIT, "media_download_failed"),
             ("normal", 32, "media_cache_limit"),
         ] {
             let f = Fixture::new(mode, 128, limit, CACHE_LIMIT).await;
@@ -3285,21 +3333,33 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_next_resolves_while_current_is_still_downloading() {
-        let f = Fixture::new("slow", 4 * 1024 * 1024, ITEM_LIMIT, CACHE_LIMIT).await;
+        let f = Fixture::new("gated_download", 4 * 1024 * 1024, ITEM_LIMIT, CACHE_LIMIT).await;
         let list = f.media.request("media_playlist_commit", json!({"playlistID":"parallel-next","baseRevision":0,
             "items":[{"pageURL":"https://youtu.be/aaaaaaaaaaa"},{"pageURL":"https://youtu.be/bbbbbbbbbbb"},
                      {"pageURL":"https://youtu.be/ccccccccccc"}]})).await.unwrap();
         let current = list["items"][0]["cacheKey"].as_str().unwrap();
         let next = list["items"][1]["cacheKey"].as_str().unwrap();
         let later = list["items"][2]["cacheKey"].as_str().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if f.helper_calls() == 2 && f.media.status(current).await.unwrap()["state"] == "downloading"
-                && f.media.status(next).await.unwrap()["state"] == "downloading" { break; }
-            assert!(tokio::time::Instant::now() < deadline, "next extraction waited for current full download");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let gate = f.body_gate.as_ref().unwrap();
+        let mut current_started = gate.current.subscribe();
+        let wait_current = async {
+            while !*current_started.borrow_and_update() {
+                current_started.changed().await.unwrap();
+            }
+        };
+        tokio::select! {
+            _ = wait_current => {}
+            result = f.terminal(current) => panic!("current did not enter the controlled download window: {result}"),
         }
+        let mut next_started = gate.next.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*next_started.borrow_and_update() {
+                next_started.changed().await.unwrap();
+            }
+        }).await.expect("next extraction waited for current full download");
+        assert_eq!(f.helper_calls(), 2);
         assert_eq!(f.media.status(current).await.unwrap()["state"], "downloading");
+        assert_eq!(f.media.status(next).await.unwrap()["state"], "downloading");
         assert_ne!(f.media.status(next).await.unwrap()["state"], "queued");
         assert_eq!(f.media.status(later).await.unwrap()["state"], "missing");
         assert!(f.media.state.lock().await.active.len() <= 2);

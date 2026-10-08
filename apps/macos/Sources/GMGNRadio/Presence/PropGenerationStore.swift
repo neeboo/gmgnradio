@@ -55,6 +55,13 @@ struct PropGenerationRecord: Codable, Identifiable, Sendable {
             messages.onMessage = { [weak self] consumer, message in self?.onMessage?(consumer, message) }
         }
     }
+    func wishControlRequest(method: String, params: Data) async throws -> Data {
+        guard let controls = daemon as? any PropTaskControlConnecting else {
+            throw PropTaskDaemonError.unavailable
+        }
+        return try await controls.controlRequest(method: method, params: params)
+    }
+
     func configure(endpoint: URL, token: String) throws {
         clearConfiguration()
         try PropTaskDaemonClient.validateConfiguration(endpoint: endpoint, token: token)

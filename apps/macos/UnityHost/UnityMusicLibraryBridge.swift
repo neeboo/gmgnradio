@@ -8,6 +8,7 @@ final class UnityMusicLibraryBridge {
     private let root: URL
     private let runtime: MusicRuntime
     private let accounts: MusicAccountCommandService
+    private let accountAuthority: RustMusicAccountClient
     private let sessions: UnityMusicSessions
     private let webLogin = MusicProviderWebLoginController(dataStore: .nonPersistent())
     private let appleMusic = AppleMusicSource()
@@ -25,9 +26,10 @@ final class UnityMusicLibraryBridge {
     private var task: Task<Void, Never>?
     private var selection: Task<Void, Never>?
     private var closed = false
-    private var playback = UnityMusicSelectionState<MusicCandidate>()
+    private let playback: RustMusicSelectionProjection<MusicCandidate>
     private var preparationGeneration: UInt64 = 0
     private var programQueue: ProgramPlaybackQueue?
+    private let programCall: RustMusicProgramClient.Call
     private var activeProgram: ProgramPlan?
     var queue: [MusicCandidate] { playback.queue }
     var index: Int { playback.index }
@@ -38,7 +40,7 @@ final class UnityMusicLibraryBridge {
     var onToolPrepared: ((URL, MusicLyrics?, MusicCandidate) -> Bool)?
     /// Host loads and confirms playback on its sole real player.
     var onProgramPrepared: (@MainActor (URL, MusicLyrics?, MusicCandidate) async throws -> Void)?
-    var onProgramSlotCommitted: (@MainActor (Int) -> Void)?
+    var onProgramSlotCommitted: (@MainActor (Int) async throws -> Void)?
     var onProgramPlaybackReleased: (@MainActor () -> Void)?
 
     @discardableResult
@@ -63,7 +65,7 @@ final class UnityMusicLibraryBridge {
         selection?.cancel(); selection = nil
         guard !closed, let accept = onProgramPrepared else { throw DJAgentMusicLibraryError.unsupported }
         // Preflight a replacement without discarding the currently playing queue.
-        let proposedQueue = ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: MusicRuntimePlaybackPreparer(runtime: runtime)))
+        let proposedQueue = ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: MusicRuntimePlaybackPreparer(runtime: runtime)), call: programCall)
         if let selectedIndex {
             guard plan.slots.indices.contains(selectedIndex) else { throw DJAgentMusicLibraryError.trackNotFound }
             try await proposedQueue.select(plan, at: selectedIndex)
@@ -93,7 +95,7 @@ final class UnityMusicLibraryBridge {
               let accept = onToolPrepared else { throw CancellationError() }
         preparationGeneration &+= 1
         let lease = preparationGeneration
-        let restoredQueue = ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: MusicRuntimePlaybackPreparer(runtime: runtime)))
+        let restoredQueue = ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: MusicRuntimePlaybackPreparer(runtime: runtime)), call: programCall)
         try await restoredQueue.load(plan, startingAt: savedIndex)
         guard let prepared = restoredQueue.current,
               let index = plan.slots.firstIndex(where: { $0.track.id == prepared.slot.track.id }),
@@ -114,11 +116,10 @@ final class UnityMusicLibraryBridge {
               self.index == index, queue.indices.contains(index), revised.slots.indices.contains(index),
               queue[index].id == revised.slots[index].track.id else { throw DJAgentMusicLibraryError.trackNotFound }
         let lease = preparationGeneration
-        await programQueue.replaceUpcoming(with: Array(revised.slots.dropFirst(index + 1)))
+        try await programQueue.replaceUpcoming(programID: revised.brief.id, programRevision: revised.revision, startingAt: index + 1)
         try Task.checkCancellation()
-        guard !closed, lease == preparationGeneration,
-              let ticket = playback.begin(queue: revised.slots.map { $0.track }, index: index),
-              playback.commit(ticket, accepted: true) else { throw CancellationError() }
+        guard !closed, lease == preparationGeneration else { throw CancellationError() }
+        try playback.client.replaceUpcoming(queue: revised.slots.map { $0.track }, ids: revised.slots.map { $0.track.id })
         activeProgram = revised
     }
 
@@ -126,7 +127,7 @@ final class UnityMusicLibraryBridge {
         guard !closed, let plan = activeProgram, queue.indices.contains(index) else { throw DJAgentMusicLibraryError.trackNotFound }
         preparationGeneration &+= 1
         let lease = preparationGeneration
-        let proposedQueue = ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: MusicRuntimePlaybackPreparer(runtime: runtime)))
+        let proposedQueue = ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: MusicRuntimePlaybackPreparer(runtime: runtime)), call: programCall)
         try await proposedQueue.select(plan, at: index)
         guard let prepared = proposedQueue.current, prepared.slot.track.id == plan.slots[index].track.id,
               case let .localFile(url) = prepared.target else { throw DJAgentMusicLibraryError.sourceUnsupported }
@@ -143,7 +144,7 @@ final class UnityMusicLibraryBridge {
         try Task.checkCancellation()
         guard !closed, lease == preparationGeneration, playback.commit(ticket, accepted: true) else { throw CancellationError() }
         programQueue = proposedQueue
-        onProgramSlotCommitted?(index)
+        try await onProgramSlotCommitted?(index)
         return .init(playlistID: plan.brief.id, trackID: prepared.slot.track.id)
     }
 
@@ -185,15 +186,15 @@ final class UnityMusicLibraryBridge {
             return .init(playlistID: playlistID, tracks: playlist.tracks[start..<end].map(Self.toolTrack), offset: offset,
                          nextOffset: end < playlist.trackCount ? end : nil, totalTrackCount: playlist.trackCount)
         }
-        let page = try await runtime.fetchPlaylistPage(providerID: playlist.providerID, playlistID: playlistID, offset: offset, limit: limit)
+        let ticket = try await libraryStore.beginPage(playlistID: playlistID, offset: offset,
+            limit: limit, cacheMode: "window")
+        defer { Task { await self.libraryStore.endPage(ticket) } }
+        let page = try await runtime.fetchPlaylistPage(providerID: ticket.providerID,
+            playlistID: ticket.playlistID, offset: ticket.offset, limit: ticket.limit)
         try Task.checkCancellation()
-        guard !closed, UnityMusicPageBoundary.isValid(offset: page.offset, expectedOffset: offset,
-            returnedCount: page.tracks.count, total: page.totalTrackCount) else { throw DJAgentMusicLibraryError.invalidArguments }
-        if let i = playlists.firstIndex(where: { $0.id == playlistID }), playlists[i].tracks.count == offset {
-            libraryStore.append(page)
-            try await libraryStore.flush()
-            playlists = libraryStore.playlists.filter { !disconnectedProviders.contains($0.providerID) }
-        }
+        guard !closed else { throw DJAgentMusicLibraryError.interrupted }
+        try await libraryStore.append(page, ticket: ticket)
+        playlists = libraryStore.playlists.filter { !disconnectedProviders.contains($0.providerID) }
         return .init(playlistID: playlistID, tracks: page.tracks.map(Self.toolTrack), offset: offset,
                      nextOffset: page.hasMore && !page.tracks.isEmpty ? offset + page.tracks.count : nil, totalTrackCount: page.totalTrackCount)
     }
@@ -250,25 +251,34 @@ final class UnityMusicLibraryBridge {
     }
 
     func toolNavigate(_ delta: Int) async throws -> DJAgentMusicPreparation {
-        guard delta == -1 || delta == 1, index >= 0, index < Int.max else {
-            throw DJAgentMusicLibraryError.invalidArguments
-        }
-        return try await toolSelect(index + delta)
+        let ticket = try playback.client.navigate(delta: delta)
+        return try await toolSelect(ticket.index)
     }
 
-    init(root: URL, runtime suppliedRuntime: MusicRuntime? = nil, storage: MusicStorageClient? = nil) {
+    init(root: URL, runtime suppliedRuntime: MusicRuntime? = nil, storage: MusicStorageClient? = nil,
+         playbackClient: RustMusicPlaybackClient? = nil, programCall: RustMusicProgramClient.Call? = nil) {
         self.root = root
+        let programDaemon = PropTaskDaemonClient(root: root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true))
+        self.programCall = programCall ?? { try await programDaemon.call(method: $0, params: $1) }
+        playback = RustMusicSelectionProjection(client: playbackClient ?? RustMusicPlaybackClient(root: root), identity: { $0.id })
         source = ProcessInfo.processInfo.environment["GMGN_UNITY_MUSIC_LIBRARY_ROOT"].map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/ai.gmgn.radio")
-        let sessions = UnityMusicSessions(directory: source.appendingPathComponent("secrets/music-sessions"), root: root)
+        let accountAuthority = RustMusicAccountClient(applicationSupportBase: root)
+        self.accountAuthority = accountAuthority
+        let sessions = UnityMusicSessions(directory: source.appendingPathComponent("secrets/music-sessions"), root: root, authority: accountAuthority)
         self.sessions = sessions
-        accounts = MusicAccountCommandService(sessions: sessions, neteaseClient: NeteaseMusicProviderClient(), qqMusicClient: QQMusicProviderClient())
+        accounts = MusicAccountCommandService(authority: accountAuthority, sessions: sessions)
         libraryStore = SyncedMusicLibraryStore(storage: storage ?? MusicStorageClient(supportRoot: root,
             legacyFiles: [root.appendingPathComponent("music-library.json")]))
+        let cacheEndpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        let cacheAuthority = RustMusicCacheClient(endpointFile: cacheEndpoint.endpointFile,
+            helperPath: cacheEndpoint.helperPath, allowsLaunching: false,
+            taskRoot: root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true),
+            hostSessionID: UUID().uuidString)
         runtime = suppliedRuntime ?? MusicRuntime(netease: NeteaseMusicSource(sessions: sessions, client: NeteaseMusicProviderClient()),
             qqMusic: QQMusicSource(sessions: sessions, client: QQMusicProviderClient()),
-            appleMusic: AppleMusicSource(), cache: StreamingMusicCache(rootURL: root.appendingPathComponent("music-cache")))
-        if FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path) { disconnectedProviders.insert(.appleMusic) }
+            appleMusic: AppleMusicSource(), cache: StreamingMusicCache(authority: cacheAuthority),
+            programClient: RustMusicProgramClient(root: root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true)))
     }
     var settingsSnapshot: [String: Any] {
         ["providers": [MusicProviderID.netease, .qqMusic, .appleMusic].map { provider in
@@ -287,18 +297,18 @@ final class UnityMusicLibraryBridge {
             if op == "music.load" {
                 for provider in [MusicProviderID.netease, .qqMusic] {
                     accountStates[provider] = await accounts.status(providerID: provider)
-                    if (try? await sessions.isDisabled(provider)) == true { disconnectedProviders.insert(provider) }
+                    if let view = try? await accountAuthority.account(provider) { adoptAccount(view, provider: provider) }
                 }
-                if FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path) { disconnectedProviders.insert(.appleMusic) }
-                accountStates[.appleMusic] = disconnectedProviders.contains(.appleMusic) ? .disconnected : appleState(await appleMusic.access())
+                do { try await refreshAppleAccount(requestAuthorization: false) }
+                catch { accountStates[.appleMusic] = .unavailable }
                 return
             }
             do {
                 accountError = false
                 if op == "music.disconnect" {
-                    if provider != .appleMusic { try await accounts.disconnect(providerID: provider); await webLogin.clearSession(providerID: provider) }
-                    disconnectedProviders.insert(provider); accountStates[provider] = .disconnected
-                    if provider == .appleMusic { try Data().write(to: root.appendingPathComponent("apple-music-disconnected"), options: .atomic) }
+                    let receipt = try await accountAuthority.disconnect(provider)
+                    adoptAccount(receipt, provider: provider)
+                    if provider != .appleMusic { await webLogin.clearSession(providerID: provider) }
                     try await seedLibrary()
                     libraryStore.remove(providerID: provider)
                     try await libraryStore.flush()
@@ -308,20 +318,15 @@ final class UnityMusicLibraryBridge {
                 }
                 if op == "music.connect" {
                     if provider == .appleMusic {
-                        let state = appleState(await appleMusic.requestAuthorization())
-                        guard state == .connected else { throw MusicProviderClientError.playbackUnavailable }
-                        accountStates[provider] = state
+                        try await refreshAppleAccount(requestAuthorization: true)
+                        guard accountStates[provider] == .connected else { throw MusicProviderClientError.playbackUnavailable }
                     } else {
                         accountStates[provider] = .authorizing
                         accountNotice = "请在官方页面完成登录。"
                         await webLogin.clearSession(providerID: provider)
                         let cookie = try await webLogin.login(providerID: provider)
                         try await accounts.connect(providerID: provider, cookie: cookie)
-                        accountStates[provider] = .connected
-                    }
-                    disconnectedProviders.remove(provider)
-                    if provider == .appleMusic, FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path) {
-                        try FileManager.default.removeItem(at: root.appendingPathComponent("apple-music-disconnected"))
+                        adoptAccount(try await accountAuthority.account(provider), provider: provider)
                     }
                 }
                 guard accountStates[provider] == .connected else { throw MusicProviderClientError.playbackUnavailable }
@@ -345,8 +350,19 @@ final class UnityMusicLibraryBridge {
         }
         return true
     }
-    private func appleState(_ access: MusicSourceAccess) -> MusicAccountAuthorizationState {
-        switch access { case .local: .connected; case let .accountRequired(state): state }
+    private func adoptAccount(_ view: RustMusicAccountClient.Account, provider: MusicProviderID) {
+        accountStates[provider] = view.state
+        if view.disabled { disconnectedProviders.insert(provider) } else { disconnectedProviders.remove(provider) }
+    }
+    private func refreshAppleAccount(requestAuthorization: Bool) async throws {
+        let current = try await accountAuthority.account(.appleMusic)
+        if current.revision == 0 {
+            _ = try await accountAuthority.importLegacy(.appleMusic, session: nil,
+                disabled: FileManager.default.fileExists(atPath: root.appendingPathComponent("apple-music-disconnected").path))
+        }
+        let facts = await appleMusic.accountAuthorizationFacts(requestAuthorization: requestAuthorization)
+        adoptAccount(try await accountAuthority.appleAuthorization(authorization: facts.authorization,
+            hasPlayableSubscription: facts.hasPlayableSubscription, reconnect: requestAuthorization), provider: .appleMusic)
     }
     private func seedLibrary() async throws {
         try await libraryStore.reload()
@@ -395,23 +411,24 @@ final class UnityMusicLibraryBridge {
                 // asynchronously, so the queue really includes the entire playlist.
                 while tracks.count < playlist.trackCount {
                     try Task.checkCancellation()
-                    let page = try await self.runtime.fetchPlaylistPage(providerID: playlist.providerID,
-                        playlistID: playlist.id, offset: tracks.count, limit: 200)
-                    guard UnityMusicPageBoundary.isValid(offset: page.offset, expectedOffset: tracks.count,
-                        returnedCount: page.tracks.count, total: page.totalTrackCount) else {
+                    let ticket = try await self.libraryStore.beginPage(playlistID: playlist.id,
+                        offset: tracks.count, limit: 200, strict: true)
+                    do {
+                        let page = try await self.runtime.fetchPlaylistPage(providerID: ticket.providerID,
+                            playlistID: ticket.playlistID, offset: ticket.offset, limit: ticket.limit)
+                        try Task.checkCancellation()
+                        guard !self.closed else { throw CancellationError() }
+                        try await self.libraryStore.append(page, ticket: ticket)
+                    } catch {
+                        await self.libraryStore.endPage(ticket)
+                        throw error
+                    }
+                    guard let confirmed = self.libraryStore.playlist(id: id) else {
                         throw MusicProviderClientError.playbackUnavailable
                     }
-                    guard !page.tracks.isEmpty else { break }
-                    tracks.append(contentsOf: page.tracks)
-                    if !page.hasMore { break }
+                    tracks = confirmed.tracks
                 }
                 guard !self.closed, !Task.isCancelled else { return }
-                let full = MusicPlaylistSnapshot(id: playlist.id, providerID: playlist.providerID, name: playlist.name,
-                    artworkURL: playlist.artworkURL, tracks: tracks, totalTrackCount: playlist.trackCount)
-                let page = MusicPlaylistPage(playlistID: id, tracks: tracks, offset: 0,
-                    totalTrackCount: playlist.trackCount)
-                self.libraryStore.append(page)
-                try await self.libraryStore.flush()
                 self.playlists = self.libraryStore.playlists.filter { !self.disconnectedProviders.contains($0.providerID) }
                 self.publish(["status": "completed", "operation": "playlist", "playlistID": id,
                     "name": playlist.name, "provider": playlist.providerID.rawValue,
@@ -475,6 +492,7 @@ final class UnityMusicLibraryBridge {
         }
         return true
     }
-    func clearQueue() { preparationGeneration &+= 1; selection?.cancel(); selection = nil; playback.clear(); queuePlaylistID = nil; activeProgram = nil; programQueue = nil; onProgramPlaybackReleased?() }
+    func cancelPreparation() { preparationGeneration &+= 1; selection?.cancel(); selection = nil; queuePlaylistID = nil; activeProgram = nil; programQueue = nil; onProgramPlaybackReleased?() }
+    func clearQueue() { cancelPreparation(); playback.clear() }
     func close() { preparationGeneration &+= 1; closed = true; task?.cancel(); selection?.cancel(); accountTask?.cancel(); webLogin.cancel() }
 }

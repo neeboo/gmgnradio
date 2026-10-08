@@ -16,6 +16,13 @@ guard let wireStart = app.range(of: "let observationScopeID = UUID().uuidString"
     exit(1)
 }
 let wiring = String(app[wireStart.lowerBound..<wireEnd.lowerBound])
+let unityHost = try String(contentsOf: root.appendingPathComponent("apps/macos/UnityHost/UnityMediaHost.swift"), encoding: .utf8)
+guard wiring.contains("context.onRustEventsPublished ="), wiring.contains("authorityFact: true"),
+      unityHost.contains("composition.context.onRustEventsPublished ="),
+      unityHost.contains("scopeID: \"\", authorityFact: true") else {
+    print("FAIL: actual App and UnityHost do not wire durable authority observations")
+    exit(1)
+}
 guard try String(contentsOf: contextSource, encoding: .utf8).contains("onEventsPublished") else {
     print("FAIL: real world events are not delivered to the resident loop")
     exit(1)
@@ -98,6 +105,24 @@ import WorldRuntime
         let first = ResidentWorldObservation.event(completed, worldID: manifest.worldID, scopeID: "first")
         let second = ResidentWorldObservation.event(completed, worldID: manifest.worldID, scopeID: "second")
         check(first?.id != second?.id, "reloaded same world uses separate event identity")
+        check(first?.id == "world:first:\(manifest.worldID):999", "native facts retain the observer-scoped identity namespace")
+        let authorityFirst = ResidentWorldObservation.event(completed, worldID: manifest.worldID, scopeID: "first", authorityFact: true)
+        let authoritySecond = ResidentWorldObservation.event(completed, worldID: manifest.worldID, scopeID: "second", authorityFact: true)
+        check(authorityFirst?.id == "world-fact:\(manifest.worldID):999" && authorityFirst?.id == authoritySecond?.id,
+              "the same durable database sequence retains identity across observer replacement")
+        let anotherWorld = ResidentWorldObservation.event(completed, worldID: "other-world", scopeID: "first", authorityFact: true)
+        check(anotherWorld?.id == "world-fact:other-world:999" && anotherWorld?.id != authorityFirst?.id,
+              "different authority worlds cannot collide on the same database sequence")
+        check(authorityFirst?.id != first?.id && authorityFirst?.id != second?.id,
+              "authority facts do not collide with native observer facts")
+        for kind in [WorldEventKind.timeAdvanced(duration: 1), .timeCaughtUp(duration: 1),
+                     .agentTransformUpdated(transform: context.state.agentTransform),
+                     .liveCameraChanged(camera: .init(anchorID: nil, transform: context.state.agentTransform,
+                         fieldOfViewDegrees: 60, nearPlane: 0.1, farPlane: 100))] {
+            let noise = WorldEvent(sequence: 999, revision: 999, worldTime: Date(), kind: kind)
+            check(ResidentWorldObservation.event(noise, worldID: manifest.worldID, scopeID: "first", authorityFact: true) == nil,
+                  "authority frame noise cannot become a resident fact")
+        }
         check(ResidentWorldObservation.event(WorldEvent(sequence: 1001, revision: 1001, worldTime: Date(), kind: .timeAdvanced(duration: 1)), worldID: manifest.worldID, scopeID: "fixture") == nil, "mapper excludes frame noise")
         let layoutEvent = WorldEvent(sequence: 1002, revision: 1002, worldTime: Date(), kind: .propLayoutChanged(objectID: "coffee", layoutRevision: 7))
         let layoutObservation = ResidentWorldObservation.event(layoutEvent, worldID: manifest.worldID, scopeID: "fixture")
@@ -153,12 +178,19 @@ import WorldRuntime
         wired.attach(oldContext)
         try oldContext.setWeather(.rain)
         check(wired.loop.snapshot.recentEvents.contains { $0.kind == "weather_changed" }, "production App callback delivers real world events")
+        oldContext.onRustEventsPublished?([completed])
+        check(wired.loop.snapshot.recentEvents.contains { $0.id == authorityFirst?.id },
+              "extracted production App callback uses the authority identity mapper")
         let oldIDs = Set(wired.loop.snapshot.recentEvents.map(\.id))
         let newContext = try WorldAgentContext(manifest: manifest)
         wired.attach(newContext)
         let beforeOld = wired.loop.snapshot.recentEvents.count
         try oldContext.setWeather(.clear)
+        oldContext.onRustEventsPublished?([movementDone])
         check(wired.loop.snapshot.recentEvents.count == beforeOld, "replaced context cannot pollute resident observations")
+        newContext.onRustEventsPublished?([completed])
+        check(wired.loop.snapshot.recentEvents.count == beforeOld,
+              "production App callback deduplicates the same authority fact after context replacement")
         try newContext.setWeather(.rain)
         check(wired.loop.snapshot.recentEvents.count > beforeOld && !oldIDs.contains(wired.loop.snapshot.recentEvents.last!.id), "same world reload creates distinct event identities")
         wired.spatialStage.selectedWorldID = "another-world"
@@ -196,11 +228,15 @@ func worldRuntimeHarnessFlags() -> [String] {
 let worldRuntimeFlags = worldRuntimeHarnessFlags()
 let worldRuntimeModules = worldRuntimeFlags[1]
 let objects = Array(worldRuntimeFlags.dropFirst(2))
+let authorityInputs = ["RustActivityCatalogClient", "RustWorldActivityClient", "WorldAuthorityClient",
+    "AuthorityWorldStatePersistence", "TaskdHTTPTransport", "RetryBackoff"]
+    .map { root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/" + $0 + ".swift").path }
 let compiled = try run("/usr/bin/swiftc", ["-j1", "-swift-version", "6", "-parse-as-library", "-I", worldRuntimeModules,
+    "apps/macos/Sources/GMGNRadio/Presence/RustResidentSchedulerClient.swift",
     contextSource.path, sources.appendingPathComponent("ResidentAgentLoop.swift").path,
     sources.appendingPathComponent("ResidentMemoryStore.swift").path,
     sources.appendingPathComponent("ResidentStateClient.swift").path,
     sources.appendingPathComponent("ResidentSteeringDelivery.swift").path, sources.appendingPathComponent("ResidentWorldObservation.swift").path,
-    program.path, "-o", executable.path] + objects)
+    program.path, "-o", executable.path] + authorityInputs + objects)
 guard compiled == 0 else { exit(compiled) }
 exit(try run(executable.path, []))

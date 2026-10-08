@@ -89,6 +89,7 @@ final class ResidentSystemMailBadgeButton: NSView {
 final class ResidentSystemInboxWindowController: NSWindowController, NSTableViewDelegate, NSTableViewDataSource {
     struct Row: Identifiable {
         let id: String
+        let eventID: String
         let title: String
         let status: String
         let detail: String

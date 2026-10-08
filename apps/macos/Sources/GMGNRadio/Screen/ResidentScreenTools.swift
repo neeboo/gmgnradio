@@ -205,7 +205,7 @@ protocol WorldScreenControlling: AnyObject {
     /// 手动标定（米）。这是"① 用户/编辑器标定"那一级的入口。
     func calibrateScreen(
         objectID: String, widthMeters: Float, heightMeters: Float, centerHeightMeters: Float
-    ) -> WorldScreenCommandOutcome
+    ) async -> WorldScreenCommandOutcome
 }
 
 // MARK: - 工具声明
@@ -571,11 +571,11 @@ final class WorldScreenControlRelay: WorldScreenControlling {
 
     func calibrateScreen(
         objectID: String, widthMeters: Float, heightMeters: Float, centerHeightMeters: Float
-    ) -> WorldScreenCommandOutcome {
+    ) async -> WorldScreenCommandOutcome {
         guard let live = live() else {
             return .failure(.screenSurfaceUnavailable, "画面还没接上，现在标定不了屏幕范围。")
         }
-        return live.calibrateScreen(
+        return await live.calibrateScreen(
             objectID: objectID, widthMeters: widthMeters,
             heightMeters: heightMeters, centerHeightMeters: centerHeightMeters
         )

@@ -5,6 +5,18 @@ import Foundation
 final class MusicStorageClient {
     struct Programs: Codable { let programs: [SavedDJProgram]; let pendingIDs: [String] }
     struct Library: Codable { let playlists: [MusicPlaylistSnapshot]; let revision: Int }
+    struct PageTicket: Codable, Sendable {
+        let batchID: String
+        let providerID: MusicProviderID
+        let playlistID: String
+        let offset: Int
+        let limit: Int
+    }
+    enum LibraryEdit {
+        case merge([MusicPlaylistSnapshot], batchID: String)
+        case remove(MusicProviderID)
+        case append(MusicPlaylistPage, PageTicket)
+    }
     private struct LegacyPrograms: Decodable { let programs: [SavedDJProgram] }
     private struct LegacyLibrary: Decodable { let playlists: [MusicPlaylistSnapshot] }
     private let call: @MainActor (String, [String: PropTaskJSON]) async throws -> [String: PropTaskJSON]
@@ -69,8 +81,29 @@ final class MusicStorageClient {
         return try result(await call("music_library_read", [:]), as: Library.self)
     }
     func commit(_ playlists: [MusicPlaylistSnapshot], revision: Int) async throws -> Library {
+        throw PropTaskDaemonError.invalidFrame
+    }
+    func edit(_ edit: LibraryEdit, requestID: String) async throws -> Library {
         try await importLegacy()
-        return try result(await call("music_library_commit", ["playlists": try payload(playlists),
-            "baseRevision": .number(Double(revision))]), as: Library.self)
+        var value: [String:PropTaskJSON]
+        switch edit {
+        case .merge(let incoming, let batchID):
+            value = ["kind":.string("merge"),"batchID":.string(batchID),"playlists":try payload(incoming)]
+        case .remove(let provider):
+            value = ["kind":.string("remove"),"providerID":.string(provider.rawValue)]
+        case .append(let page, let ticket):
+            value = ["kind":.string("append"),"batchID":.string(ticket.batchID),"providerID":.string(ticket.providerID.rawValue),
+                "playlistID":.string(page.playlistID),"offset":.number(Double(page.offset)),
+                "totalTrackCount":.number(Double(page.totalTrackCount)),"tracks":try payload(page.tracks)]
+        }
+        return try result(await call("music_library_edit",["requestID":.string(requestID),"edit":.object(value)]),as:Library.self)
+    }
+    func beginPage(playlistID: String, offset: Int, limit: Int, strict: Bool = false, cacheMode: String = "deduplicate") async throws -> PageTicket {
+        try await importLegacy()
+        return try result(await call("music_library_page_begin",["requestID":.string(UUID().uuidString),
+            "playlistID":.string(playlistID),"offset":.number(Double(offset)),"limit":.number(Double(limit)),"strict":.bool(strict),"cacheMode":.string(cacheMode)]),as:PageTicket.self)
+    }
+    func endPage(_ ticket: PageTicket) async throws {
+        _ = try await call("music_library_page_end",["batchID":.string(ticket.batchID)])
     }
 }

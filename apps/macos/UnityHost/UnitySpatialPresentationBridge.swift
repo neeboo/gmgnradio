@@ -27,7 +27,7 @@ final class UnitySpatialPresentationBridge {
         let continuation: CheckedContinuation<Void, Error>
     }
     private let currentWorldID: @MainActor () -> String?
-    private let changeWeather: @MainActor (WorldWeather) throws -> Void
+    private let changeWeather: @MainActor (WorldWeather) async throws -> Void
     private let timeoutNanoseconds: UInt64
     private var pending: Pending?
     private var timeout: Task<Void, Never>?
@@ -40,7 +40,7 @@ final class UnitySpatialPresentationBridge {
     private var lastReceipt: [String: Any]?
 
     init(currentWorldID: @escaping @MainActor () -> String?,
-         changeWeather: @escaping @MainActor (WorldWeather) throws -> Void,
+         changeWeather: @escaping @MainActor (WorldWeather) async throws -> Void,
          timeoutNanoseconds: UInt64 = 5_000_000_000) {
         self.currentWorldID = currentWorldID
         self.changeWeather = changeWeather
@@ -54,7 +54,7 @@ final class UnitySpatialPresentationBridge {
         let base: WorldWeather = value == .clear ? .clear : .rain
         let prior = (weather, overrideBase)
         weather = value; overrideBase = base
-        do { try changeWeather(base) }
+        do { try await changeWeather(base) }
         catch { weather = prior.0; overrideBase = prior.1; throw error }
         generation &+= 1
         try await request(worldID: world, payload: ["operation": "weather", "weather": value.rawValue])

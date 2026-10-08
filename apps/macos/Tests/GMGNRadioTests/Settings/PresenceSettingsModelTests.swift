@@ -4,32 +4,64 @@ import MotionDistribution
 import Testing
 @testable import GMGNRadio
 
+private func settingsVRM() throws -> Data {
+    var json = try JSONSerialization.data(withJSONObject: ["asset": ["version": "2.0"],
+        "extensionsUsed": ["VRMC_vrm"], "extensions": ["VRMC_vrm": ["specVersion": "1.0"]]])
+    while !json.count.isMultiple(of: 4) { json.append(0x20) }
+    var data = Data("glTF".utf8)
+    for word in [UInt32(2), UInt32(20 + json.count), UInt32(json.count), UInt32(0x4e4f534a)] {
+        var little = word.littleEndian
+        withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+    }
+    data.append(json)
+    return data
+}
+
 @MainActor
 @Suite
 struct PresenceSettingsModelTests {
     @Test
-    func rendererSpecificCompatibilityDropsOldVMDWhenSwitchingToUnityVRM() throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: "gmgn-unity-motion-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        let motions = MotionPackageStore(rootURL: root.appending(path: "motions"), bundledStudioGrooveURL: nil)
+    func rendererSpecificCompatibilityDropsOldVMDWhenSwitchingToUnityVRM() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let root = authority.root
+        let motions = authority.motionStore
         var bytes = Data("Vocaloid Motion Data 0002".utf8)
         bytes.append(Data(repeating: 0, count: 54 - bytes.count))
         let source = root.appending(path: "old.vmd")
         try bytes.write(to: source)
         let old = try motions.installMotion(from: source)
-        try motions.activate(id: old.id)
-        let runtime = StageAvatarRuntimeStore(packageStore: nil, motionPackageStore: motions)
+        let pmxStore = try authority.pmxStore()
+        let vrm = root.appendingPathComponent("settings.vrm")
+        try settingsVRM().write(to: vrm)
+        let store = PresencePackageStore(rootURL: authority.packageRoot,
+            builtInVRMs: pmxStore.builtInVRMs + [.init(id: "settings.vrm", name: "Settings VRM", url: vrm)],
+            selectionAuthority: authority.client)
+        try await authority.bind(store: store, motions: motions)
+        try await store.activateAsync(id: "private.pmx")
+        try await authority.acknowledge()
+        try await motions.activateAsync(id: old.id)
+        try await authority.acknowledge()
+        let observed = try store.listPackages().map { package in
+            PresencePackage(manifest: package.manifest, installPath: package.installPath,
+                thumbnailPath: package.thumbnailPath, isActive: package.isActive,
+                isBuiltIn: package.isBuiltIn, rendererAvailable: true)
+        }
+        _ = try await authority.client.bind(packages: observed, motions: motions.listMotions(),
+            packageRoot: store.rootURL, motionRoot: motions.rootURL, policy: "unity",
+            supportedEngines: ["orb", "pmx", "vrm"], builtInMotionIDs: [MotionPackageStore.naturalIdleID])
+        try await store.activateAsync(id: "settings.vrm")
+        try await authority.acknowledge()
+        let runtime = StageAvatarRuntimeStore(packageStore: store, motionPackageStore: motions)
         let model = PresenceSettingsModel(defaults: UserDefaults(suiteName: UUID().uuidString)!,
-            avatarRuntime: runtime, presenceStore: PresencePackageStore(rootURL: root.appending(path: "presence"), builtInVRMs: []),
-            motionStore: motions, playbackCompatibility: { engine, format in
+            avatarRuntime: runtime, presenceStore: store,
+            motionStore: motions, productSettings: RustProductSettingsClient(root: root.appendingPathComponent("TaskService")), renderPolicy: "unity", playbackCompatibility: { engine, format in
                 if engine == .vrm && format == .vmd { return .incompatible("VRMA required") }
                 return PresenceSettingsModel.motionCompatibility(avatarEngine: engine, motionFormat: format)
             })
         model.packages = [package(engine: .vrm)]
         try model.refreshEffectiveMotionForActiveAvatar()
         #expect(try motions.activeMotion().id == MotionPackageStore.naturalIdleID)
-        model.activateMotion(old)
+        do { try await model.activateMotionConfirmed(old); Issue.record("Unity VRM accepted an incompatible VMD") } catch {}
         #expect(try motions.activeMotion().id == MotionPackageStore.naturalIdleID)
         #expect(model.motionCompatibility(old) == .incompatible("VRMA required"))
         // Original SceneKit compatibility is deliberately unchanged.
@@ -263,14 +295,9 @@ struct PresenceSettingsModelTests {
     }
 
     @Test
-    func distinguishesAnInstalledPublishedMotionFromANewerUpdate() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "gmgn-settings-motion-update-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(
-            at: root,
-            withIntermediateDirectories: true
-        )
+    func distinguishesAnInstalledPublishedMotionFromANewerUpdate() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let root = authority.root
         let vmdURL = root.appending(path: "backflip.vmd")
         var vmd = Data("Vocaloid Motion Data 0002".utf8)
         vmd.append(Data(repeating: 0, count: 30 - vmd.count))
@@ -280,10 +307,7 @@ struct PresenceSettingsModelTests {
         let digest = SHA256.hash(data: vmd)
             .map { String(format: "%02x", $0) }
             .joined()
-        let motionStore = MotionPackageStore(
-            rootURL: root.appending(path: "motions"),
-            bundledStudioGrooveURL: nil
-        )
+        let motionStore = authority.motionStore
         _ = try motionStore.installPublishedMotion(
             id: "gmgn.motion.ardy-backflip",
             name: "后空翻",
@@ -292,21 +316,24 @@ struct PresenceSettingsModelTests {
             sourceURL: vmdURL,
             expectedSHA256: digest
         )
-        try motionStore.activate(id: "gmgn.motion.ardy-backflip")
+        let store = try authority.pmxStore()
+        try await authority.bind(store: store, motions: motionStore)
+        try await store.activateAsync(id: "private.pmx")
+        try await authority.acknowledge()
+        try await motionStore.activateAsync(id: "gmgn.motion.ardy-backflip")
+        try await authority.acknowledge()
         let runtime = StageAvatarRuntimeStore(
-            packageStore: nil,
+            packageStore: store,
             motionPackageStore: motionStore
         )
         let model = PresenceSettingsModel(
             defaults: UserDefaults(suiteName: UUID().uuidString)!,
             avatarRuntime: runtime,
-            presenceStore: PresencePackageStore(
-                rootURL: root.appending(path: "presence"),
-                builtInVRMs: []
-            ),
-            motionStore: motionStore
+            presenceStore: store,
+            motionStore: motionStore,
+            productSettings: RustProductSettingsClient(root: root.appendingPathComponent("TaskService"))
         )
-        model.load()
+        try model.refreshEffectiveMotionForActiveAvatar()
         let installed = try publishedMotion(
             id: "gmgn.motion.ardy-backflip",
             version: "1.2.0",

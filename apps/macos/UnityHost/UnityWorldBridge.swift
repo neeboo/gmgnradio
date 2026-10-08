@@ -6,6 +6,10 @@ import CryptoKit
 /// Explicit commands run off the render thread. No daemon or autonomy is started.
 final class UnityWorldBridge: @unchecked Sendable {
     private let endpoint: WorldAuthorityEndpoint
+    typealias PropIdentity = @Sendable (String) -> RustWorldPropClient.Identity?
+    typealias PropFacts = @Sendable (RustWorldPropClient.Identity, UInt64, UInt64) async throws -> Data
+    private let propIdentity: PropIdentity?
+    private let propFacts: PropFacts?
     private let queue = DispatchQueue(label: "ai.gmgn.unity.world-authority")
     private let geometryQueue = DispatchQueue(label: "ai.gmgn.unity.geometry-decoding")
     private let lock = NSLock()
@@ -14,13 +18,20 @@ final class UnityWorldBridge: @unchecked Sendable {
     private var closed = false
     private var generation: UInt64 = 0
     private var emittedGeneration: UInt64?
+    private var loadedFacts: Data?
+    private var meshSamples: [String: RustPropNativeMeshSampler.Sample] = [:]
+    private var importedBlobs = Set<String>()
+    private var loadedFactsVersion: UInt64 = 0
+    private var compiledFacts: (version: UInt64, context: String, data: Data)?
+    private var observedFacts: (key: String, at: Date, observation: RustWorldPropClient.Observation)?
     private var resultData = Data("{\"status\":\"idle\",\"version\":1}".utf8)
     // Accessed only on the serial authority queue. One immutable geometry cached.
     private var indexedGeometryCache: [Data: [String: Any]] = [:]
     private var indexedGeometryOrder: [Data] = []
 
-    init(root: URL) {
+    init(root: URL, propIdentity: PropIdentity? = nil, propFacts: PropFacts? = nil) {
         endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        self.propIdentity = propIdentity; self.propFacts = propFacts
     }
 
     /// Data is copied at the ABI boundary; expensive geometry decoding stays off main.
@@ -32,6 +43,7 @@ final class UnityWorldBridge: @unchecked Sendable {
         geometryQueue.async { [self] in
             defer { lock.lock(); geometryDecoding = false; lock.unlock() }
             let value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if let value, value["op"] as? String == "world.prop.loaded", adoptLoadedFacts(value) { return }
             if let value, let op = value["op"] as? String,
                ["world.placement.evaluate", "world.placement.derive"].contains(op), command(value) { return }
             let failure: [String: Any] = ["version": 1, "operation": value?["op"] as? String ?? "world.placement.evaluate",
@@ -47,8 +59,12 @@ final class UnityWorldBridge: @unchecked Sendable {
 
     /// true means accepted for background execution, not committed.
     func command(_ value: [String: Any]) -> Bool {
+        if value["op"] as? String == "world.prop.loaded" { return adoptLoadedFacts(value) }
+        if let operation = value["op"] as? String, ["world.prop.preview", "world.prop.command"].contains(operation) {
+            return submitProp(value)
+        }
         guard let operation = value["op"] as? String,
-              ["world.snapshot", "world.commit", "world.placement.evaluate", "world.placement.derive"].contains(operation),
+              ["world.snapshot", "world.placement.evaluate", "world.placement.derive"].contains(operation),
               let worldID = value["worldID"] as? String, !worldID.isEmpty,
               worldID.utf8.count <= 256,
               JSONSerialization.isValidJSONObject(value),
@@ -102,27 +118,6 @@ final class UnityWorldBridge: @unchecked Sendable {
                         params: ["worldID": worldID, "includeState": true])
                     guard reply["record"] != nil else { throw WorldAuthorityError.invalidResponse }
                     response["result"] = reply
-                } else {
-                    guard let requestID = request["requestID"] as? String,
-                          !requestID.isEmpty, requestID.utf8.count <= 256,
-                          let expected = request["expectedRevision"] as? NSNumber,
-                          CFGetTypeID(expected) != CFBooleanGetTypeID(),
-                          expected.doubleValue >= 0, expected.doubleValue <= 9_007_199_254_740_991,
-                          expected.doubleValue.rounded() == expected.doubleValue,
-                          let state = request["state"] as? [String: Any],
-                          state["worldID"] as? String == worldID else {
-                        throw WorldAuthorityError.daemon("invalid_request")
-                    }
-                    // Validate the established WorldState contract, preserving all
-                    // original keys in the request rather than re-encoding it.
-                    _ = try WorldAuthorityClient.decodeState(state)
-                    let reply = try client.call(method: "world_commit", params: [
-                        "worldID": worldID, "requestID": requestID,
-                        "expectedRevision": expected, "producer": "unity",
-                        "intent": request["intent"] as? [String: Any] ?? ["kind": "unity-edit"],
-                        "ops": [["op": "replaceState", "state": state]]])
-                    response["requestID"] = requestID
-                    response["result"] = reply
                 }
                 response["status"] = "completed"
             } catch {
@@ -163,6 +158,204 @@ final class UnityWorldBridge: @unchecked Sendable {
             lock.unlock()
         }
         return true
+    }
+
+    /// Pointer intent carries no grant, verdict or replacement WorldState.
+    /// The host supplies measured facts; Rust issues the single-use UI capability.
+    private func submitProp(_ value: [String: Any]) -> Bool {
+        guard JSONSerialization.isValidJSONObject(value), let data = try? JSONSerialization.data(withJSONObject: value) else { return false }
+        lock.lock()
+        guard !pending, !closed else { lock.unlock(); return false }
+        pending = true
+        lock.unlock()
+        Task { [self] in
+            var response: [String: Any] = ["version": 1]
+            do {
+                let request = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+                let operation = request["op"] as? String ?? ""
+                let worldID = request["worldID"] as? String ?? ""
+                response["operation"] = operation; response["worldID"] = worldID; response["requestID"] = request["requestID"]
+                guard let identity = propIdentity?(worldID), identity.worldID == worldID,
+                      let expected = request["expectedRevision"] as? NSNumber,
+                      let layout = request["expectedLayoutRevision"] as? NSNumber,
+                      CFGetTypeID(expected) != CFBooleanGetTypeID(), CFGetTypeID(layout) != CFBooleanGetTypeID(),
+                      expected.doubleValue >= 0, layout.doubleValue >= 0,
+                      expected.doubleValue.rounded() == expected.doubleValue, layout.doubleValue.rounded() == layout.doubleValue,
+                      expected.doubleValue <= 9_007_199_254_740_991, layout.doubleValue <= 9_007_199_254_740_991,
+                      let requestID = request["requestID"] as? String, !requestID.isEmpty, requestID.utf8.count <= 256,
+                      let command = request["command"] as? [String: Any],
+                      ["place", "withdraw", "hold", "adjustGrip", "returnHeld", "dropHeld", "delete", "undo"].contains(command["op"] as? String ?? "") else {
+                    throw RustWorldPropError.rejected("world_prop_native_not_ready")
+                }
+                let client = RustWorldPropClient(endpointFile: URL(fileURLWithPath: endpoint.endpointFile))
+                let revision = expected.uint64Value, layoutRevision = layout.uint64Value
+                let factsVersion = nativeFactsVersion()
+                let facts: Data
+                if let propFacts { facts = try await propFacts(identity, revision, layoutRevision) }
+                else { facts = try await measuredNativeFacts(identity, layoutRevision: layoutRevision, client: client) }
+                guard propFacts != nil || factsVersion == nativeFactsVersion() else { throw RustWorldPropError.rejected("world_prop_stale_native_facts") }
+                let observation: RustWorldPropClient.Observation
+                let observationKey = identity.worldID + "|" + identity.residentScope + "|" + identity.hostSessionID + "|" + String(layoutRevision) + "|" + String(factsVersion)
+                if propFacts == nil, let cached = cachedObservation(observationKey) { observation = cached }
+                else {
+                    observation = try await client.observe(identity, expectedRevision: revision, layoutRevision: layoutRevision, facts: facts)
+                    if propFacts == nil { cacheObservation(observation, key: observationKey) }
+                }
+                let commandData = try JSONSerialization.data(withJSONObject: command)
+                guard propFacts != nil || factsVersion == nativeFactsVersion() else { throw RustWorldPropError.rejected("world_prop_stale_native_facts") }
+                let reply: Data
+                if operation == "world.prop.preview" {
+                    reply = try await client.preview(identity, expectedRevision: revision, layoutRevision: layoutRevision,
+                        geometryID: observation.geometryID, command: commandData)
+                } else {
+                    let intent = try await client.uiIntent(identity, expectedRevision: revision, layoutRevision: layoutRevision, command: commandData)
+                    guard propFacts != nil || factsVersion == nativeFactsVersion() else { throw RustWorldPropError.rejected("world_prop_stale_native_facts") }
+                    reply = try await client.uiCommand(identity, intent: intent, expectedRevision: revision,
+                        layoutRevision: layoutRevision, geometryID: observation.geometryID, requestID: requestID)
+                }
+                response["result"] = try JSONSerialization.jsonObject(with: reply)
+                response["status"] = "completed"
+            } catch {
+                response["status"] = "failed"
+                if case let RustWorldPropError.rejected(code) = error { response["code"] = code }
+                else { response["code"] = "world_prop_unavailable" }
+                response["message"] = "空间服务没有确认这次操作，预览已保留。"
+            }
+            publishPropResponse((try? JSONSerialization.data(withJSONObject: response)) ?? Data("{\"status\":\"failed\"}".utf8))
+        }
+        return true
+    }
+    private func publishPropResponse(_ data: Data) {
+        lock.lock(); defer { lock.unlock() }
+        if !closed { resultData = data; generation &+= 1 }
+        pending = false
+    }
+    private func adoptLoadedFacts(_ value: [String: Any]) -> Bool {
+        guard let worldID = value["worldID"] as? String, let identity = propIdentity?(worldID), identity.worldID == worldID,
+              let payload = value["payload"] as? [String: Any], payload["worldID"] as? String == worldID,
+              JSONSerialization.isValidJSONObject(payload), let bytes = try? JSONSerialization.data(withJSONObject: payload),
+              bytes.count <= 64 * 1024 * 1024 else { return false }
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return false }
+        loadedFacts = bytes
+        loadedFactsVersion &+= 1; compiledFacts = nil; observedFacts = nil
+        return true
+    }
+    private func nativeFactsInput() throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        guard let loadedFacts else { throw RustWorldPropError.rejected("world_prop_native_not_ready") }
+        return loadedFacts
+    }
+    private func measuredNativeFacts(_ identity: RustWorldPropClient.Identity, layoutRevision: UInt64,
+                                     client: RustWorldPropClient) async throws -> Data {
+        let version = nativeFactsVersion()
+        let context = identity.worldID + "|" + String(layoutRevision)
+        if let cached = cachedCompiledFacts(version, context: context) { return cached }
+        let input = try JSONSerialization.jsonObject(with: nativeFactsInput()) as! [String: Any]
+        guard input["worldID"] as? String == identity.worldID,
+              (input["layoutRevision"] as? NSNumber)?.uint64Value == layoutRevision,
+              let environmentPath = input["environmentPath"] as? String,
+              let environmentHash = input["environmentSHA256"] as? String, environmentHash.count == 64,
+              let environment = input["environment"] as? [String: Any],
+              let avatar = input["avatar"] as? [String: Any],
+              let objects = input["objects"] as? [String: [String: Any]], objects.count <= 128 else {
+            throw RustWorldPropError.rejected("world_prop_native_not_ready")
+        }
+        // This path was reported only after the Unity collider loader sampled it.
+        // Keep the C# calibrated RH triangles; importing the original file adds its hash binding.
+        try await importNativeBlob(client, path: environmentPath, hash: environmentHash)
+        var meshes: [String: Any] = [:]
+        for (objectID, descriptor) in objects {
+            guard let assetID = descriptor["assetID"] as? String, let path = descriptor["path"] as? String else {
+                throw RustWorldPropError.rejected("world_prop_invalid_native_facts")
+            }
+            let key = assetID + "\n" + path
+            let sample: RustPropNativeMeshSampler.Sample
+            if let cached = cachedMesh(key) { sample = cached }
+            else {
+                sample = try await RustPropNativeMeshSampler.sample(modelURL: URL(fileURLWithPath: path))
+                cacheMesh(sample, key: key)
+            }
+            guard assetID == "sha256:" + sample.sha256 else { throw RustWorldPropError.rejected("world_prop_invalid_native_facts") }
+            try await importNativeBlob(client, path: path, hash: sample.sha256)
+            let triangles = try JSONSerialization.jsonObject(with: sample.trianglesJSON)
+            meshes[objectID] = ["assetID": assetID, "blobRef": "sha256:" + sample.sha256,
+                "triangles": try preparePlacementGeometry(["triangles":triangles])["triangles"]!]
+        }
+        let measured: [String: Any] = ["environmentBlobRef":"sha256:" + environmentHash,
+            "environment":try preparePlacementGeometry(environment), "avatar":avatar, "objects":meshes]
+        let data = try JSONSerialization.data(withJSONObject: measured)
+        cacheCompiledFacts(data, version: version, context: context)
+        return data
+    }
+    private func cachedMesh(_ key: String) -> RustPropNativeMeshSampler.Sample? {
+        lock.lock(); defer { lock.unlock() }; return meshSamples[key]
+    }
+    private func cacheMesh(_ sample: RustPropNativeMeshSampler.Sample, key: String) {
+        lock.lock(); defer { lock.unlock() }
+        if meshSamples.count >= 128 { meshSamples.removeAll() }
+        meshSamples[key] = sample
+    }
+    private func blobImported(_ key: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }; return importedBlobs.contains(key)
+    }
+    private func markBlobImported(_ key: String) {
+        lock.lock(); defer { lock.unlock() }
+        if importedBlobs.count >= 256 { importedBlobs.removeAll() }
+        importedBlobs.insert(key)
+    }
+    private func importNativeBlob(_ client: RustWorldPropClient, path: String, hash: String) async throws {
+        let key = hash + "\n" + path
+        if blobImported(key) { return }
+        try await client.putBlob(localPath: path, sha256: hash)
+        markBlobImported(key)
+    }
+    private func nativeFactsVersion() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }; return loadedFactsVersion
+    }
+    func nativeUIIdentity(worldID: String) -> RustWorldPropClient.Identity? { propIdentity?(worldID) }
+    func nativePropFacts(identity: RustWorldPropClient.Identity) async throws -> Data {
+        let version = nativeFactsVersion()
+        let client = RustWorldPropClient(endpointFile: URL(fileURLWithPath: endpoint.endpointFile))
+        let facts = try await measuredNativeFacts(identity, layoutRevision: try loadedLayoutRevision(worldID: identity.worldID), client: client)
+        guard nativeFactsVersion() == version else { throw RustWorldPropError.rejected("world_prop_stale_native_facts") }
+        return facts
+    }
+    private func loadedLayoutRevision(worldID: String) throws -> UInt64 {
+        guard let value = try JSONSerialization.jsonObject(with: nativeFactsInput()) as? [String: Any],
+              value["worldID"] as? String == worldID, let layout = value["layoutRevision"] as? NSNumber else {
+            throw RustWorldPropError.rejected("world_prop_native_not_ready")
+        }
+        return layout.uint64Value
+    }
+    func nativeDeviceObservation(worldID: String, expectedRevision: UInt64, layoutRevision: UInt64) async throws -> RustWorldPropClient.Observation {
+        guard let identity = propIdentity?(worldID), identity.worldID == worldID else { throw RustWorldPropError.rejected("world_prop_native_not_ready") }
+        let version = nativeFactsVersion()
+        let key = identity.worldID + "|" + identity.residentScope + "|" + identity.hostSessionID + "|" + String(layoutRevision) + "|" + String(version)
+        if let cached = cachedObservation(key) { return cached }
+        let client = RustWorldPropClient(endpointFile: URL(fileURLWithPath: endpoint.endpointFile))
+        let facts = try await measuredNativeFacts(identity, layoutRevision: layoutRevision, client: client)
+        guard nativeFactsVersion() == version else { throw RustWorldPropError.rejected("world_prop_stale_native_facts") }
+        let observation = try await client.observe(identity, expectedRevision: expectedRevision, layoutRevision: layoutRevision, facts: facts)
+        guard nativeFactsVersion() == version else { throw RustWorldPropError.rejected("world_prop_stale_native_facts") }
+        cacheObservation(observation, key: key)
+        return observation
+    }
+    private func cachedCompiledFacts(_ version: UInt64, context: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        return compiledFacts?.version == version && compiledFacts?.context == context ? compiledFacts?.data : nil
+    }
+    private func cacheCompiledFacts(_ data: Data, version: UInt64, context: String) {
+        lock.lock(); defer { lock.unlock() }
+        if loadedFactsVersion == version { compiledFacts = (version, context, data) }
+    }
+    private func cachedObservation(_ key: String) -> RustWorldPropClient.Observation? {
+        lock.lock(); defer { lock.unlock() }
+        guard let cached = observedFacts, cached.key == key, Date().timeIntervalSince(cached.at) < 4 else { return nil }
+        return cached.observation
+    }
+    private func cacheObservation(_ observation: RustWorldPropClient.Observation, key: String) {
+        lock.lock(); defer { lock.unlock() }; observedFacts = (key, Date(), observation)
     }
 
     func snapshot() -> [String: Any] {

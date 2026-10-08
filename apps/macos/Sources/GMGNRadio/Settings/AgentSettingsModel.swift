@@ -2,43 +2,66 @@ import Foundation
 import Observation
 
 /// Portable voice choices are independent of the retired realtime-conversation SDK.
+@MainActor
 final class RustSpeechPreferences {
-    private let defaults: UserDefaults
-    init(defaults: UserDefaults = E2ERuntime.defaults) { self.defaults = defaults }
-    func provider(for purpose: String, includesEnvironment: Bool = true) -> RustVoiceProvider {
-        let explicit = includesEnvironment ? ProcessInfo.processInfo.environment["GMGN_VOICE_\(purpose.uppercased())_PROVIDER"] : nil
-        return (explicit ?? defaults.string(forKey: "speech.rust.\(purpose).provider"))
-            .flatMap(RustVoiceProvider.init(rawValue:)) ?? .bailian
+    private let settings: RustProductSettingsClient
+    private let secrets: any ProductSpeechSecretStore
+    private let legacyDefaults: UserDefaults
+    private var observedCredentials: [String: Bool] = [:]
+    private static var savingProviders = Set<String>()
+    init(defaults: UserDefaults = E2ERuntime.defaults, settings: RustProductSettingsClient = .shared,
+         secrets: any ProductSpeechSecretStore = FileSpeechSecretStore()) {
+        self.settings = settings; self.secrets = secrets; legacyDefaults = defaults
+        settings.bootstrap(legacy: RustProductSettingsClient.legacySnapshot(defaults))
     }
-    func configuration(for purpose: String, includesEnvironment: Bool = true) -> RustVoiceConfiguration {
-        let provider = provider(for: purpose, includesEnvironment: includesEnvironment)
-        return configuration(provider: provider, for: purpose, includesEnvironment: includesEnvironment)
-    }
-    func configuration(provider: RustVoiceProvider, for purpose: String, includesEnvironment: Bool = true) -> RustVoiceConfiguration {
-        let prefix = "speech.rust.\(provider.rawValue)."
-        let environment = includesEnvironment ? ProcessInfo.processInfo.environment : [:]
-        let environmentPrefix = "GMGN_VOICE_\(provider.rawValue.uppercased())_"
-        func usableKey(_ value: String?) -> String? {
-            guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
-            return trimmed
+    private func credential(provider: String) -> String {
+        if !secrets.legacyImported(provider: provider) {
+            let old = legacyDefaults.string(forKey: "speech.rust.\(provider).apiKey")
+                ?? (provider == "bailian" ? legacyDefaults.string(forKey: "voice.bailian.apiKey") : nil)
+            do {
+                if secrets.read(provider: provider) == nil, let old { try secrets.write(provider: provider, key: old) }
+                try secrets.markLegacyImported(provider: provider)
+            } catch { /* No plaintext preference writer or credential logging. */ }
         }
-        // Existing Bailian credentials remain reusable without moving or exposing them.
-        let legacy = provider == .bailian ? defaults.string(forKey: "voice.bailian.apiKey") : nil
-        let sharedElevenKey = provider == .elevenlabs ? environment["ELEVENLABS_API_KEY"] : nil
-        return RustVoiceConfiguration(provider: provider,
-            apiKey: usableKey(environment[environmentPrefix + "API_KEY"])
-                ?? usableKey(defaults.string(forKey: prefix + "apiKey"))
-                ?? usableKey(sharedElevenKey) ?? usableKey(legacy) ?? "",
-            voiceID: environment[environmentPrefix + "VOICE_ID"] ?? defaults.string(forKey: prefix + "voiceID")
-                ?? (provider == .bailian ? defaults.string(forKey: RealtimeVoicePreferences.replyVoiceIDKey) ?? "Cherry" : ""),
-            model: environment[environmentPrefix + purpose.uppercased() + "_MODEL"] ?? defaults.string(forKey: prefix + purpose + ".model"))
+        let key = secrets.read(provider: provider) ?? ""
+        observedCredentials[provider] = !key.isEmpty
+        return key
     }
-    func save(_ configuration: RustVoiceConfiguration, for purpose: String) {
-        defaults.set(configuration.provider.rawValue, forKey: "speech.rust.\(purpose).provider")
-        let prefix = "speech.rust.\(configuration.provider.rawValue)."
-        defaults.set(configuration.apiKey, forKey: prefix + "apiKey")
-        if purpose == "tts" { defaults.set(configuration.voiceID, forKey: prefix + "voiceID") }
-        defaults.set(configuration.model, forKey: prefix + purpose + ".model")
+    func credentialConfigured(provider: RustVoiceProvider) -> Bool? { observedCredentials[provider.rawValue] }
+    func provider(for purpose: String, includesEnvironment: Bool = true) -> RustVoiceProvider {
+        let configured = purpose == "asr" ? settings.confirmed?.values.asrProvider : settings.confirmed?.values.ttsProvider
+        let explicit = includesEnvironment ? ProcessInfo.processInfo.environment["GMGN_VOICE_\(purpose.uppercased())_PROVIDER"] : nil
+        return (explicit ?? configured).flatMap(RustVoiceProvider.init(rawValue:)) ?? .bailian
+    }
+    func configuration(for purpose: String, includesEnvironment: Bool = true, includesSecrets: Bool = true) -> RustVoiceConfiguration {
+        configuration(provider: provider(for: purpose, includesEnvironment: includesEnvironment), for: purpose, includesEnvironment: includesEnvironment, includesSecrets: includesSecrets)
+    }
+    func configuration(provider: RustVoiceProvider, for purpose: String, includesEnvironment: Bool = true, includesSecrets: Bool = true) -> RustVoiceConfiguration {
+        let env = includesEnvironment ? ProcessInfo.processInfo.environment : [:]
+        let prefix = "GMGN_VOICE_\(provider.rawValue.uppercased())_"
+        let values = settings.confirmed?.values
+        let selected = purpose == "asr" ? values?.asrProvider : values?.ttsProvider
+        let model = selected == provider.rawValue ? (purpose == "asr" ? values?.asrModel : values?.ttsModel) : nil
+        let voice = selected == provider.rawValue ? values?.ttsVoice : nil
+        let key = includesSecrets ? (env[prefix + "API_KEY"] ?? (provider == .elevenlabs ? env["ELEVENLABS_API_KEY"] : nil) ?? credential(provider: provider.rawValue)) : ""
+        return RustVoiceConfiguration(provider: provider, apiKey: key, voiceID: env[prefix + "VOICE_ID"] ?? voice ?? (provider == .bailian ? "Cherry" : ""),
+            model: env[prefix + purpose.uppercased() + "_MODEL"] ?? model)
+    }
+    func save(_ configuration: RustVoiceConfiguration, for purpose: String) async throws {
+        guard ["tts","asr"].contains(purpose), let model = configuration.model else { throw RustProductSettingsClient.SettingsError.invalidProtocol }
+        var changes: [String: Any] = [purpose + "Provider":configuration.provider.rawValue, purpose + "Model":model]
+        if purpose == "tts" { changes["ttsVoice"] = configuration.voiceID }
+        // Credentials cross only the private native file boundary, never this JSON request.
+        let provider = configuration.provider.rawValue
+        guard Self.savingProviders.insert(provider).inserted else { throw RustProductSettingsClient.SettingsError.unavailable }
+        defer { Self.savingProviders.remove(provider) }
+        let previousKey = secrets.read(provider: provider) ?? ""
+        try secrets.write(provider: provider, key: configuration.apiKey)
+        do { _ = try await settings.apply(changes); observedCredentials[provider] = !configuration.apiKey.isEmpty }
+        catch {
+            try secrets.write(provider: provider, key: previousKey)
+            throw error
+        }
     }
 }
 
@@ -214,147 +237,6 @@ struct RealtimeVoiceConfiguration: Equatable, Sendable {
     }
 }
 
-final class RealtimeVoicePreferences {
-    static let replyVoiceIDKey = "speech.bailian.voiceID"
-    static let providerKey = "voice.provider"
-    static let agentIDKey = "voice.elevenlabs.agentID"
-    static let voiceIDKey = "voice.elevenlabs.voiceID"
-    static let conversationTokenKey =
-        "voice.elevenlabs.conversationToken"
-    static let apiKeyKey = "voice.elevenlabs.apiKey"
-    static let microphoneDeviceIDKey = "voice.microphoneDeviceID"
-
-    private let defaults: UserDefaults
-
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
-    }
-
-    var replyVoiceID: String {
-        defaults.string(forKey: Self.replyVoiceIDKey) ?? "Cherry"
-    }
-
-    func saveReplyVoiceID(_ id: String) {
-        defaults.set(id, forKey: Self.replyVoiceIDKey)
-    }
-
-    func load() -> RealtimeVoiceConfiguration {
-        let provider = defaults.string(forKey: Self.providerKey)
-            .flatMap(RealtimeDJProvider.init(rawValue:))
-            ?? .bailian
-        return load(provider: provider)
-    }
-
-    func loadMetadata() -> RealtimeVoiceConfiguration {
-        let provider = defaults.string(forKey: Self.providerKey)
-            .flatMap(RealtimeDJProvider.init(rawValue:))
-            ?? .bailian
-        return load(provider: provider)
-    }
-
-    func loadMetadata(
-        provider: RealtimeDJProvider
-    ) -> RealtimeVoiceConfiguration {
-        load(provider: provider)
-    }
-
-    func load(
-        provider: RealtimeDJProvider
-    ) -> RealtimeVoiceConfiguration {
-        return RealtimeVoiceConfiguration(
-            provider: provider,
-            apiKey: normalized(
-                defaults.string(forKey: key(provider, "apiKey"))
-            ),
-            agentID: normalized(
-                defaults.string(forKey: key(provider, "agentID"))
-            ),
-            conversationToken: normalized(
-                defaults.string(forKey: key(provider, "conversationToken"))
-            ),
-            voiceID: normalized(
-                defaults.string(forKey: key(provider, "voiceID"))
-            ),
-            model: normalized(
-                defaults.string(forKey: key(provider, "model"))
-            ),
-            appID: normalized(
-                defaults.string(forKey: key(provider, "appID"))
-            ),
-            accessToken: normalized(
-                defaults.string(forKey: key(provider, "accessToken"))
-            ),
-            resourceID: normalized(
-                defaults.string(forKey: key(provider, "resourceID"))
-            ),
-            microphoneDeviceID: normalized(
-                defaults.string(forKey: Self.microphoneDeviceIDKey)
-            )
-        )
-    }
-
-    func save(
-        _ configuration: RealtimeVoiceConfiguration
-    ) throws {
-        defaults.set(
-            configuration.provider.rawValue,
-            forKey: Self.providerKey
-        )
-        let provider = configuration.provider
-        defaults.set(
-            configuration.agentID,
-            forKey: key(provider, "agentID")
-        )
-        defaults.set(
-            configuration.voiceID,
-            forKey: key(provider, "voiceID")
-        )
-        defaults.set(
-            configuration.model,
-            forKey: key(provider, "model")
-        )
-        defaults.set(
-            configuration.appID,
-            forKey: key(provider, "appID")
-        )
-        defaults.set(
-            configuration.resourceID,
-            forKey: key(provider, "resourceID")
-        )
-        defaults.set(
-            configuration.microphoneDeviceID,
-            forKey: Self.microphoneDeviceIDKey
-        )
-        defaults.set(
-            configuration.apiKey,
-            forKey: key(provider, "apiKey")
-        )
-        defaults.set(
-            configuration.conversationToken,
-            forKey: key(provider, "conversationToken")
-        )
-        defaults.set(
-            configuration.accessToken,
-            forKey: key(provider, "accessToken")
-        )
-    }
-
-    private func key(
-        _ provider: RealtimeDJProvider,
-        _ field: String
-    ) -> String {
-        "voice.\(provider.rawValue).\(field)"
-    }
-
-    private func normalized(_ value: String?) -> String? {
-        guard let value else {
-            return nil
-        }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
 enum RealtimeVoiceConnectionState: Equatable {
     case disconnected
     case connecting
@@ -389,18 +271,6 @@ final class AgentSettingsModel {
     var isWorking = false
     var message: String?
     var hasError = false
-    var realtimeProvider: RealtimeDJProvider
-    var elevenLabsAgentID: String
-    var elevenLabsConversationToken: String
-    var elevenLabsVoiceID: String
-    var voiceAPIKey: String
-    var voiceModel: String
-    var voiceAppID: String
-    var voiceAccessToken: String
-    var voiceResourceID: String
-    var voiceMicrophoneDeviceID: String
-    let voiceMicrophoneDevices: [BailianMicrophoneDeviceOption]
-    let defaultMicrophoneDeviceID: String?
     var takeoverEnabled: Bool
     var planningModel: String
 
@@ -418,68 +288,24 @@ final class AgentSettingsModel {
         Set<AgentConversationBackendID> = []
     var selectedConversationBackendID: AgentConversationBackendID = .codex
     var autoSpeakAgentReplies = true
-    var selectedReplyVoiceID: String
-
-    var voiceID: String {
-        get { elevenLabsVoiceID }
-        set { elevenLabsVoiceID = newValue }
-    }
-
     private let account: any CodexAccountServicing
     private let preferences: DJAgentPreferences
-    private let voicePreferences: RealtimeVoicePreferences
     private let residentPreferences: ResidentPreferences
 
     init(
         account: any CodexAccountServicing = CodexAgentAccountService(),
         preferences: DJAgentPreferences = DJAgentPreferences(),
-        voicePreferences: RealtimeVoicePreferences =
-            RealtimeVoicePreferences(),
-        residentPreferences: ResidentPreferences = ResidentPreferences(),
-        microphoneDevices: [BailianMicrophoneDeviceOption] =
-            BailianMicrophoneDeviceCatalog.availableDevices(),
-        defaultMicrophoneDeviceID: String? =
-            BailianMicrophoneDeviceCatalog.defaultDeviceID()
+        residentPreferences: ResidentPreferences = ResidentPreferences()
     ) {
         self.account = account
         self.preferences = preferences
-        self.voicePreferences = voicePreferences
         self.residentPreferences = residentPreferences
-        selectedReplyVoiceID = voicePreferences.replyVoiceID
-        voiceMicrophoneDevices = microphoneDevices
-        self.defaultMicrophoneDeviceID = defaultMicrophoneDeviceID
         hostPrompt = preferences.hostPrompt()
         takeoverEnabled = preferences.takeoverEnabled()
         planningModel = preferences.planningModel() ?? ""
         residentPersona = residentPreferences.persona
         backgroundTurnsPerHour =
             residentPreferences.backgroundTurnsPerHour
-        let voice = voicePreferences.loadMetadata()
-        realtimeProvider = voice.provider
-        let resolvedVoiceModel: String
-        if voice.provider == .bailian {
-            resolvedVoiceModel =
-                voice.model ?? BailianRealtimeOptions.defaultModel
-        } else {
-            resolvedVoiceModel = voice.model ?? ""
-        }
-        elevenLabsAgentID = voice.agentID ?? ""
-        elevenLabsConversationToken = voice.conversationToken ?? ""
-        elevenLabsVoiceID = voice.voiceID
-            ?? (
-                voice.provider == .bailian
-                    ? BailianRealtimeOptions.defaultVoice(
-                        for: resolvedVoiceModel
-                    )
-                    : ""
-            )
-        voiceAPIKey = voice.apiKey ?? ""
-        voiceModel = resolvedVoiceModel
-        voiceAppID = voice.appID ?? ""
-        voiceAccessToken = voice.accessToken ?? ""
-        voiceResourceID = voice.resourceID ?? ""
-        voiceMicrophoneDeviceID = voice.microphoneDeviceID ?? ""
-
         let conversationService = AgentConversationService.shared
         installedConversationBackendIDs = Set(
             conversationService.installedBackends(refresh: true).map(\.kind)
@@ -513,13 +339,6 @@ final class AgentSettingsModel {
     func setAutoSpeakAgentReplies(_ enabled: Bool) {
         autoSpeakAgentReplies = enabled
         AgentConversationService.shared.setAutoSpeakReplies(enabled)
-    }
-
-    func selectReplyVoice(_ id: String) {
-        selectedReplyVoiceID = id
-        voicePreferences.saveReplyVoiceID(id)
-        message = "百炼回复音色已保存，下次朗读生效。"
-        hasError = false
     }
 
     func isConversationBackendInstalled(
@@ -592,20 +411,16 @@ final class AgentSettingsModel {
     }
 
     func savePrompt() {
-        preferences.saveHostPrompt(hostPrompt)
+        let prompt = hostPrompt
+        Task { do { try await preferences.saveHostPrompt(prompt); hostPrompt = preferences.hostPrompt(); message = "DJ 偏好已保存。"; hasError = false } catch { message = "设置未保存，请检查后台连接。"; hasError = true } }
         saveAgentConfiguration(showMessage: false)
-        hostPrompt = preferences.hostPrompt()
-        message = "DJ 偏好已保存。"
-        hasError = false
     }
 
     /// 保存居民人格。人格独立于 DJ hostPrompt；居民会话每轮重新读取，保存后
     /// 下一轮生效，切换空间仍保留。设置页保存后另行发出既有自主设置通知。
     func saveResidentPersona() {
-        residentPreferences.savePersona(residentPersona)
-        residentPersona = residentPreferences.persona
-        message = "居民人格已保存，下一轮思考生效。"
-        hasError = false
+        let persona = residentPersona
+        Task { do { try await residentPreferences.savePersona(persona); residentPersona = residentPreferences.persona; message = "居民人格已保存，下一轮思考生效。"; hasError = false; NotificationCenter.default.post(name: .init("gmgnResidentAutonomyChanged"), object: nil) } catch { message = "设置未保存，请检查后台连接。"; hasError = true } }
     }
 
     /// 保存本次居民会话滚动一小时的后台思考预算（0...6），返回收敛后的值供设置页回显。
@@ -613,162 +428,16 @@ final class AgentSettingsModel {
     /// 循环接线方读取 `ResidentPreferences`，额度不跨循环重建或重启保留。
     @discardableResult
     func saveBackgroundTurnsPerHour(_ value: Int) -> Int {
-        let saved = residentPreferences
-            .saveBackgroundTurnsPerHour(value)
-        backgroundTurnsPerHour = saved
-        message = saved == 0
-            ? "已保存：不再发起新的后台思考，不会取消正在进行的一轮。"
-            : "后台思考预算已保存：本次会话滚动一小时内最多 \(saved) 轮。"
-        hasError = false
-        return saved
+        Task { do { let saved = try await residentPreferences.saveBackgroundTurnsPerHour(value); backgroundTurnsPerHour = saved; message = saved == 0 ? "已保存：不再发起新的后台思考，不会取消正在进行的一轮。" : "后台思考预算已保存：本次会话滚动一小时内最多 \(saved) 轮。"; hasError = false; NotificationCenter.default.post(name: .init("gmgnResidentAutonomyChanged"), object: nil) } catch { message = "设置未保存，请检查后台连接。"; hasError = true } }
+        return backgroundTurnsPerHour
     }
 
     func saveAgentConfiguration(showMessage: Bool = true) {
-        preferences.saveTakeoverEnabled(takeoverEnabled)
-        preferences.savePlanningModel(planningModel)
-        planningModel = preferences.planningModel() ?? ""
-        if showMessage {
-            message = takeoverEnabled
-                ? "DJ 接管已开启。"
-                : "DJ 接管已关闭。"
-            hasError = false
-        }
+        let enabled = takeoverEnabled, model = planningModel
+        Task { do { try await preferences.saveConfiguration(takeover: enabled, model: model); planningModel = preferences.planningModel() ?? ""; takeoverEnabled = preferences.takeoverEnabled(); if showMessage { message = takeoverEnabled ? "DJ 接管已开启。" : "DJ 接管已关闭。"; hasError = false } } catch { message = "设置未保存，请检查后台连接。"; hasError = true } }
     }
 
-    func saveVoiceConfiguration() -> RealtimeVoiceConfiguration? {
-        let configuration = RealtimeVoiceConfiguration(
-            provider: realtimeProvider,
-            apiKey: normalized(voiceAPIKey),
-            agentID: normalized(elevenLabsAgentID),
-            conversationToken: normalized(
-                elevenLabsConversationToken
-            ),
-            voiceID: normalized(elevenLabsVoiceID),
-            model: normalized(voiceModel),
-            appID: normalized(voiceAppID),
-            accessToken: normalized(voiceAccessToken),
-            resourceID: normalized(voiceResourceID),
-            microphoneDeviceID: normalized(voiceMicrophoneDeviceID)
-        )
 
-        guard validate(configuration) else {
-            hasError = true
-            return nil
-        }
-
-        do {
-            try voicePreferences.save(configuration)
-            message = "语音输入配置已保存；转写后交给选定的 Agent 回复。"
-            hasError = false
-            return configuration
-        } catch {
-            message = (error as? LocalizedError)?.errorDescription
-                ?? error.localizedDescription
-            hasError = true
-            return nil
-        }
-    }
-
-    func selectRealtimeProvider(_ provider: RealtimeDJProvider) {
-        realtimeProvider = provider
-        apply(voicePreferences.loadMetadata(provider: provider))
-        message = nil
-        hasError = false
-    }
-
-    func selectBailianModel(_ model: String) {
-        voiceModel = model
-        let voices = BailianRealtimeOptions.voices(for: model)
-        if !voices.contains(where: { $0.id == voiceID }) {
-            voiceID = BailianRealtimeOptions.defaultVoice(for: model)
-        }
-        message = nil
-        hasError = false
-    }
-
-    private func apply(_ configuration: RealtimeVoiceConfiguration) {
-        elevenLabsAgentID = configuration.agentID ?? ""
-        elevenLabsConversationToken =
-            configuration.conversationToken ?? ""
-        voiceAPIKey = configuration.apiKey ?? ""
-        if configuration.provider == .bailian {
-            voiceModel =
-                configuration.model ?? BailianRealtimeOptions.defaultModel
-            let voices = BailianRealtimeOptions.voices(for: voiceModel)
-            elevenLabsVoiceID = configuration.voiceID
-                .flatMap { selected in
-                    voices.contains(where: { $0.id == selected })
-                        ? selected
-                        : nil
-                }
-                ?? BailianRealtimeOptions.defaultVoice(for: voiceModel)
-        } else {
-            elevenLabsVoiceID = configuration.voiceID ?? ""
-            voiceModel = configuration.model ?? ""
-        }
-        voiceAppID = configuration.appID ?? ""
-        voiceAccessToken = configuration.accessToken ?? ""
-        voiceResourceID = configuration.resourceID ?? ""
-        voiceMicrophoneDeviceID = configuration.microphoneDeviceID ?? ""
-    }
-
-    var systemMicrophoneLabel: String {
-        guard
-            let defaultMicrophoneDeviceID,
-            let device = voiceMicrophoneDevices.first(
-                where: { $0.id == defaultMicrophoneDeviceID }
-            )
-        else {
-            return "跟随系统"
-        }
-        return "跟随系统（\(device.name)）"
-    }
-
-    private func validate(
-        _ configuration: RealtimeVoiceConfiguration
-    ) -> Bool {
-        switch configuration.provider {
-        case .elevenLabs:
-            if configuration.conversationToken != nil {
-                return true
-            }
-            guard
-                let agentID = configuration.agentID,
-                agentID.hasPrefix("agent_"),
-                agentID.count > "agent_".count
-            else {
-                message =
-                    "填写真实的 ElevenLabs Agent ID（以 agent_ 开头），或填写会话令牌。"
-                return false
-            }
-            return true
-        case .bailian:
-            guard configuration.apiKey != nil else {
-                message = "填写百炼 API Key。"
-                return false
-            }
-            return true
-        case .doubao:
-            guard configuration.appID != nil else {
-                message = "填写豆包 RTC App ID。"
-                return false
-            }
-            guard configuration.accessToken != nil else {
-                message = "填写豆包 RTC Access Token。"
-                return false
-            }
-            guard configuration.resourceID != nil else {
-                message = "填写豆包实时语音 Resource ID。"
-                return false
-            }
-            return true
-        }
-    }
-
-    private func normalized(_ value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }
 
 extension CodexAccountState {

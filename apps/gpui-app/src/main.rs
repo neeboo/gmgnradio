@@ -25,6 +25,18 @@ fn modal_owns_scene_input(menu: bool, dialog: bool, sheet: bool) -> bool {
     menu || dialog || sheet
 }
 
+#[derive(Debug, PartialEq)]
+struct ProductErrorNotice { revision: u64, title: String, message: String }
+
+fn next_error_notice(value: &serde_json::Value, consumed: u64) -> Option<ProductErrorNotice> {
+    let revision = value["revision"].as_u64()?;
+    if revision <= consumed { return None; }
+    let title = value["title"].as_str()?;
+    let message = value["message"].as_str()?;
+    if title.trim().is_empty() { return None; }
+    Some(ProductErrorNotice { revision, title: title.to_owned(), message: message.to_owned() })
+}
+
 fn user_status_notice(message: &str) -> String {
     if message.contains("原物件已摆放") {
         "物件已经摆好了，无需再次摆放。".into()
@@ -109,6 +121,7 @@ struct GMGNProductUI {
     runtime_state: serde_json::Value,
     surface_mounted: bool,
     navigation_revision:u64,
+    error_notice_revision:u64,
     main_window:Rc<RefCell<Option<AnyWindowHandle>>>,
     profile_switch_pending:bool,
     dismissed_reply_revision:Option<String>,
@@ -188,7 +201,7 @@ impl GMGNProductUI {
         let bound_commands=self.bound_video_pane.update(cx,|pane,_|pane.take_commands());
         for command in stage_commands.into_iter().chain(program_commands).chain(prop_commands).chain(bound_commands) {
             if !self.host.borrow().as_ref().is_some_and(|host|host.settings_command(&command)) {
-                self.core_notice=Some("场景操作未完成，原状态保持不变。".into());cx.notify();
+                self.core_notice=Some("场景操作尚未确认完成，请检查当前状态。".into());cx.notify();
             }
         }
         let inbox_commands=self.inbox_pane.update(cx,|pane,_|pane.take_commands());
@@ -200,7 +213,7 @@ impl GMGNProductUI {
         let settings_commands=self.settings_pane.update(cx, |pane,_|pane.take_commands());
         for command in settings_commands {
             if !self.host.borrow().as_ref().is_some_and(|host|host.settings_command(&command)) {
-                self.core_notice=Some("设置操作未能被原应用接收，原配置保持不变。".into());cx.notify();
+                self.core_notice=Some("设置操作尚未确认完成，请检查当前配置。".into());cx.notify();
             }
         }
         if !self.surface_mounted {
@@ -344,6 +357,16 @@ impl GMGNProductUI {
         if self.transcript != batch.transcript {
             self.transcript = batch.transcript.clone();
             self.pane.update(cx, |pane, cx| pane.set_transcript(batch.transcript, cx));
+        }
+        if let Some(notice) = next_error_notice(&self.runtime_state["errorNotice"], self.error_notice_revision) {
+            self.error_notice_revision = notice.revision;
+            window.open_dialog(cx, move |dialog, _, _| {
+                dialog.title(notice.title.clone()).w(px(460.))
+                    .child(div().text_sm().child(notice.message.clone()))
+                    .footer(div().flex().justify_end().child(
+                        Button::new("product-error-close").label("关闭")
+                            .on_click(|_, window, cx| window.close_dialog(cx))))
+            });
         }
     }
     fn native_action(&mut self, action: &str, cx: &mut Context<Self>) {
@@ -725,6 +748,27 @@ impl Render for GMGNProductUI {
 #[cfg(test)]
 mod layout_tests {
     #[test]
+    fn product_errors_consume_each_revision_once_and_preserve_text() {
+        let value=serde_json::json!({"revision":1,"title":"音乐资源连接失败","message":"音乐服务返回了不安全的播放地址，应用已阻止连接。"});
+        let notice=super::next_error_notice(&value,0).unwrap();
+        assert_eq!(notice.title,"音乐资源连接失败");
+        assert_eq!(notice.message,"音乐服务返回了不安全的播放地址，应用已阻止连接。");
+        assert!(super::next_error_notice(&value,notice.revision).is_none());
+        assert!(super::next_error_notice(&value,2).is_none());
+        let mut next=value.clone();next["revision"]=2.into();
+        assert!(super::next_error_notice(&next,1).is_some());
+    }
+    #[test]
+    fn incomplete_error_snapshot_does_not_consume_revision() {
+        for value in [serde_json::Value::Null,serde_json::json!({"revision":0,"title":"错误","message":"详情"}),
+            serde_json::json!({"revision":1,"title":"  ","message":"详情"}),
+            serde_json::json!({"revision":1,"title":"错误"}),
+            serde_json::json!({"revision":"1","title":"错误","message":"详情"})] {
+            assert!(super::next_error_notice(&value,0).is_none());
+        }
+        assert!(super::next_error_notice(&serde_json::json!({"revision":1,"title":"错误","message":""}),0).is_some());
+    }
+    #[test]
     fn compact_background_reply_is_visible_without_fabricating_transcript() {
         let state=serde_json::json!({"contextID":"world-a","reply":"后台回复","replyRevision":3});
         let transcript=vec![];
@@ -908,7 +952,7 @@ fn main() {
                 GMGNProductUI { host: host.clone(), pane, settings_pane, settings_window:None, inbox_pane, inbox_window:None, stage_pane,stage_panel_open:false,
                     program_pane,program_open:false,program_backdrop:Rc::new(RefCell::new(None)),lyrics_layer:Rc::new(RefCell::new(None)),prop_pane,lyrics_pane,lyrics_error_logged:None,bound_video_pane,props_open:false,chat_open:false,composer_focus_pending:false, voice_held:false, pending: None, accepted: false,
                     transcript: vec![], compact, core_notice, runtime_state: serde_json::Value::Null,
-                    surface_mounted: false,navigation_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
+                    surface_mounted: false,navigation_revision:0,error_notice_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
             });
             *main_ui.borrow_mut()=Some(view.clone());
             cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(rgba(0x00000000)))

@@ -5,12 +5,13 @@ import Testing
 @Test
 @MainActor
 func programPlaybackQueueKeepsCurrentTwoLockedAndTheRestInReserve() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
         preflight: PlaybackPreflight(preparer: preparer)
-    )
+    , call: fixture.call)
 
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"]))
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])))
 
     #expect(queue.current?.slot.track.id == "1")
     #expect(queue.locked.map(\.slot.track.id) == ["2", "3"])
@@ -21,13 +22,14 @@ func programPlaybackQueueKeepsCurrentTwoLockedAndTheRestInReserve() async throws
 @Test
 @MainActor
 func programPlaybackQueueRestoresAtTheSavedTrack() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
         preflight: PlaybackPreflight(preparer: preparer)
-    )
+    , call: fixture.call)
 
     try await queue.load(
-        playbackPlan(ids: ["1", "2", "3", "4", "5", "6"]),
+        try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])),
         startingAt: 2
     )
 
@@ -40,11 +42,12 @@ func programPlaybackQueueRestoresAtTheSavedTrack() async throws {
 @Test
 @MainActor
 func selectingPreparedTrackReusesItWithoutAnotherPreflight() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: preparer)
+        preflight: PlaybackPreflight(preparer: preparer), call: fixture.call
     )
-    let plan = playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])
+    let plan = try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"]))
     try await queue.load(plan)
 
     try await queue.select(plan, at: 1)
@@ -56,11 +59,12 @@ func selectingPreparedTrackReusesItWithoutAnotherPreflight() async throws {
 @Test
 @MainActor
 func selectingUnpreparedTrackOnlyPreparesTheRequestedSong() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: preparer)
+        preflight: PlaybackPreflight(preparer: preparer), call: fixture.call
     )
-    let plan = playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])
+    let plan = try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"]))
     try await queue.load(plan)
 
     try await queue.select(plan, at: 4)
@@ -72,12 +76,13 @@ func selectingUnpreparedTrackOnlyPreparesTheRequestedSong() async throws {
 @Test
 @MainActor
 func savedProgramRestorerReturnsAPlayableReadyState() async throws {
-    let plan = playbackPlan(ids: ["1", "2", "3", "4", "5"])
-    let store = DJProgramStore()
-    store.publish(plan)
-    store.activateSlot(at: 2)
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let plan = try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5"]))
+    let store = DJProgramStore(client: fixture.client)
+    try await store.publish(plan)
+    try await store.activateSlot(at: 2)
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy())
+        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy()), call: fixture.call
     )
     let restorer = SavedProgramPlaybackRestorer(queue: queue)
 
@@ -130,13 +135,14 @@ func agentPlayCommandStartsTheCurrentlySelectedProgramWhenIdle() {
 @Test
 @MainActor
 func programPlaybackQueueUsesReserveWhenAnUpcomingTrackFailsPreflight() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     preparer.failingTrackIDs = ["2"]
     let queue = ProgramPlaybackQueue(
         preflight: PlaybackPreflight(preparer: preparer)
-    )
+    , call: fixture.call)
 
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4", "5"]))
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5"])))
 
     #expect(queue.current?.slot.track.id == "1")
     #expect(queue.locked.map(\.slot.track.id) == ["3", "4"])
@@ -148,13 +154,14 @@ func programPlaybackQueueUsesReserveWhenAnUpcomingTrackFailsPreflight() async th
 @Test
 @MainActor
 func programPlaybackQueueAdvancesAndRefillsAfterCompletion() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: preparer)
+        preflight: PlaybackPreflight(preparer: preparer), call: fixture.call
     )
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4", "5"]))
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5"])))
 
-    let next = await queue.advanceAfterCompletion()
+    let next = try await queue.advanceAfterCompletion()
 
     #expect(next?.slot.track.id == "2")
     #expect(queue.current?.slot.track.id == "2")
@@ -166,14 +173,15 @@ func programPlaybackQueueAdvancesAndRefillsAfterCompletion() async throws {
 @Test
 @MainActor
 func programPlaybackQueueSkipsFailedReserveTracksWhileRefilling() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: preparer)
+        preflight: PlaybackPreflight(preparer: preparer), call: fixture.call
     )
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"]))
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4", "5", "6"])))
     preparer.failingTrackIDs = ["4"]
 
-    _ = await queue.advanceAfterCompletion()
+    _ = try await queue.advanceAfterCompletion()
 
     #expect(queue.current?.slot.track.id == "2")
     #expect(queue.locked.map(\.slot.track.id) == ["3", "5"])
@@ -184,13 +192,14 @@ func programPlaybackQueueSkipsFailedReserveTracksWhileRefilling() async throws {
 @Test
 @MainActor
 func programPlaybackQueueReplacesTheCurrentTrackAfterPlaybackFailure() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: preparer)
+        preflight: PlaybackPreflight(preparer: preparer), call: fixture.call
     )
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4"]))
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4"])))
 
-    let replacement = await queue.replaceCurrentAfterFailure()
+    let replacement = try await queue.replaceCurrentAfterFailure()
 
     #expect(replacement?.slot.track.id == "2")
     #expect(queue.current?.slot.track.id == "2")
@@ -201,13 +210,14 @@ func programPlaybackQueueReplacesTheCurrentTrackAfterPlaybackFailure() async thr
 @Test
 @MainActor
 func programPlaybackQueueReturnsToThePreviousTrackWithoutLosingTheCurrentOne() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy())
+        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy()), call: fixture.call
     )
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4"]))
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4"])))
 
-    _ = await queue.advanceAfterCompletion()
-    let previous = queue.returnToPrevious()
+    _ = try await queue.advanceAfterCompletion()
+    let previous = try await queue.returnToPrevious()
 
     #expect(previous?.slot.track.id == "1")
     #expect(queue.current?.slot.track.id == "1")
@@ -219,31 +229,32 @@ func programPlaybackQueueReturnsToThePreviousTrackWithoutLosingTheCurrentOne() a
 @Test
 @MainActor
 func replacingUpcomingTracksKeepsTheSongThatIsPlaying() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy())
+        preflight: PlaybackPreflight(preparer: PlaybackPreparingSpy()), call: fixture.call
     )
-    try await queue.load(playbackPlan(ids: ["1", "2", "3", "4"]))
-    _ = await queue.advanceAfterCompletion()
+    try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2", "3", "4"])))
+    _ = try await queue.advanceAfterCompletion()
 
-    await queue.replaceUpcoming(
-        with: playbackPlan(ids: ["5", "6"]).slots
-    )
+    let replacement = try await fixture.seed(playbackPlan(ids: ["5", "6"]))
+    try await queue.replaceUpcoming(programID: replacement.brief.id, programRevision: replacement.revision, startingAt: 0)
 
     #expect(queue.current?.slot.track.id == "2")
     #expect(queue.history.map(\.slot.track.id) == ["1"])
     #expect(queue.locked.map(\.slot.track.id) == ["5", "6"])
 
-    let next = await queue.advanceAfterCompletion()
+    let next = try await queue.advanceAfterCompletion()
     #expect(next?.slot.track.id == "5")
 }
 
 @Test
 @MainActor
-func programPlaybackQueueReportsWhenNoSlotCanBePrepared() async {
+func programPlaybackQueueReportsWhenNoSlotCanBePrepared() async throws {
+    let fixture = try await PrivateMusicAuthorityFixture.start()
     let preparer = PlaybackPreparingSpy()
     preparer.failingTrackIDs = ["1", "2"]
     let queue = ProgramPlaybackQueue(
-        preflight: PlaybackPreflight(preparer: preparer)
+        preflight: PlaybackPreflight(preparer: preparer), call: fixture.call
     )
 
     await #expect(
@@ -251,7 +262,7 @@ func programPlaybackQueueReportsWhenNoSlotCanBePrepared() async {
             failedTrackIDs: ["1", "2"]
         )
     ) {
-        try await queue.load(playbackPlan(ids: ["1", "2"]))
+        try await queue.load(try await fixture.seed(playbackPlan(ids: ["1", "2"])))
     }
 }
 

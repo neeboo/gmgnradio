@@ -149,8 +149,10 @@ func pointCloudLayeringKeepsVideoScenesOpenAndPreservesCoverDetail() {
 
 @Test
 @MainActor
-func stageVisualDirectionStoreAcceptsAndClearsDJDirection() {
-    let store = StageVisualDirectionStore()
+func stageVisualDirectionStoreAcceptsAndClearsDJDirection() async throws {
+    let fixture = try await PrivateStageSettingsFixture.start()
+    let store = StageVisualDirectionStore(defaults: UserDefaults(suiteName: "private-stage-visual-" + UUID().uuidString)!, settings: fixture.settings)
+    try await store.awaitSettingsReady()
 
     store.update(.pulse)
     #expect(store.currentMood == .pulse)
@@ -161,8 +163,10 @@ func stageVisualDirectionStoreAcceptsAndClearsDJDirection() {
 
 @Test
 @MainActor
-func stageVisualDirectionStoreKeepsTheActiveProgramCue() {
-    let store = StageVisualDirectionStore()
+func stageVisualDirectionStoreKeepsTheActiveProgramCue() async throws {
+    let fixture = try await PrivateStageSettingsFixture.start()
+    let store = StageVisualDirectionStore(defaults: UserDefaults(suiteName: "private-stage-visual-" + UUID().uuidString)!, settings: fixture.settings)
+    try await store.awaitSettingsReady()
     let cue = ProgramVisualDirector().cue(
         for: .peak,
         mood: .pulse,
@@ -178,15 +182,17 @@ func stageVisualDirectionStoreKeepsTheActiveProgramCue() {
 
 @Test
 @MainActor
-func manualPointCloudChoiceRemainsLockedWhenTheDJChangesTheSceneCue() throws {
+func manualPointCloudChoiceRemainsLockedWhenTheDJChangesTheSceneCue() async throws {
     let suiteName = "gmgn-radio-point-cloud-lock-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defaults.removePersistentDomain(forName: suiteName)
     defer {
         defaults.removePersistentDomain(forName: suiteName)
     }
-    let store = StageVisualDirectionStore(defaults: defaults)
-    store.selectPointCloud(.albumRelief)
+    let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+    let store = StageVisualDirectionStore(defaults: defaults, settings: fixture.settings)
+    try await store.awaitSettingsReady()
+    try await store.selectPointCloud(rawValue: StagePointCloudChoice.albumRelief.rawValue)
 
     store.update(
         ProgramVisualDirector().cue(
@@ -202,7 +208,7 @@ func manualPointCloudChoiceRemainsLockedWhenTheDJChangesTheSceneCue() throws {
 
 @Test
 @MainActor
-func manualPointCloudChoiceIsRestoredWithoutUsingTheKeychain() throws {
+func manualPointCloudChoiceIsRestoredWithoutUsingTheKeychain() async throws {
     let suiteName = "gmgn-radio-point-cloud-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defaults.removePersistentDomain(forName: suiteName)
@@ -210,16 +216,19 @@ func manualPointCloudChoiceIsRestoredWithoutUsingTheKeychain() throws {
         defaults.removePersistentDomain(forName: suiteName)
     }
 
-    let first = StageVisualDirectionStore(defaults: defaults)
-    first.selectPointCloud(.galaxyField)
-    let restored = StageVisualDirectionStore(defaults: defaults)
+    let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+    let first = StageVisualDirectionStore(defaults: defaults, settings: fixture.settings)
+    try await first.awaitSettingsReady()
+    try await first.selectPointCloud(rawValue: StagePointCloudChoice.galaxyField.rawValue)
+    let restored = StageVisualDirectionStore(defaults: defaults, settings: try await fixture.reopenedSettings())
+    try await restored.awaitSettingsReady()
 
     #expect(restored.currentPointCloudChoice == .galaxyField)
 }
 
 @Test
 @MainActor
-func legacyVinylPreferenceRestoresAsAlbumRelief() throws {
+func legacyVinylPreferenceRestoresAsAlbumRelief() async throws {
     let suiteName = "gmgn-radio-cover-relief-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defaults.removePersistentDomain(forName: suiteName)
@@ -228,14 +237,16 @@ func legacyVinylPreferenceRestoresAsAlbumRelief() throws {
     }
     defaults.set("vinylRecord", forKey: "stage.point-cloud-choice")
 
-    let restored = StageVisualDirectionStore(defaults: defaults)
+    let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+    let restored = StageVisualDirectionStore(defaults: defaults, settings: fixture.settings)
+    try await restored.awaitSettingsReady()
 
     #expect(restored.currentPointCloudChoice == .albumRelief)
 }
 
 @Test
 @MainActor
-func particleSizeFineTuneIsClampedAndRestoredLocally() throws {
+func particleSizeFineTuneIsClampedAndRestoredLocally() async throws {
     let suiteName = "gmgn-radio-particle-size-\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suiteName))
     defaults.removePersistentDomain(forName: suiteName)
@@ -243,13 +254,16 @@ func particleSizeFineTuneIsClampedAndRestoredLocally() throws {
         defaults.removePersistentDomain(forName: suiteName)
     }
 
-    let first = StageVisualDirectionStore(defaults: defaults)
+    let fixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
+    let first = StageVisualDirectionStore(defaults: defaults, settings: fixture.settings)
+    try await first.awaitSettingsReady()
     #expect(first.particleSizeMultiplier == 1)
 
-    first.setParticleSizeMultiplier(1.32)
-    let restored = StageVisualDirectionStore(defaults: defaults)
+    try await first.setParticleSizeMultiplier(rawValue: 1.32)
+    let restored = StageVisualDirectionStore(defaults: defaults, settings: try await fixture.reopenedSettings())
+    try await restored.awaitSettingsReady()
     #expect(abs(restored.particleSizeMultiplier - 1.32) < 0.001)
 
-    restored.setParticleSizeMultiplier(3)
+    try await restored.setParticleSizeMultiplier(rawValue: 3)
     #expect(restored.particleSizeMultiplier == 1.6)
 }

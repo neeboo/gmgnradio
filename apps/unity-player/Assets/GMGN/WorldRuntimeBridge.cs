@@ -34,7 +34,7 @@ namespace GMGN.UnityPlayer
             => recoveredItems.TryGetValue(objectID, out var item) && item.Status == "restored" && item.Instance != null ? item.Instance.transform : null;
         public Renderer[] GetHeldPresentationRenderers(GMGN.UnityPlayer.Characters.CharacterWorldAdapter resident)
         {
-            var held = AuthorityProjection?["state"]?["heldProp"];
+            var held = WorldProjectionOptional.Held(AuthorityProjection?["state"]);
             var id = (string)held?["objectID"];
             if (resident == null || resident != character || id == null
                 || (string)held?["avatarAssetID"] != resident.CharacterId
@@ -61,6 +61,7 @@ namespace GMGN.UnityPlayer
         WorldPlacementGeometry.PlacementGeometry placementGeometry;
         WorldPlacementGeometry.PlacementGridView placementView;
         string placementDeriveID;
+        string propNativeFactsSignature;
         JObject placementGrid;
         GMGN.UnityPlayer.Characters.CharacterWorldAdapter character;
         Transform characterParent;
@@ -81,6 +82,43 @@ namespace GMGN.UnityPlayer
         GeneratedAssetResolver outputPreviewAssets;
         public Func<JObject,bool> OutputProjectionAck;
         public JObject AuthorityProjection { get; private set; }
+        readonly WorldPhysicsProbeBridge physicsProbes = new();
+        string lastPhysicsRequest;
+        void MeasureWorldPhysics(JObject request)
+        {
+            var requestID = (string)request["requestID"];
+            if (requestID == lastPhysicsRequest) return;
+            lastPhysicsRequest = requestID;
+            try {
+                var state = AuthorityProjection?["state"];
+                if (state == null || placementGeometry == null || worldRoot == null ||
+                    (string)request["worldID"] != worldID || (ulong?)request["layoutRevision"] != (ulong?)state["layoutRevision"])
+                    throw new InvalidOperationException("world_physics_not_ready");
+                var signature = placementGeometry.SourceSHA256 + "|" + request["hostSessionID"] + "|" + state["layoutRevision"] + "|" + state["heldProp"];
+                var active = new List<RecoveryItem>();
+                var heldID=WorldProjectionOptional.HeldID(state);
+                foreach(var entry in (JObject)state["objectStates"]) {
+                    if((bool?)entry.Value["isEnabled"]!=true || entry.Key==heldID) continue;
+                    if(!recoveredItems.TryGetValue(entry.Key,out var item) || item.Status!="restored" || item.Instance==null)
+                        throw new InvalidOperationException("world_physics_not_ready");
+                    active.Add(item);signature += "|" + item.ObjectID + "|" + item.Instance.transform.localToWorldMatrix;
+                }
+                physicsProbes.Register(worldID,(ulong)state["layoutRevision"],signature,
+                    (JArray)placementGeometry.DeriveRequest["triangles"],worldRoot.transform,active,heldID);
+                if((string)request["mode"]=="register") {
+                    backend.SendCommand(new JObject { ["op"]="world.physics.receipt",["mode"]="register",["requestID"]=request["requestID"],
+                        ["worldID"]=request["worldID"],["hostSessionID"]=request["hostSessionID"],["layoutRevision"]=request["layoutRevision"],
+                        ["physicsGeneration"]=physicsProbes.RegisteredGeneration,["status"]="registered" });
+                    return;
+                }
+                backend.SendCommand(physicsProbes.Measure(request));
+            } catch {
+                backend.SendCommand(new JObject { ["op"]="world.physics.receipt",["requestID"]=request["requestID"],
+                    ["worldID"]=request["worldID"],["hostSessionID"]=request["hostSessionID"],
+                    ["layoutRevision"]=request["layoutRevision"],["physicsGeneration"]=request["physicsGeneration"],
+                    ["status"]="failed",["code"]="world_physics_not_ready" });
+            }
+        }
         public bool Configured => !string.IsNullOrEmpty(worldID);
 
         // Selection and activity share the adapter owned by PlayerScreen. Never
@@ -124,6 +162,7 @@ namespace GMGN.UnityPlayer
         public void Initialize(NativePlayerBackend native, AudioSculpture player)
         {
             backend = native; sculpture = player;
+            backend.WorldPhysicsProbeRequested += MeasureWorldPhysics;
             backend.SendCommand(new JObject { ["op"] = "world.runtime.capabilities",
                 ["marbleSPZVersion"] = GaussianWorldView.FormalMarbleSupported ? 2 : 0 });
             cameraControls = gameObject.AddComponent<WorldCameraController>();
@@ -134,6 +173,7 @@ namespace GMGN.UnityPlayer
             if (!string.IsNullOrEmpty(root) && Configured) generatedAssets = new GeneratedAssetResolver(root, worldID);
             backend.WorldUpdated += OnWorldUpdated;
             backend.PlacementDerived += OnPlacementDerived;
+            backend.PropNativeFactsRejected += OnPropNativeFactsRejected;
             if (Configured) backend.RequestWorldSnapshot(worldID);
         }
 
@@ -196,11 +236,16 @@ namespace GMGN.UnityPlayer
         }
         public bool BeginInventoryPlacement(string objectID)
             => visible && interactions != null && interactions.BeginInventoryPlacement(objectID, InitialPlacementPosition());
+        public JObject ResetPresentationCamera()
+        {
+            if (cameraControls == null) throw new InvalidOperationException("camera_controller_unavailable");
+            return cameraControls.ExecuteCommand(new JObject { ["direction"] = "reset" });
+        }
         public bool DeleteInventoryObject(string objectID)
         {
             var state = AuthorityProjection?["state"];
             if (!visible || state?["objectStates"]?[objectID]?["metadata"]?["gmgn.generated-prop.v1"] == null ||
-                (string)state?["heldProp"]?["objectID"] == objectID) return false;
+                WorldProjectionOptional.HeldID(state) == objectID) return false;
             return backend.SendCommand(new JObject { ["op"] = "inventory.delete", ["worldID"] = worldID,
                 ["objectID"] = objectID, ["layoutRevision"] = state["layoutRevision"] });
         }
@@ -368,12 +413,37 @@ namespace GMGN.UnityPlayer
             if (backend == null || Time.unscaledTime < attachmentReceiptAt) return;
             attachmentReceiptAt = Time.unscaledTime + .5f;
             var receipt = BuildAttachmentReadinessReceipt();
+            PublishPropNativeFacts(receipt);
             var raw = receipt.ToString(Newtonsoft.Json.Formatting.None);
             if ((raw != attachmentReceiptRaw || Time.unscaledTime - attachmentReceiptSentAt >= 5)
                 && backend.SendCommand(receipt)) {
                 attachmentReceiptRaw = raw; attachmentReceiptSentAt = Time.unscaledTime;
             }
         }
+        void PublishPropNativeFacts(JObject attachment)
+        {
+            if (placementGeometry?.SourcePath == null || AuthorityProjection?["state"] == null || character?.CharacterId == null) return;
+            var objects = new JObject();
+            foreach (var item in recoveredItems.Values) {
+                if (item.Instance == null || item.PreparedAssetPath == null || item.AssetMetadata == null) continue;
+                try {
+                    var assetID = (string)JObject.Parse(item.AssetMetadata)["assetID"];
+                    if (assetID != null) objects[item.ObjectID] = new JObject { ["assetID"] = assetID, ["path"] = item.PreparedAssetPath };
+                } catch (Newtonsoft.Json.JsonException) { }
+            }
+            var descriptor = new JObject { ["worldID"] = worldID,
+                ["layoutRevision"] = AuthorityProjection["state"]["layoutRevision"],
+                ["environmentPath"] = placementGeometry.SourcePath,
+                ["environmentSHA256"] = placementGeometry.SourceSHA256,
+                ["avatar"] = new JObject { ["assetID"] = attachment["avatarID"], ["format"] = attachment["avatarFormat"],
+                    ["selectionRevision"] = attachment["selectionRevision"], ["slots"] = attachment["slots"].DeepClone() },
+                ["objects"] = objects };
+            var signature = descriptor.ToString(Newtonsoft.Json.Formatting.None);
+            if (signature == propNativeFactsSignature) return;
+            descriptor["environment"] = placementGeometry.DeriveRequest.DeepClone();
+            if (backend.ReportPropNativeFacts(descriptor)) propNativeFactsSignature = signature;
+        }
+        void OnPropNativeFactsRejected() { propNativeFactsSignature = null; }
         JObject BuildAttachmentReadinessReceipt()
         {
             var slots = new JArray();
@@ -399,7 +469,7 @@ namespace GMGN.UnityPlayer
         {
             PublishAttachmentReadiness();
             var state = AuthorityProjection?["state"];
-            var held = state?["heldProp"];
+            var held = WorldProjectionOptional.Held(state);
             var id = (string)held?["objectID"];
             character?.ClearHeldFingerPose();
             if (projectedHeldObjectID != null && projectedHeldObjectID != id
@@ -479,7 +549,7 @@ namespace GMGN.UnityPlayer
                     var enabled = (bool?)saved["isEnabled"] == true;
                     item.Instance.transform.localPosition = WorldCoordinates.Position(saved["transform"]?["position"]);
                     item.Instance.transform.localRotation = WorldCoordinates.Rotation(saved["transform"]?["rotation"]);
-                    var held = id == (string)state["heldProp"]?["objectID"];
+                    var held = id == WorldProjectionOptional.HeldID(state);
                     item.Instance.SetActive(enabled && !held);
                     item.Status = held ? "attachment_pending" : enabled ? "restored" : "inventory";
                 }
@@ -501,7 +571,7 @@ namespace GMGN.UnityPlayer
                 recoveredItems.TryGetValue(entry.Name, out var item);
                 inventory.Add(new JObject { ["objectID"] = entry.Name, ["name"] = (string)prop["displayName"],
                     ["modelReady"] = item?.Instance != null && (item.Status == "inventory" || item.Status == "restored"),
-                    ["held"] = (string)AuthorityProjection?["state"]?["heldProp"]?["objectID"] == entry.Name,
+                    ["held"] = WorldProjectionOptional.HeldID(AuthorityProjection?["state"]) == entry.Name,
                     ["placed"] = (bool?)entry.Value["isEnabled"] == true,
                     ["status"] = item?.Status ?? "pending" });
             }
@@ -647,9 +717,12 @@ namespace GMGN.UnityPlayer
 
         void OnDestroy()
         {
+            if(backend!=null) backend.WorldPhysicsProbeRequested -= MeasureWorldPhysics;
+            physicsProbes.Dispose();
             lifetime.Cancel(); lifetime.Dispose();
             if (backend != null) backend.WorldUpdated -= OnWorldUpdated;
             if (backend != null) backend.PlacementDerived -= OnPlacementDerived;
+            if (backend != null) backend.PropNativeFactsRejected -= OnPropNativeFactsRejected;
             if (interactions != null) interactions.DeviceRestored -= OnDeviceRestored;
             DetachCharacter();
             if (worldRoot != null) Destroy(worldRoot);
@@ -720,6 +793,7 @@ namespace GMGN.UnityPlayer
             interactions.PreviewStarted += placementView.Hide;
             interactions.PreviewChanged += result => {
                 if (result?["columns"] is not JArray) { placementView.Hide(); return; }
+                if (result["spacing"] != null) { placementView.ShowAuthoritativePreview(result); return; }
                 var volume = result["volume"];
                 var support = (float?)result["previewSupportHeight"];
                 if (volume == null && !support.HasValue) { placementView.Hide(); return; }

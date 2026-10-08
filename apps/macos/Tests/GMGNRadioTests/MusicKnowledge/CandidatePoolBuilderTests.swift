@@ -2,146 +2,35 @@ import Foundation
 import Testing
 @testable import GMGNRadio
 
+// The original selector assertions were moved verbatim to the pure Rust rules.
+// These cases invoke that actual compiled test binary; no Swift reducer remains.
 @Test
-func candidatePoolExcludesRecentlySkippedTracks() async {
-    let now = Date(timeIntervalSince1970: 10_000)
-    let index = InMemoryMusicLibraryIndex()
-    await index.ingest(
-        [
-            poolCandidate(id: "keep", affinity: 0.8),
-            poolCandidate(id: "skip", affinity: 0.9)
-        ],
-        origin: .saved,
-        seenAt: now.addingTimeInterval(-100)
-    )
-    await index.record(.skipped(
-        trackID: "skip",
-        at: now.addingTimeInterval(-60)
-    ))
-
-    let pool = CandidatePoolBuilder().build(
-        from: await index.snapshot(),
-        request: CandidatePoolRequest(
-            limit: 10,
-            now: now,
-            recentSkipWindow: 3600
-        )
-    )
-
-    #expect(pool.items.map(\.candidate.id) == ["keep"])
+func candidatePoolExcludesRecentlySkippedTracks() async throws {
+    try await runCandidatePoolParity("music_program_rules::tests::original_candidate_pool_excludes_recently_skipped_tracks")
 }
 
 @Test
-func candidatePoolUsesFamiliarRediscoveryAndExplorationBuckets() async {
-    let now = Date(timeIntervalSince1970: 10_000_000)
-    let index = InMemoryMusicLibraryIndex()
-
-    for number in 0 ..< 6 {
-        let id = "familiar-\(number)"
-        await index.ingest(
-            [poolCandidate(id: id, affinity: 0.9 - Double(number) * 0.01)],
-            origin: .saved,
-            seenAt: now.addingTimeInterval(-1_000)
-        )
-        await index.record(.played(
-            trackID: id,
-            completed: true,
-            at: now.addingTimeInterval(-86_400)
-        ))
-    }
-    for number in 0 ..< 3 {
-        let id = "rediscovery-\(number)"
-        await index.ingest(
-            [poolCandidate(id: id, affinity: 0.7 - Double(number) * 0.01)],
-            origin: .saved,
-            seenAt: now.addingTimeInterval(-5_000_000)
-        )
-        await index.record(.played(
-            trackID: id,
-            completed: true,
-            at: now.addingTimeInterval(-60 * 86_400)
-        ))
-    }
-    for number in 0 ..< 4 {
-        await index.ingest(
-            [
-                poolCandidate(
-                    id: "explore-\(number)",
-                    affinity: 0.2,
-                    matchScore: 0.9 - Double(number) * 0.01
-                )
-            ],
-            origin: .discovery,
-            seenAt: now
-        )
-    }
-
-    let pool = CandidatePoolBuilder().build(
-        from: await index.snapshot(),
-        request: CandidatePoolRequest(limit: 10, now: now)
-    )
-
-    #expect(pool.items.count == 10)
-    #expect(pool.items.filter { $0.bucket == .familiar }.count == 6)
-    #expect(pool.items.filter { $0.bucket == .rediscovery }.count == 2)
-    #expect(pool.items.filter { $0.bucket == .exploration }.count == 2)
+func candidatePoolUsesFamiliarRediscoveryAndExplorationBuckets() async throws {
+    try await runCandidatePoolParity("music_program_rules::tests::original_candidate_pool_uses_familiar_rediscovery_exploration_buckets")
 }
 
 @Test
-func candidatePoolIsDeterministicAndBackfillsMissingBuckets() async {
-    let now = Date(timeIntervalSince1970: 10_000_000)
-    let index = InMemoryMusicLibraryIndex()
-    for id in ["z", "b", "a", "c", "y", "d", "x"] {
-        await index.ingest(
-            [
-                poolCandidate(
-                    id: id,
-                    affinity: 0.5,
-                    matchScore: 0.5
-                )
-            ],
-            origin: .discovery,
-            seenAt: now
-        )
-    }
-    let request = CandidatePoolRequest(limit: 5, now: now)
-    let builder = CandidatePoolBuilder()
-
-    let first = builder.build(
-        from: await index.snapshot(),
-        request: request
-    )
-    let second = builder.build(
-        from: (await index.snapshot()).reversed(),
-        request: request
-    )
-
-    #expect(first.items.count == 5)
-    #expect(first.items.map(\.candidate.id) == ["a", "b", "c", "d", "x"])
-    #expect(second == first)
-    #expect(first.items.allSatisfy { $0.bucket == .exploration })
+func candidatePoolIsDeterministicAndBackfillsMissingBuckets() async throws {
+    try await runCandidatePoolParity("music_program_rules::tests::original_candidate_pool_is_deterministic_and_backfills_missing_buckets")
 }
 
-private func poolCandidate(
-    id: String,
-    affinity: Double,
-    matchScore: Double = 0.7
-) -> MusicCandidate {
-    MusicCandidate(
-        id: id,
-        canonicalID: nil,
-        providerID: .netease,
-        source: .streaming,
-        title: "Title \(id)",
-        artist: "Artist \(id)",
-        album: nil,
-        duration: 240,
-        isPlayable: true,
-        matchScore: matchScore,
-        userAffinity: affinity,
-        energy: 0.5,
-        moodTags: ["calm"],
-        genres: ["electronic"],
-        releaseYear: 2024
-    )
+private func runCandidatePoolParity(_ name: String) async throws {
+    guard let binary = ProcessInfo.processInfo.environment["GMGN_TASKD_TEST_UNIT_BINARY"],
+          FileManager.default.isExecutableFile(atPath: binary) else { throw PropTaskDaemonError.helperMissing }
+    let result = try await Task.detached {
+        let process = Process(); process.executableURL = URL(fileURLWithPath: binary)
+        process.arguments = ["--exact", name, "--nocapture"]
+        let output = Pipe(); process.standardOutput = output; process.standardError = output
+        try process.run()
+        let bytes = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(decoding: bytes, as: UTF8.self))
+    }.value
+    #expect(result.0 == 0, Comment(rawValue: result.1))
+    #expect(result.1.contains("1 passed"), "The named Rust test must actually execute.")
 }

@@ -1,10 +1,16 @@
 import Foundation
 import WorldRuntime
 
+@MainActor
+private final class UnityWishClaimOutputGate {
+    var check: (WishMachineJob) -> Bool = { _ in false }
+}
+
 /// Business services for one selected world and one resident. All persistence
 /// uses the same root and the original authority; construction replays no jobs.
 @MainActor
 final class UnityWorldSessionComposition {
+    let residentHostSessionID = UUID().uuidString
     enum CompositionError: Error, LocalizedError {
         case selectedWorldMismatch, jukeboxNotPlaced, sessionClosed, authorityReadBehind
         var errorDescription: String? {
@@ -32,6 +38,7 @@ final class UnityWorldSessionComposition {
     private var renderedCharacterSelectionRevision: UInt64 = 0
     private var pendingHeldAvatarRebinding: UnityHeldAvatarRebinding?
     private(set) var heldAvatarBindingNotice: String?
+    private var heldRebindingRequestID: String?
     func adoptAttachmentReadiness(_ receipt: [String: Any]) -> Bool {
         guard !closed else { return false }
         let expectedAssets = Dictionary(uniqueKeysWithValues: context.state.objectStates.compactMap { id,item in
@@ -50,6 +57,9 @@ final class UnityWorldSessionComposition {
     private let referenceDirectory: URL
     private let authority: WorldAuthorityClient
     private let applicationSupportBase: URL
+    typealias NativePropFacts = @Sendable (RustWorldPropClient.Identity) async throws -> Data
+    private let nativePropFacts: NativePropFacts?
+    private let propAuthority: RustWorldPropClient
     var onPropLayoutChanged: (() -> Void)?
     private var inventoryMutation: [String: Any] = ["generation": UInt64(0)]
     private var inventoryMutationBusy = false
@@ -69,15 +79,22 @@ final class UnityWorldSessionComposition {
          validatedPackage: BundledLivingWorldPackage? = nil,
          bundle: Bundle = .main,
          avatarFormat: StageAvatarFormat = .pmx,
+         nativePropFacts: NativePropFacts? = nil,
+         nativePhysicsClient: UnityWorldPhysicsClient? = nil,
          takeoverEnabled: @escaping @MainActor () -> Bool = { true },
          claimEvidence: (@MainActor (WishMachineJob, WorldAgentContext) -> WishMachineClaimEvidence?)? = nil) throws {
         applicationSupportBase = root
+        self.nativePropFacts = nativePropFacts
+        propAuthority = RustWorldPropClient(endpointFile: URL(fileURLWithPath: WorldAuthorityEndpoint(applicationSupportBase: root).endpointFile))
         let package = try validatedPackage ?? LivingWorldBootstrap.loadBundledCanary(bundle: bundle)
         guard package.manifest.worldID == selectedWorldID else {
             throw CompositionError.selectedWorldMismatch
         }
         let initialCollisionWorld: (any WorldCollisionQuerying)?
-        if let marble = try UnityMarbleRuntimeCollision.load(package: package) {
+        let physicsProvider = nativePhysicsClient.map { UnityWorldPhysicsProvider(client:$0,worldID:selectedWorldID) }
+        if let physicsProvider {
+            initialCollisionWorld=physicsProvider
+        } else if let marble = try UnityMarbleRuntimeCollision.load(package: package) {
             initialCollisionWorld = MarbleLivingCabinCollisionWorld(environment: marble,
                 props: CollisionVolumeWorld(volumes:
                     ResidentPropPlacementConfiguration.independentCollisionVolumes(package.manifest)))
@@ -93,14 +110,25 @@ final class UnityWorldSessionComposition {
                     ResidentPropPlacementConfiguration.independentCollisionVolumes(package.manifest)))
             NSLog("[UnityNavigation] collider installed triangles=%ld", triangles.count)
         } else { initialCollisionWorld = nil }
+        let nativePhysics: WorldAgentContext.NativePhysics?
+        if let physicsProvider {
+            nativePhysics = { @MainActor @Sendable request in
+                try await physicsProvider.measure(request)
+            }
+        } else {
+            nativePhysics = nil
+        }
         context = try LivingWorldBootstrap.makeContext(package: package, applicationSupportBase: root,
-            initialCollisionWorld: initialCollisionWorld)
+            initialCollisionWorld: initialCollisionWorld,
+            nativePhysics: nativePhysics)
         try context.adoptAuthorityState(context.state, propFunctionSources: context.propFunctionSources)
         activity = UnityActivityBridge(context: context)
         dispatcher = WorldAgentToolDispatcher(takeoverEnabled: takeoverEnabled, context: context)
         residentScope = "resident.world." + Data(selectedWorldID.utf8).base64EncodedString()
         let support = root.appendingPathComponent("gmgn radio", isDirectory: true)
         let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
+        context.bindWorldControl(client: RustWorldControlClient(endpointFile: endpoint.endpointFile, helperPath: endpoint.helperPath),
+            identity: .init(worldID: selectedWorldID, residentScope: residentScope, hostSessionID: residentHostSessionID))
         authority = WorldAuthorityClient(worldID: selectedWorldID, endpointFile: endpoint.endpointFile,
             helperPath: endpoint.helperPath, allowsLaunching: false)
         referenceDirectory = support.appendingPathComponent("WishMachine/ReferenceImages", isDirectory: true)
@@ -119,11 +147,13 @@ final class UnityWorldSessionComposition {
         generationStore = PropGenerationStore(directory: support.appendingPathComponent("PropGeneration", isDirectory: true), daemonClient: daemon)
         let sharedContext = context, projection = activity, store = generationStore
         let scope = residentScope
+        let outputGate = UnityWishClaimOutputGate()
         inbox = UnityInboxBridge(root: root, worldID: selectedWorldID, residentScope: scope)
         wishCoordinator = WishMachineCoordinator(store: generationStore,
             directory: support.appendingPathComponent("WishMachine", isDirectory: true),
+            wishControlHostSessionID: residentHostSessionID,
             canClaim: { job in
-                guard job.residentScope == scope,
+                guard job.residentScope == scope, outputGate.check(job),
                       let evidence = claimEvidence.map({ $0(job, sharedContext) })
                         ?? Self.authoritativeClaimEvidence(job, sharedContext, store: store),
                       evidence.worldID == selectedWorldID,
@@ -137,9 +167,13 @@ final class UnityWorldSessionComposition {
                 return WishMachineClaimEvidence(worldID: evidence.worldID, activityID: evidence.activityID,
                     phase: evidence.phase == "loop" && !projection.hasRenderedLoop(activityID: "wish_machine.collect")
                         ? nil : evidence.phase,
-                    distanceMeters: evidence.distanceMeters, outputAvailable: evidence.outputAvailable)
+                    distanceMeters: evidence.distanceMeters, outputAvailable: evidence.outputAvailable,
+                    activityRequestID: evidence.activityRequestID, activityGeneration: evidence.activityGeneration,
+                    phaseGeneration: evidence.phaseGeneration, activityHostSessionID: evidence.activityHostSessionID,
+                    objectID: evidence.objectID)
             })
-        registrar = UnityWishInventoryRegistrar(root: root, worldID: selectedWorldID, store: generationStore)
+        registrar = UnityWishInventoryRegistrar(root: root, worldID: selectedWorldID, residentScope: scope,
+            hostSessionID: residentHostSessionID, store: generationStore)
         let inventory = registrar
         wish = UnityWishMachineBridge(coordinator: wishCoordinator, worldID: selectedWorldID,
             residentScope: residentScope, registerInventory: { try await inventory.register($0) },
@@ -177,8 +211,24 @@ final class UnityWorldSessionComposition {
             do { try self.context.completeActivityPlayback(requestID: request, phase: phase) }
             catch { NSLog("[UnityActivity] finite motion completion could not persist") }
         }
+        outputGate.check = { [weak self] job in self?.isWishOutputRendered(job.objectID) == true }
         installNotifications()
         preparePropSupport()
+        let authoredTemplates = UnityBuiltinDevicesBridge.snapshot(package: package)
+        Task { [weak self] in
+            guard let self, !self.closed else { return }
+            do {
+                let identity = RustWorldPropClient.Identity(worldID: selectedWorldID,
+                    residentScope: scope, hostSessionID: self.residentHostSessionID)
+                let data = try JSONSerialization.data(withJSONObject: authoredTemplates)
+                let registered = try await self.propAuthority.deviceCatalog(identity,templates:data)
+                struct Reply: Decodable { struct Snapshot: Decodable { struct Record: Decodable {let state:WorldState};let record:Record};let snapshot:Snapshot }
+                let decoder=JSONDecoder();decoder.dateDecodingStrategy = .millisecondsSince1970
+                let confirmed = try decoder.decode(Reply.self,from:registered).snapshot.record.state
+                guard !self.closed else { return }
+                try self.adoptAuthorityState(confirmed)
+            } catch { self.notificationError = "空间原始功能点注册未确认（world_device_catalog_unavailable）。" }
+        }
     }
 
     private func preparePropSupport() {
@@ -242,26 +292,40 @@ final class UnityWorldSessionComposition {
             heldAvatarBindingNotice = "新角色的原挂点或物件资产尚未准备好；原手持记录保留，未放回或重新拿取。"
             return
         }
-        do {
-            let service = makePropPlacementService(isCurrent: { [weak self] in
-                guard let self, !self.closed else { return false }
-                return pending.isCurrent(state: self.context.state, targetAvatarID: self.renderedAvatarAssetID,
-                    selectionRevision: self.renderedCharacterSelectionRevision)
-            })
-            let command = try service.rebindHeldAvatarCommand(objectID: pending.objectID,
-                previousAvatarAssetID: pending.previousAvatarID)
-            try preparePropMutation(command)
-            try service.commit(command, expectedLayoutRevision: context.state.layoutRevision,
-                requestID: "avatar-rebind:\(pending.selectionRevision):\(context.state.layoutRevision):\(pending.objectID)")
-            pendingHeldAvatarRebinding = nil
-            heldAvatarBindingNotice = nil
-            attachmentReadiness.invalidate()
-            onPropLayoutChanged?()
-            NSLog("[UnityAttachment] held avatar rebind committed object=%@ target=%@", pending.objectID, pending.targetAvatarID)
-        } catch {
-            let notice = "新角色手持绑定未保存：\(error.localizedDescription) 原物件和放回位置保留。"
-            if heldAvatarBindingNotice != notice { NSLog("[UnityAttachment] %@", notice) }
-            heldAvatarBindingNotice = notice
+        guard heldRebindingRequestID == nil, let nativeFacts = nativePropFacts else { return }
+        let requestID = "system.avatar-rebind." + UUID().uuidString
+        heldRebindingRequestID = requestID
+        Task { [weak self] in
+            guard let self else { return }
+            var submitted = false
+            do {
+                struct Binding: Decodable { struct Snapshot: Decodable { struct Record: Decodable { let state: WorldState; let recordRevision: UInt64 }; let record: Record }; let snapshot: Snapshot; let heldBindingSHA256: String }
+                let identity = RustWorldPropClient.Identity(worldID: context.manifest.worldID,
+                    residentScope: residentScope, hostSessionID: residentHostSessionID)
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let binding = try decoder.decode(Binding.self, from: await propAuthority.systemReturnBinding(identity))
+                guard !closed, pending.isCurrent(state: binding.snapshot.record.state, targetAvatarID: renderedAvatarAssetID,
+                    selectionRevision: renderedCharacterSelectionRevision) else { throw RustWorldPropError.rejected("world_prop_system_event_stale") }
+                let facts = try await nativeFacts(identity)
+                let observed = try await propAuthority.observe(identity, expectedRevision: binding.snapshot.record.recordRevision,
+                    layoutRevision: binding.snapshot.record.state.layoutRevision, facts: facts)
+                guard !closed, pending.selectionRevision == renderedCharacterSelectionRevision,
+                    pending.targetAvatarID == renderedAvatarAssetID else { throw RustWorldPropError.rejected("world_prop_system_event_stale") }
+                submitted = true
+                let receipt = try await propAuthority.systemAvatarReturn(identity, expectedRevision: binding.snapshot.record.recordRevision,
+                    layoutRevision: binding.snapshot.record.state.layoutRevision, geometryID: observed.geometryID, requestID: requestID,
+                    objectID: pending.objectID, previousAvatarAssetID: pending.previousAvatarID, avatarAssetID: pending.targetAvatarID,
+                    selectionRevision: pending.selectionRevision, heldBindingSHA256: binding.heldBindingSHA256, rebind: true)
+                try await context.adoptRustPropReceipt(receipt)
+                guard context.state.heldProp?.objectID == pending.objectID,
+                    context.state.heldProp?.avatarAssetID == pending.targetAvatarID else { throw RustWorldPropError.executionUnknown }
+                heldRebindingRequestID = nil; pendingHeldAvatarRebinding = nil; heldAvatarBindingNotice = nil
+                attachmentReadiness.invalidate(); onPropLayoutChanged?()
+            } catch {
+                if !submitted { heldRebindingRequestID = nil }
+                if case RustWorldPropError.rejected = error { heldRebindingRequestID = nil }
+                heldAvatarBindingNotice = "新角色手持绑定回执未确认；原物件及放回记录保留（world_prop_rebind_unconfirmed）。"
+            }
         }
     }
 
@@ -287,70 +351,148 @@ final class UnityWorldSessionComposition {
     /// The player's existing action is invoked only after formal navigation,
     /// authored phase progression and the renderer's actual motion acknowledgement.
     var prepareJukebox: (@MainActor () async throws -> Void)?
-    func performJukebox(_ play: @escaping @MainActor () async throws -> Void) async throws {
-        var stage = "prepare"
-        var operationRequestID: String?
-        do {
-            guard !closed else { throw CompositionError.sessionClosed }
-            try await prepareJukebox?()
-            guard !closed else { throw CompositionError.sessionClosed }
-            stage = "availability"
-            guard context.propAnchorRegistry.entry(activityID: "music.listen") != nil else {
-                throw CompositionError.jukeboxNotPlaced
+    private lazy var jukeboxAuthority: RustJukeboxClient = {
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: applicationSupportBase)
+        return RustJukeboxClient(endpointFile: endpoint.endpointFile, helperPath: endpoint.helperPath,
+            worldID: context.manifest.worldID, scopeID: residentScope, hostSessionID: residentHostSessionID)
+    }()
+    private var jukeboxView: RustJukeboxClient.View?
+    private var jukeboxRenderFacts: Data?
+    private var jukeboxLastRenderFacts: Data?
+
+    func performJukebox(operation: Data, _ play: @escaping @MainActor () async throws -> Data) async throws {
+        guard !closed else { throw CompositionError.sessionClosed }
+        var value = try await jukeboxAuthority.begin(operation: operation, requestID: UUID().uuidString)
+        let compoundID = value.compoundID
+        var originalError: Error?
+        var cancellationSent = false
+        defer {
+            if jukeboxView?.compoundID == compoundID {
+                jukeboxView = nil; jukeboxRenderFacts = nil; jukeboxLastRenderFacts = nil
             }
-            stage = "start"
-            activity.invalidateProjection()
-            try context.startActivity(id: "music.listen")
-            guard let requestID = context.currentActivityRequestID else { throw CompositionError.sessionClosed }
-            operationRequestID = requestID
-            stage = "wait"
-            try await activity.waitForRenderedLoop(activityID: "music.listen", requestID: requestID, timeout: 45)
-            try Task.checkCancellation()
-            guard !closed, context.currentActivityRequestID == requestID,
-                  activity.hasRenderedLoop(activityID: "music.listen") else { throw CancellationError() }
-            stage = "play"
-            try await play()
-        } catch {
-            // Only fixed enum codes and a bounded type name. Never log localized
-            // messages, associated object IDs, private paths, URLs or credentials.
-            let code: String
-            switch error {
-            case is CancellationError: code = "cancelled"
-            case UnityActivityBridge.ProjectionError.notRendered: code = "not_rendered"
-            case WorldAgentContextError.activityStartRejected(_, let reason):
-                switch reason {
-                case .notInterruptible: code = "not_interruptible"
-                case .lowerPriority: code = "lower_priority"
-                case .definitionMismatch: code = "definition_mismatch"
-                case .cooldownActive: code = "cooldown_active"
+        }
+        while true {
+            jukeboxView = value
+            if value.state == "completed" { return }
+            if value.state == "failed" {
+                throw originalError ?? RustJukeboxClient.Fault.rejected(value.errorCode ?? "jukebox_execution_failed")
+            }
+            if value.action?.status == "unknown" { throw RustJukeboxClient.Fault.unknown }
+            if (Task.isCancelled || closed) && !cancellationSent {
+                cancellationSent = true; originalError = CancellationError()
+                value = try await jukeboxAuthority.read(compoundID: compoundID, cancelRequested: true)
+                continue
+            }
+            if let pending = value.action, pending.status == "pending" {
+                let claimed = try await jukeboxAuthority.claim(compoundID: compoundID, actionID: pending.actionID)
+                value = claimed; jukeboxView = claimed
+                guard let action = claimed.action, action.status == "claimed" else { continue }
+                let facts: Data
+                do {
+                    guard !closed else { throw CompositionError.sessionClosed }
+                    switch action.kind {
+                    case "prepare":
+                        try await prepareJukebox?()
+                        facts = try jukeboxPreparationFacts()
+                    case "start":
+                        activity.invalidateProjection()
+                        try await context.startActivityMeasured(id: "music.listen")
+                        let run = try await jukeboxAuthority.observeActivity()
+                        guard context.currentActivityRequestID == run.runRequestID else { throw CancellationError() }
+                        facts = try JSONSerialization.data(withJSONObject:
+                            ["runRequestID": run.runRequestID, "generation": run.generation])
+                    case "play":
+                        guard let fence = claimed.runFence,
+                              context.currentActivityRequestID == fence.runRequestID,
+                              context.activeActivitySnapshot?.phase.rawValue == fence.phase else { throw CancellationError() }
+                        facts = try await play()
+                    case "compensate_stop":
+                        guard let fence = claimed.runFence,
+                              context.currentActivityRequestID == fence.runRequestID,
+                              context.activeActivitySnapshot?.phase.rawValue == fence.phase else { throw CancellationError() }
+                        try context.stopActivity(reason: "点唱机操作未完成")
+                        activity.invalidateProjection()
+                        facts = try JSONSerialization.data(withJSONObject: [:])
+                    default: throw RustJukeboxClient.Fault.rejected("jukebox_invalid_state")
+                    }
+                } catch {
+                    originalError = error
+                    let uncertain = error is TaskdHTTPError || error is PropTaskDaemonError
+                        || (error is CancellationError && (action.kind == "play" || action.kind == "start"))
+                    value = try await jukeboxAuthority.receipt(compoundID: compoundID, actionID: action.actionID,
+                        outcome: uncertain ? "unknown" : "failed", errorCode: "native_action_failed")
+                    continue
                 }
-            case WorldAgentContextError.activityRejected: code = "activity_rejected"
-            case WorldAgentContextError.unknownActivity: code = "unknown_activity"
-            case WorldAgentContextError.routeBlocked: code = "route_blocked"
-            case WorldSimulationError.propIsHeld: code = "held_prop_conflict"
-            case WorldSimulationError.activityAlreadyActive: code = "activity_already_active"
-            case WorldSimulationError.staleRevision: code = "stale_revision"
-            case WorldAuthorityError.daemon(let value):
-                let allowed: Set<String> = ["revision_conflict", "request_id_conflict", "world_not_found", "stale_revision", "invalid_state"]
-                code = allowed.contains(value) ? value : "authority_rejected"
-            case WorldAuthorityError.unavailable: code = "authority_unavailable"
-            case WorldAuthorityError.staleProjection: code = "stale_projection"
-            case WorldAuthorityError.noAuthorityRecord: code = "no_authority_record"
-            case WorldAuthorityError.invalidResponse: code = "invalid_authority_response"
-            case WorldAuthorityError.stateEncodeFailed: code = "state_encode_failed"
-            case CompositionError.sessionClosed: code = "session_closed"
-            case CompositionError.jukeboxNotPlaced: code = "jukebox_not_placed"
-            default: code = "unclassified"
+                // Lost replies do not re-execute the native action. Resolve its durable identity only.
+                do {
+                    value = try await jukeboxAuthority.receipt(compoundID: compoundID, actionID: action.actionID,
+                        outcome: "completed", facts: facts)
+                } catch {
+                    let observed = try await jukeboxAuthority.read(compoundID: compoundID)
+                    guard observed.action?.actionID != action.actionID || observed.state == "completed"
+                        || observed.state == "failed" else { throw RustJukeboxClient.Fault.unknown }
+                    value = observed
+                }
+                continue
             }
-            let type = String(String(describing: Swift.type(of: error)).prefix(96))
-            NSLog("[UnityJukebox] failed stage=%@ type=%@ code=%@", stage, type, code)
-            if !closed, let operationRequestID,
-               context.currentActivityRequestID == operationRequestID,
-               context.snapshot.activeActivity?.id == "music.listen" {
-                try? context.stopActivity(reason: "点唱机操作未完成")
-                activity.invalidateProjection()
+            if value.action?.status == "claimed" { throw RustJukeboxClient.Fault.unknown }
+            if let wait = value.waitMS, wait > 0 {
+                // Rust supplies the due interval; this native delay does not decide timeout or stages.
+                try? await Task.sleep(for: .milliseconds(wait))
             }
-            throw error
+            let rendered = jukeboxRenderFacts; jukeboxRenderFacts = nil
+            do {
+                value = try await jukeboxAuthority.read(compoundID: compoundID, renderFacts: rendered)
+            } catch WorldAuthorityError.daemon("jukebox_stale_render") {
+                // A finite clip may advance Rust's phase before the raw renderer fact reaches it.
+                // Discard only that observation; no native action is claimed or replayed here.
+                value = try await jukeboxAuthority.read(compoundID: compoundID)
+            }
+        }
+    }
+    private func jukeboxPreparationFacts() throws -> Data {
+        guard let entry = context.propAnchorRegistry.entry(activityID: "music.listen") else {
+            throw CompositionError.jukeboxNotPlaced
+        }
+        let authored = context.activityCatalog.definition(id: "music.listen")?.contract(for: .loop)?.motionIDs ?? []
+        let projection = UnityActivityMotionProjection.resolve(avatarFormat: avatarFormat,
+            approvedMotions: approvedMotions, locomoting: false, authoredIDs: authored)
+        if projection.required && projection.motion == nil { throw UnityActivityBridge.ProjectionError.notRendered }
+        let contact = context.propAnchorRegistry.anchorsByID[entry.objectID + "#button"]
+            ?? context.propAnchorRegistry.anchorsByID[entry.objectID + "#interact"]
+        func point(_ value: WorldVector3) -> [String: Double] {
+            ["x": Double(value.x), "y": Double(value.y), "z": Double(value.z)]
+        }
+        var facts: [String: Any] = ["worldRevision": context.state.revision, "objectID": entry.objectID,
+            "interactionTarget": point(entry.position), "motionRequired": projection.required,
+            "avatarFormat": avatarFormat?.rawValue as Any? ?? NSNull(),
+            "requiredMotionID": projection.motion?["id"] ?? NSNull(), "contactTarget": NSNull()]
+        if let contact, contact.kind == .interaction { facts["contactTarget"] = point(contact.position) }
+        if projection.required {
+            let selected = projection.motion?["id"] as? String
+            let authoredID = authored.first(where: { $0 == selected || approvedMotions[$0]?.id == selected })
+                ?? (selected == MotionPackageStore.iluvSlapBassVRMID ? authored.first(where: { $0 == "listen.music" }) : nil)
+            facts["motionBinding"] = ["authoredMotionID": authoredID ?? "",
+                "renderedMotionID": projection.motion?["id"] ?? NSNull(),
+                "avatarFormat": avatarFormat?.rawValue as Any? ?? NSNull()]
+        }
+        return try JSONSerialization.data(withJSONObject: facts)
+    }
+    private func captureJukeboxProjection(_ raw: [String: Any]) {
+        guard let view = jukeboxView, view.state == "wait_render", let fence = view.runFence,
+              raw["requestID"] as? String == fence.runRequestID,
+              raw["phase"] as? String == fence.phase else { return }
+        guard let position = raw["position"] as? [Double], position.count == 3 else { return }
+        var facts = raw
+        facts["runRequestID"] = fence.runRequestID; facts["generation"] = fence.generation
+        facts["phaseGeneration"] = fence.phaseGeneration
+        facts["position"] = ["x": position[0], "y": position[1], "z": position[2]]
+        if let contact = raw["contactPosition"] as? [Double], contact.count == 3 {
+            facts["contactPosition"] = ["x": contact[0], "y": contact[1], "z": contact[2]]
+        }
+        if let encoded = try? JSONSerialization.data(withJSONObject: facts, options: .sortedKeys),
+           encoded != jukeboxLastRenderFacts {
+            jukeboxLastRenderFacts = encoded; jukeboxRenderFacts = encoded
         }
     }
 
@@ -365,9 +507,13 @@ final class UnityWorldSessionComposition {
     }
 
     func adoptAuthorityState(_ state: WorldState, replacingUncommittedProjection: Bool = false) throws {
-        var sources = context.propFunctionSources.filter { state.objectStates[$0.declaration.objectID]?.isEnabled == true }
+        var sources = context.propFunctionSources.filter {
+            state.objectStates[$0.declaration.objectID]?.isEnabled == true
+                && state.objectStates[$0.declaration.objectID]?.functionPointDeclaration == nil
+        }
         for (_, item) in state.objectStates where item.isEnabled {
-            guard let raw = item.metadata["gmgn.builtin-device.v1"],
+            guard item.functionPointDeclaration == nil,
+                  let raw = item.metadata["gmgn.builtin-device.v1"],
                   let declaration = try? JSONDecoder().decode(WorldProceduralPropDeclaration.self, from: Data(raw.utf8)),
                   let points = declaration.functionPointDeclaration else { continue }
             sources.removeAll { $0.declaration.objectID == declaration.objectID }
@@ -409,7 +555,8 @@ final class UnityWorldSessionComposition {
     static func authoritativeClaimEvidence(_ job: WishMachineJob, _ context: WorldAgentContext,
                                           store: PropGenerationStore) -> WishMachineClaimEvidence? {
         guard job.worldID == context.manifest.worldID, job.stage == .ready,
-              context.snapshot.activeActivity?.id == "wish_machine.collect",
+              let run = context.currentRustActivityRun,
+              run.definition.id == "wish_machine.collect",
               let anchor = context.propAnchorRegistry.entry(activityID: "wish_machine.collect"),
               let path = job.modelPath, !path.isEmpty,
               FileManager.default.isReadableFile(atPath: path),
@@ -423,7 +570,9 @@ final class UnityWorldSessionComposition {
             + pow(Double(position.y - anchor.position.y), 2)
             + pow(Double(position.z - anchor.position.z), 2))
         return WishMachineClaimEvidence(worldID: job.worldID, activityID: "wish_machine.collect",
-            phase: context.snapshot.activeActivity?.phase.rawValue, distanceMeters: distance, outputAvailable: true)
+            phase: run.phase.rawValue, distanceMeters: distance, outputAvailable: true,
+            activityRequestID: run.requestID, activityGeneration: run.generation,
+            phaseGeneration: run.phaseGeneration, activityHostSessionID: run.hostSessionID, objectID: job.objectID)
     }
 
     /// Each human turn supplies its existing grant identity independently of the
@@ -448,6 +597,7 @@ final class UnityWorldSessionComposition {
                     worldID: self.context.manifest.worldID, residentScope: self.residentScope,
                     authorizationID: grant, isCurrent: isCurrent,
                     humanOrderedClaim: { !humanText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+                    continuationResumeAuthorizationID: foreground && isCurrent() && !humanText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? runID : nil,
                     serviceFacts: serviceFacts)
                 let music = musicActions.map {
                     ResidentMusicToolBridge(actions: UnityResidentMusicActions(base: $0, world: self),
@@ -473,10 +623,12 @@ final class UnityWorldSessionComposition {
                     },
                     resolveDelegatedGrant: { [weak self] objectID, placement in
                         guard let self, !self.closed, isCurrent() else { throw CancellationError() }
-                        return try self.resolveWishPlacementGrant(objectID: objectID, placement: placement)
+                        let grant = try await self.resolveWishPlacementGrant(objectID: objectID, placement: placement)
+                        guard !self.closed, isCurrent() else { throw CancellationError() }
+                        return grant
                     }, recordDelegatedPlacement: { [weak self] grant, placement in
                         guard let self, !self.closed, isCurrent() else { throw CancellationError() }
-                        try self.wishCoordinator.recordPlacementCompletion(worldID: self.context.manifest.worldID,
+                        try await self.wishCoordinator.recordPlacementCompletion(worldID: self.context.manifest.worldID,
                             residentScope: self.residentScope, objectID: grant.objectID, requestID: grant.requestID,
                             surfaceID: placement.surfaceID, target: Self.wishTarget(placement))
                     }, ownershipRow: { [weak self] objectID in
@@ -485,6 +637,17 @@ final class UnityWorldSessionComposition {
                     }, screenCapability: { objectID in
                         guard isCurrent() else { return nil }
                         return screenCapability(objectID)
+                    }, rustTool: { [weak self] name, callID, arguments in
+                        guard let self, !self.closed, isCurrent(), let nativeFacts = self.nativePropFacts,
+                              let dispatch = ResidentWorldToolSession.rustDispatchAuthority,
+                              dispatch.worldID == self.context.manifest.worldID, dispatch.residentScope == self.residentScope,
+                              dispatch.callID == callID, dispatch.toolName == name else {
+                            throw RustWorldPropError.rejected("world_prop_unauthorized")
+                        }
+                        let identity = RustWorldPropClient.Identity(worldID: dispatch.worldID,
+                            residentScope: dispatch.residentScope, hostSessionID: dispatch.hostSessionID)
+                        return try await self.context.executeRustPropTool(name, callID: callID, arguments: arguments,
+                            client: self.propAuthority, identity: identity, nativeFacts: { try await nativeFacts(identity) }, isCurrent: isCurrent)
                     }).tools.filter {
                         ["read_owned_props", "list_placement_surfaces", "preview_prop_placement",
                          "apply_prop_placement", "withdraw_prop", "undo_prop_placement", "delete_prop",
@@ -595,13 +758,13 @@ final class UnityWorldSessionComposition {
             yaw: Double(placement.yaw))
     }
 
-    private func resolveWishPlacementGrant(objectID: String, placement: WorldPropPlacement) throws -> ResidentPropDelegatedGrant {
+    private func resolveWishPlacementGrant(objectID: String, placement: WorldPropPlacement) async throws -> ResidentPropDelegatedGrant {
         guard !closed, context.state.propTombstones?[objectID] == nil,
               context.state.objectStates[objectID]?.generatedProp != nil,
               wishCoordinator.residentJobs(worldID: context.manifest.worldID, residentScope: residentScope)
                 .contains(where: { $0.objectID == objectID && $0.stage == .claimed && $0.autoContinuationPaused != true })
         else { throw WishMachineError.unauthorized }
-        let grant = try wishCoordinator.resolvePlacementGrant(worldID: context.manifest.worldID,
+        let grant = try await wishCoordinator.resolvePlacementGrant(worldID: context.manifest.worldID,
             residentScope: residentScope, objectID: objectID, surfaceID: placement.surfaceID, target: Self.wishTarget(placement))
         let target = (grant.explicitTarget ?? grant.boundTarget).map {
             WorldPropPlacement(surfaceID: $0.surfaceID,
@@ -625,16 +788,18 @@ final class UnityWorldSessionComposition {
     @discardableResult
     func authorizeHumanImages(runID: UUID, conversationID: String,
                               attachments: [ResidentImageAttachment],
-                              isCurrent: @MainActor () -> Bool) throws -> UUID {
+                              isCurrent: @MainActor () -> Bool) async throws -> UUID {
         guard !closed, isCurrent(), !conversationID.isEmpty,
               !attachments.isEmpty, attachments.count <= 4 else { throw WishMachineError.unauthorized }
-        try wishCoordinator.registerImages(attachments, worldID: context.manifest.worldID,
+        try await wishCoordinator.registerImages(attachments, worldID: context.manifest.worldID,
             residentScope: residentScope, conversationID: conversationID)
+        guard !closed, isCurrent() else { throw WishMachineError.unauthorized }
         let grantID = humanImageGrants[runID] ?? humanReferenceWindows[runID] ?? UUID()
-        try wishCoordinator.authorize(registeredImageIDs: attachments.map(\.id),
+        try await wishCoordinator.authorize(registeredImageIDs: attachments.map(\.id),
             worldID: context.manifest.worldID, residentScope: residentScope,
             conversationID: conversationID, authorizationID: grantID,
             source: .init(author: "用户提供", license: "未核验，仅限个人测试"))
+        guard !closed, isCurrent() else { throw WishMachineError.unauthorized }
         humanImageGrants[runID] = grantID
         return grantID
     }
@@ -655,9 +820,7 @@ final class UnityWorldSessionComposition {
             guard !inventoryMutationBusy, value["worldID"] as? String == context.manifest.worldID,
                   let objectID = value["objectID"] as? String,
                   let expected = value["layoutRevision"] as? UInt64,
-                  expected == context.state.layoutRevision,
-                  context.state.objectStates[objectID]?.generatedProp != nil,
-                  context.state.heldProp?.objectID != objectID else { return false }
+                  expected == context.state.layoutRevision else { return false }
             inventoryMutationBusy = true
             Task { [weak self] in
                 guard let self else { return }
@@ -665,12 +828,16 @@ final class UnityWorldSessionComposition {
                 var result: [String: Any] = ["objectID": objectID]
                 do {
                     guard !closed else { throw CompositionError.sessionClosed }
-                    guard context.state.heldProp?.objectID != objectID else {
-                        throw ResidentPropPlacementError.attachmentUnsupported("请先放回手持物件，再删除。")
-                    }
-                    let service = makePropPlacementService(isCurrent: { [weak self] in self?.closed == false })
-                    try service.commit(service.deleteCommand(objectID: objectID), expectedLayoutRevision: expected,
-                        requestID: "human-delete:\(UUID().uuidString)")
+                    let identity = RustWorldPropClient.Identity(worldID: context.manifest.worldID,
+                        residentScope: residentScope, hostSessionID: residentHostSessionID)
+                    let (state, revision) = try await context.rustPropAuthoritySnapshot(client: propAuthority, identity: identity)
+                    guard state.layoutRevision == expected, !closed else { throw RustWorldPropError.rejected("revision_conflict") }
+                    let raw = try JSONSerialization.data(withJSONObject: ["op":"delete","objectID":objectID])
+                    let intent = try await propAuthority.uiIntent(identity, expectedRevision: revision, layoutRevision: expected, command: raw)
+                    guard !closed else { throw CompositionError.sessionClosed }
+                    let receipt = try await propAuthority.uiCommand(identity, intent: intent, expectedRevision: revision,
+                        layoutRevision: expected, geometryID: nil, requestID: "human-delete:" + UUID().uuidString)
+                    try await context.adoptRustPropReceipt(receipt)
                     let durable = try await refreshAuthorityState(preservingActorForInventory: true)
                     guard durable.objectStates[objectID] == nil, durable.propTombstones?[objectID]?.isValid == true else {
                         throw CompositionError.authorityReadBehind
@@ -690,7 +857,9 @@ final class UnityWorldSessionComposition {
             return accepted
         }
         if value["op"] as? String == "activity.projected" {
-            return activity.acknowledgeProjection(value)
+            let accepted = activity.acknowledgeProjection(value)
+            if accepted { captureJukeboxProjection(value) }
+            return accepted
         }
         return wish.command(value)
     }

@@ -31,6 +31,8 @@ final class UnityWorldNotifications {
         guard !closed, !syncing else { return false }
         syncing = true
         defer { syncing = false }
+        try await coordinator.waitUntilReady()
+        guard !closed else { return false }
         // Current ownership facts must reach the human inbox even when the
         // independent agent subscription or acknowledgement is unavailable.
         let scopedJobIDs = Set(coordinator.residentJobs(worldID: worldID, residentScope: residentScope).map(\.id))
@@ -79,7 +81,7 @@ final class UnityWorldNotifications {
                   receipt.kind == "wish." + event.kind.rawValue, receipt.payload == payload else {
                 throw PropTaskDaemonError.invalidFrame
             }
-            try coordinator.markEventPublished(id: event.id)
+            try await coordinator.markEventPublished(id: event.id)
         }
         guard !closed else { return false }
         // A replay after a process restart is already consumed when its local
@@ -106,10 +108,9 @@ final class UnityWorldNotifications {
             let event = ResidentAgentLoop.Event(id: "wish." + message.id.uuidString,
                 kind: message.kind + "." + message.taskId.uuidString + "." + message.id.uuidString,
                 summary: String(decoding: data, as: UTF8.self))
-            let terminal = ["wish.failed", "wish.cancelled", "wish.interrupted", "wish.placed"].contains(message.kind)
-            let resumed = message.payload["resume_authorization_id"] != nil && automatic.contains(message.id)
-            let continuation = job.autoContinuationPaused != true && (terminal || resumed
-                || (message.kind == "wish.outputReady" && automatic.contains(message.id)))
+            // Only the current Rust receipt grants continuation. A native task
+            // kind or a resume-looking payload cannot manufacture that grant.
+            let continuation = automatic.contains(message.id)
             if onAgentEvent?(event, continuation) == true { queued.insert(message.id) }
         }
         return true
@@ -133,10 +134,8 @@ final class UnityWorldNotifications {
         // never release their admission and repeat successful side effects.
         consumed.formUnion(completed)
         pendingDurableWrites.formUnion(completed)
-        for id in completed {
-            try coordinator.acknowledgeEvent(id: id, worldID: worldID, residentScope: residentScope)
-            pendingDurableWrites.remove(id)
-        }
+        // Only the async durable flush may acknowledge either authority. Keep
+        // these consumed facts out of agent admission while ACKs are retried.
     }
 
     func didNotConsume(_ events: [ResidentAgentLoop.Event]) {
@@ -158,10 +157,10 @@ final class UnityWorldNotifications {
             try Task.checkCancellation()
             guard !closed else { return }
             if !coordinator.isEventAcknowledged(id: id, worldID: worldID, residentScope: residentScope) {
-                try coordinator.acknowledgeEvent(id: id, worldID: worldID, residentScope: residentScope)
+                try await coordinator.acknowledgeEvent(id: id, worldID: worldID, residentScope: residentScope)
             }
-            pendingDurableWrites.remove(id)
             try await store.acknowledgeMessage(id: id, consumer: "agent", worldID: worldID, residentScope: residentScope)
+            pendingDurableWrites.remove(id)
             agentMessages.removeValue(forKey: id)
             queued.remove(id)
             consumed.remove(id)

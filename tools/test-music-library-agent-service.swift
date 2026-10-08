@@ -31,7 +31,7 @@ import Foundation
 import os
 \#(try String(contentsOf: root.appendingPathComponent("tools/fixtures/MusicStorageRPCFixture.swift"), encoding: .utf8))
 \#(planTypes)
-\#(declaration("struct AgentVisualDirection:", in: try read("DJCore/AgentShowProposal.swift")))
+\#(try read("DJCore/AgentShowProposal.swift"))
 \#(dto)
 \#(declaration("enum ProgramPlaybackQueueError:", in: queue))
 @MainActor
@@ -53,7 +53,10 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
         artworkURL: URL(string: "https://private.invalid/cover?token=secret"), tracks: tracks, totalTrackCount: total)
 }
 @MainActor final class Fixture: ProgramPlaybackPreparing {
-    let store = SyncedMusicLibraryStore()
+    let backend = MusicStorageRPCFixture()
+    lazy var store = SyncedMusicLibraryStore(storage: backend.client)
+    lazy var programClient = RustMusicProgramClient(call: backend.call)
+    lazy var programStore = DJProgramStore(client: programClient)
     var current = true
     var fetches: [(Int, Int)] = []
     var preparedIDs: [String] = []
@@ -68,7 +71,7 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
     var providerTarget = false
     var badPage = false
     var noProgress = false
-    lazy var service = MusicLibraryAgentService(store: store,
+    lazy var service = MusicLibraryAgentService(store: store, programClient: programClient,
         fetchPage: { [unowned self] provider, id, offset, limit in
             self.fetches.append((offset, limit))
             if self.holdFetch { await withCheckedContinuation { self.waiting = $0 } }
@@ -76,13 +79,21 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
             let all = [track("one"), track("two"), track("three")]
             return MusicPlaylistPage(playlistID: self.badPage ? "wrong" : id,
                 tracks: self.noProgress ? [] : Array(all.dropFirst(offset).prefix(limit)), offset: offset, totalTrackCount: 3)
-        }, makeQueue: { [unowned self] in ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: self)) },
+        }, makeQueue: { [unowned self] in ProgramPlaybackQueue(preflight: PlaybackPreflight(preparer: self), call: self.backend.call) },
         isCurrent: { [unowned self] in self.current },
         commit: { [unowned self] plan, queue, index in
+            try await self.programStore.publish(plan)
+            try await self.programStore.activateSlot(at: index)
             self.commitCount += 1; self.committedIndex = index; self.committedQueue = queue
         })
-    init() { store.merge(playlists: [playlist(), playlist("apple:only", name: "外部歌单", provider: .appleMusic,
-        tracks: [track("apple-song", provider: .appleMusic)], total: 1)]) }
+    init() { }
+    func seed() async throws {
+        store.remove(providerID: .netease); store.remove(providerID: .appleMusic)
+        try await store.flush()
+        store.merge(playlists: [playlist(), playlist("apple:only", name: "外部歌单", provider: .appleMusic,
+            tracks: [track("apple-song", provider: .appleMusic)], total: 1)])
+        try await store.flush()
+    }
     func preparePlayback(for track: MusicCandidate) async throws -> PreparedPlaybackTarget {
         preparedIDs.append(track.id)
         if held { await withCheckedContinuation { waiting = $0 } }
@@ -97,7 +108,18 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
 @main struct Tests {
     @MainActor static func main() async throws {
         let backend = MusicStorageRPCFixture()
+        if ProcessInfo.processInfo.environment["GMGN_MUSIC_LIBRARY_FIXTURE_PHASE"] == "reopen" {
+            let store = SyncedMusicLibraryStore(storage: backend.client)
+            try await store.reload()
+            check(store.playlists.count == 2, "daemon restart preserves both providers")
+            check(store.playlist(id: "netease:cozy")?.tracks.map(\.id) == ["one"], "daemon restart preserves confirmed cached prefix")
+            check(store.playlist(id: "apple:only")?.tracks.map(\.id) == ["apple-song"], "daemon restart preserves other provider")
+            print("\(failures == 0 ? "PASS" : "FAIL"): \(checks) music library restart checks, \(failures) failures")
+            exit(failures == 0 ? 0 : 1)
+        }
         let backgroundStore = SyncedMusicLibraryStore(storage: backend.client)
+        backgroundStore.remove(providerID: .netease); backgroundStore.remove(providerID: .appleMusic)
+        try await backgroundStore.flush()
         let firstMerge = await backgroundStore.mergeAndVerifyInBackground(playlists: [playlist()])
         check(firstMerge && backgroundStore.playlists.count == 1, "background merge publishes verified data")
         let reopened = SyncedMusicLibraryStore(storage: backend.client)
@@ -111,7 +133,7 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
         let blockedStore = SyncedMusicLibraryStore(storage: blockedBackend.client)
         let blockedMerge = await blockedStore.mergeAndVerifyInBackground(playlists: [playlist()])
         check(!blockedMerge && blockedStore.playlists.isEmpty, "background write failure cannot publish unverified library")
-        let f = Fixture()
+        let f = Fixture(); try await f.seed()
         let listing = try f.service.list(query: "cozy", offset: 0, limit: 10)
         check(listing.playlists.count == 1 && listing.playlists.first?.id == "netease:cozy", "local title query returns existing playlist")
         check(f.fetches.isEmpty && f.preparedIDs.isEmpty && f.commitCount == 0, "listing cannot fetch, prepare or alter playback")
@@ -130,6 +152,12 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
         check(prepared.status == "prepared" && !prepared.isPlaying, "preparation never claims actual playback")
         check(f.preparedIDs == ["two"] && f.committedIndex == 1 && f.committedQueue?.current?.slot.track.id == "two",
               "real queue preflight selects exact requested cached track without fallback or prefetch")
+        check(f.programStore.activeSlot?.track.id == "two", "native Store projects actual Rust selected slot")
+        let authority = try await f.programClient.read()
+        check(authority.plan == f.programStore.plan && authority.activeSlotIndex == 1, "same SQLite authority confirms publish and activation")
+        let reloaded = DJProgramStore(client: RustMusicProgramClient(call: f.backend.call))
+        try await reloaded.restoreLatest()
+        check(reloaded.plan == f.programStore.plan && reloaded.activeSlot?.track.id == "two", "new native projection restores actual durable program and slot")
         let count = f.commitCount
         do { _ = try await f.service.prepare(playlistID: "netease:cozy", trackID: "invented"); check(false, "invented track must fail") }
         catch { check(error as? DJAgentMusicLibraryError == .trackNotFound && f.commitCount == count, "unknown ID cannot change playback") }
@@ -141,7 +169,7 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
             } catch { check(error as? DJAgentMusicLibraryError == .sourceUnsupported, "\(operation) rejects external source before access") }
         }
         for mode in ["cancel", "stale", "removed", "replaced", "provider", "failure"] {
-            let p = Fixture(); p.held = true
+            let p = Fixture(); try await p.seed(); p.held = true
             let task = Task { @MainActor in try await p.service.prepare(playlistID: "netease:cozy", trackID: "one") }
             await p.waitUntilHeld()
             check(p.commitCount == 0, "\(mode): suspended preflight leaves official queue untouched")
@@ -154,12 +182,13 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
             case "failure": p.failPrepare = true
             default: break
             }
+            if mode == "removed" || mode == "replaced" { try await p.store.flush() }
             p.waiting?.resume(); p.waiting = nil
             do { _ = try await task.value; check(false, "\(mode) preparation cannot commit") }
             catch { check(p.commitCount == 0, "\(mode): rejected late preparation never commits") }
         }
         for mode in ["cancel", "stale", "bad-page", "failure", "no-progress"] {
-            let p = Fixture(); p.holdFetch = true
+            let p = Fixture(); try await p.seed(); p.holdFetch = true
             let task = Task { @MainActor in try await p.service.read(playlistID: "netease:cozy", offset: 1, limit: 2) }
             await p.waitUntilHeld()
             switch mode {
@@ -182,10 +211,10 @@ func playlist(_ id: String = "netease:cozy", name: String = "Cozy 爵士", provi
             do { _ = try f.service.list(query: nil, offset: offset, limit: 10); check(false, "invalid page bound cannot succeed") }
             catch { check(error as? DJAgentMusicLibraryError == .invalidArguments, "invalid list bounds are rejected without overflow") }
         }
-        let farPage = Fixture()
+        let farPage = Fixture(); try await farPage.seed()
         do { _ = try await farPage.service.read(playlistID: "netease:cozy", offset: 1000, limit: 10); check(false, "far page cannot fetch whole library") }
         catch { check(error as? DJAgentMusicLibraryError == .invalidArguments, "uncached far offset requires sequential pagination") }
-        let busy = Fixture(); busy.held = true
+        let busy = Fixture(); try await busy.seed(); busy.held = true
         let first = Task { @MainActor in try await busy.service.prepare(playlistID: "netease:cozy", trackID: "one") }
         await busy.waitUntilHeld()
         do { _ = try await busy.service.prepare(playlistID: "netease:cozy", trackID: "one"); check(false, "parallel preparation cannot commit over pending operation") }
@@ -207,7 +236,7 @@ func run(_ binary: String, _ args: [String]) throws -> Int32 {
     let process = Process(); process.executableURL = URL(fileURLWithPath: binary); process.arguments = args
     try process.run(); process.waitUntilExit(); return process.terminationStatus
 }
-let sourceFiles = ["MusicSources/MusicSource.swift", "MusicSources/MusicStorageClient.swift", "DJCore/DJProgramStore.swift", "MusicSources/SyncedMusicLibraryStore.swift",
+let sourceFiles = ["MusicSources/MusicSource.swift", "MusicSources/MusicStorageClient.swift", "DJCore/DJProgramStore.swift", "DJCore/RustMusicProgramClient.swift", "MusicKnowledge/TrackKnowledge.swift", "MusicKnowledge/CandidatePoolBuilder.swift", "MusicSources/SyncedMusicLibraryStore.swift",
     "Domain/PlaybackContext.swift", "AudioEngine/PlaybackPreflight.swift", "Agent/MusicLibraryAgentService.swift"]
 let arguments = ["-j1", "-parse-as-library"] + sourceFiles.map { sources.appendingPathComponent($0).path } +
     [program.path, "-o", temp.appendingPathComponent("test").path]

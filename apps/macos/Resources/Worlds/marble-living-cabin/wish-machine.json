@@ -1,5 +1,6 @@
 {
   "id": "wish_machine.device",
+  "collisionSourceID": "wish_machine.collision",
   "kind": "prop.procedural",
   "renderer": "builtin.wish_machine",
   "position": [
@@ -14,6 +15,7 @@
     0.8
   ],
   "activityID": "wish_machine.collect",
+  "placeBindings": [{"placeID":"wish_machine.pickup","role":"pickup"}],
   "functionPoints": [
     {
       "role": "pickup",

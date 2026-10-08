@@ -529,7 +529,8 @@ public struct WorldSimulation: Sendable {
     @discardableResult
     public mutating func advance(
         by duration: TimeInterval,
-        expectedRevision: UInt64
+        expectedRevision: UInt64,
+        recordActivityElapsed: Bool = true
     ) throws -> WorldEvent {
         try validateRevision(expectedRevision)
         guard duration.isFinite, duration >= 0 else {
@@ -537,7 +538,7 @@ public struct WorldSimulation: Sendable {
         }
 
         state.worldTime = state.worldTime.addingTimeInterval(duration)
-        if state.activeActivity?.status == .running {
+        if recordActivityElapsed, state.activeActivity?.status == .running {
             state.activeActivity?.elapsedActiveTime += duration
         }
         return record(.timeAdvanced(duration: duration))

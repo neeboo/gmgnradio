@@ -2,11 +2,12 @@ import Testing
 @testable import GMGNRadio
 
 @Test
+@MainActor
 func agentProgramPlannerUsesTheAgentsTrackOrder() async throws {
-    let agent = DJTrackRankingAgentStub(
-        trackIDs: ["5", "2", "4", "1", "3"]
-    )
-    let planner = AgentProgramPlanner(agent: agent)
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    try fixture.mockOutput(#"{"track_ids":["5","2","4","1","3"]}"#)
+    let agent = PrivateDJPlanningAgent(planningConfiguration: fixture.configuration())
+    let planner = AgentProgramPlanner(agent: agent, client: fixture.client)
     let brief = ProgramBrief(
         id: "agent-show",
         targetDuration: 20 * 60,
@@ -32,8 +33,10 @@ func agentProgramPlannerUsesTheAgentsTrackOrder() async throws {
 }
 
 @Test
+@MainActor
 func agentProgramPlannerAppliesShowStoryHostingAndVisualSemantics() async throws {
-    let agent = DJShowPlanningAgentStub(
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let proposal = DJShowPlanningAgentStub(
         proposal: AgentShowProposal(
             title: "午后推进",
             direction: "先舒展，再提亮，最后回到专注",
@@ -65,7 +68,9 @@ func agentProgramPlannerAppliesShowStoryHostingAndVisualSemantics() async throws
             ]
         )
     )
-    let planner = AgentProgramPlanner(agent: agent)
+    try fixture.mockProposal(proposal.proposal)
+    let agent = PrivateDJPlanningAgent(planningConfiguration: fixture.configuration())
+    let planner = AgentProgramPlanner(agent: agent, client: fixture.client)
     let candidates = [
         candidate(id: "1", title: "One", artist: "A"),
         candidate(id: "2", title: "Two", artist: "B"),
@@ -99,10 +104,11 @@ func agentProgramPlannerAppliesShowStoryHostingAndVisualSemantics() async throws
 }
 
 @Test
+@MainActor
 func agentProgramPlannerFallsBackSafelyWhenShowPlanningFails() async throws {
-    let planner = AgentProgramPlanner(
-        agent: FailingDJShowPlanningAgentStub()
-    )
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    try fixture.mockOutput("invalid model JSON")
+    let planner = AgentProgramPlanner(agent: PrivateDJPlanningAgent(planningConfiguration: fixture.configuration()), client: fixture.client)
     let candidates = [
         candidate(id: "1", title: "One", artist: "A"),
         candidate(id: "2", title: "Two", artist: "B"),

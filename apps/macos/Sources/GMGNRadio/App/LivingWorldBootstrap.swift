@@ -54,6 +54,55 @@ struct BundledLivingWorldPackage: Sendable {
 }
 
 struct MarbleLivingCabinDocument: Decodable {
+    /// The published cabin metadata is a local asset codec. It does not decode
+    /// provider responses or select quality/default semantics for remote worlds.
+    private struct WorldFact: Decodable {
+        struct Assets: Decodable {
+            struct Mesh: Decodable {
+                let collider: URL
+                enum CodingKeys: String, CodingKey { case collider = "collider_mesh_url" }
+            }
+            struct Splats: Decodable {
+                struct Semantics: Decodable {
+                    let scale: Double
+                    let offset: Double
+                    enum CodingKeys: String, CodingKey {
+                        case scale = "metric_scale_factor", offset = "ground_plane_offset"
+                    }
+                }
+                let urls: [String: URL]
+                let semantics: Semantics
+                enum CodingKeys: String, CodingKey {
+                    case urls = "spz_urls", semantics = "semantics_metadata"
+                }
+            }
+            let mesh: Mesh
+            let splats: Splats
+            let thumbnail: URL?
+            enum CodingKeys: String, CodingKey { case mesh, splats, thumbnail = "thumbnail_url" }
+        }
+        let id: String
+        let name: String
+        let model: String?
+        let assets: Assets
+        enum CodingKeys: String, CodingKey {
+            case id = "world_id", name = "display_name", model, assets
+        }
+        func nativeWorld() throws -> MarbleWorld {
+            // This package's manifest names scene-500k.spz explicitly. There is
+            // no provider quality preference or fallback to another resource.
+            guard !id.isEmpty, let splat = assets.splats.urls["500k"],
+                  assets.splats.semantics.scale.isFinite, assets.splats.semantics.scale > 0,
+                  assets.splats.semantics.offset.isFinite else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Invalid published cabin metadata"))
+            }
+            return MarbleWorld(id: id, name: name, model: model, thumbnailURL: assets.thumbnail,
+                colliderURL: assets.mesh.collider,
+                semantics: .init(metricScale: assets.splats.semantics.scale,
+                    groundPlaneOffset: assets.splats.semantics.offset),
+                splatFallbacks: [.init(quality: .fiveHundredK, url: splat)])
+        }
+    }
     struct Vector: Decodable {
         let value: SIMD3<Float>
         init(from decoder: Decoder) throws {
@@ -98,6 +147,14 @@ struct MarbleLivingCabinDocument: Decodable {
     let framing: Framing
     let camera: Camera
     let jukebox: Jukebox
+    enum CodingKeys: String, CodingKey { case world, framing, camera, jukebox }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        world = try c.decode(WorldFact.self, forKey: .world).nativeWorld()
+        framing = try c.decode(Framing.self, forKey: .framing)
+        camera = try c.decode(Camera.self, forKey: .camera)
+        jukebox = try c.decode(Jukebox.self, forKey: .jukebox)
+    }
 }
 
 struct BundledMarbleLivingCabin {
@@ -604,7 +661,8 @@ enum LivingWorldBootstrap {
         walkingSpeed: Float? = nil,
         fileManager: FileManager = .default,
         applicationSupportBase: URL? = nil,
-        initialCollisionWorld: (any WorldCollisionQuerying)? = nil
+        initialCollisionWorld: (any WorldCollisionQuerying)? = nil,
+        nativePhysics: WorldAgentContext.NativePhysics? = nil
     ) throws -> WorldAgentContext {
         // 权威边界（docs/plans/2026-10-02-rust-world-authority-and-mcp.md）：
         // `gmgn-taskd` 是**唯一**写世界状态的进程；`state.json` 降级成只读预像
@@ -639,7 +697,14 @@ enum LivingWorldBootstrap {
             walkingSpeed: walkingSpeed ?? fallbackWalkingSpeed,
             capsule: collisionCapsule(worldID: package.manifest.worldID),
             propFunctionSources: propFunctionSources(in: package, fileManager: fileManager),
-            initialCollisionWorld: initialCollisionWorld
+            initialCollisionWorld: initialCollisionWorld,
+            rustActivityCatalog: RustActivityCatalogClient(endpointFile: endpoint.endpointFile,
+                helperPath: endpoint.helperPath),
+            rustWorldActivity: RustWorldActivityClient(endpointFile: endpoint.endpointFile,
+                helperPath: endpoint.helperPath),
+            rustPropCapability: RustPropCapabilityClient(endpointFile: endpoint.endpointFile,
+                helperPath: endpoint.helperPath),
+            nativePhysics: nativePhysics
         )
         // 事件通道（推送）：权威一变就推进本地投影的 `basedOnRevision`。
         // 渲染路径仍然只读内存里的投影，**永不同步 RPC**（设计 §4.1）。

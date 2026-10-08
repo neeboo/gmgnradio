@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using GMGN.UnityPlayer.World;
@@ -13,6 +14,8 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
     public sealed class PlacementGeometry
     {
         public JObject DeriveRequest { get; private set; }
+        public string SourcePath { get; private set; }
+        public string SourceSHA256 { get; private set; }
         public static async Task<PlacementGeometry> LoadFormalPackage(FormalWorldPackage package, CancellationToken cancellation)
         {
             var world = package.Manifest;
@@ -105,6 +108,7 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
         static async Task<PlacementGeometry> LoadPath(string path, Matrix4x4 unityColliderToGameplay,
             Vector3 seedUnity, CancellationToken cancellation)
         {
+            var sourceHash = await Task.Run(() => HashFile(path), cancellation);
             var model = await new GltfWorldAssetLoader().LoadCollisionAsset(path, cancellation);
             try
             {
@@ -130,9 +134,18 @@ namespace GMGN.UnityPlayer.WorldPlacementGeometry
                 }
                 // Only value-type arrays leave the main thread. No Unity objects,
                 // transforms, mesh properties or rendering APIs are accessed here.
-                return await Task.Run(() => BuildRequest(snapshots, seedUnity, cancellation), cancellation);
+                var measured = await Task.Run(() => BuildRequest(snapshots, seedUnity, cancellation), cancellation);
+                if (await Task.Run(() => HashFile(path), cancellation) != sourceHash) throw new InvalidDataException("碰撞模型在采样期间改变，请重新载入空间。");
+                measured.SourcePath = path;
+                measured.SourceSHA256 = sourceHash;
+                return measured;
             }
             finally { UnityEngine.Object.Destroy(model); }
+        }
+        static string HashFile(string path)
+        {
+            using var stream = File.OpenRead(path); using var sha = SHA256.Create();
+            return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
         }
         sealed class MeshSnapshot { public Vector3[] Vertices; public int[] Indices; public Matrix4x4 Matrix; }
         static PlacementGeometry BuildRequest(List<MeshSnapshot> snapshots, Vector3 seedUnity, CancellationToken cancellation)

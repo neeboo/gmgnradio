@@ -9,11 +9,15 @@ struct PropGenerationSettingsSection: View {
     @State private var hasError = false
     @State private var checkTask: Task<Void, Never>?
     @State private var checkID: UUID?
-
-    private let store: PropGenerationConfigurationStore
-
-    init(store: PropGenerationConfigurationStore = PropGenerationConfigurationStore()) {
-        self.store = store
+    @State private var saving = false
+    private let authority: RustGenerationConfigurationClient
+    private let legacyFile: URL
+    private let currentFile: URL
+    init(authority: RustGenerationConfigurationClient? = nil, legacyFile: URL = PropGenerationConfigurationStore.defaultFileURL) {
+        let root = WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: E2ERuntime.applicationSupportBase)
+        self.authority = authority ?? RustGenerationConfigurationClient(root: root)
+        self.legacyFile = legacyFile
+        currentFile = root.deletingLastPathComponent().appendingPathComponent("secrets/prop-generation.json")
     }
 
     var body: some View {
@@ -41,7 +45,7 @@ struct PropGenerationSettingsSection: View {
                     .disabled(!configured || checkID != nil || !replacementToken.isEmpty)
                 Button("保存") { save() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(saving)
             }
 
             Text("地址和密钥只存在这台电脑上，保存后不会立刻开始生成。")
@@ -58,40 +62,28 @@ struct PropGenerationSettingsSection: View {
     }
 
     private func load() {
+      Task { @MainActor in
         do {
-            let value = try store.load()
-            configured = value != nil
-            if let value { endpoint = value.endpoint.absoluteString }
+            let value = try await authority.load(currentFile: currentFile, legacyFile: legacyFile)
+            configured = value.configured
+            if let origin = value.endpoint { endpoint = origin }
         } catch {
             configured = false
             hasError = true
             message = "许愿机配置读取失败，现有文件已保留。"
         }
+      }
     }
 
     private func save() {
         cancelCheck()
+        guard !saving else { return }; saving = true
+      Task { @MainActor in
+        defer { saving = false }
         do {
-            guard let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                throw PropGenerationError.invalidEndpoint
-            }
-            // A newly entered key explicitly replaces an unreadable old configuration too.
-            let previous = replacementToken.isEmpty ? try store.load() : nil
-            let token: String
-            if replacementToken.isEmpty, let previous {
-                let candidate = try PropGenerationConfiguration(endpoint: url, token: previous.token)
-                guard candidate.endpoint == previous.endpoint else {
-                    hasError = true
-                    message = "更换服务地址时请同时填写密钥。"
-                    return
-                }
-                token = previous.token
-            } else {
-                token = replacementToken
-            }
-            let value = try PropGenerationConfiguration(endpoint: url, token: token)
-            try store.save(value)
-            endpoint = value.endpoint.absoluteString
+            let value = try await authority.save(endpoint: endpoint, replacementToken: replacementToken)
+            guard let origin = value.endpoint else { throw RustGenerationConfigurationClient.ConfigurationError.invalidProtocol }
+            endpoint = origin
             replacementToken = ""
             configured = true
             hasError = false
@@ -104,6 +96,7 @@ struct PropGenerationSettingsSection: View {
             hasError = true
             message = "许愿机配置无法保存，请检查本机存储权限。"
         }
+      }
     }
 
     private func cancelCheck() {
@@ -114,19 +107,16 @@ struct PropGenerationSettingsSection: View {
 
     private func checkConnection() {
         cancelCheck()
+        let id = UUID(); checkID = id
+        checkTask = Task { @MainActor in
+          defer { if checkID == id { checkID = nil; checkTask = nil } }
         do {
-            guard let saved = try store.load(),
-                  let url = URL(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)),
-                  try PropGenerationConfiguration(endpoint: url, token: saved.token).endpoint == saved.endpoint else {
+            guard let saved = try await authority.validatedConfiguration(endpoint: endpoint) else {
                 hasError = true
                 message = "请先保存服务配置，再检测连接。"
                 return
             }
-            let id = UUID()
-            checkID = id
             message = nil
-            checkTask = Task { @MainActor in
-                defer { if checkID == id { checkID = nil; checkTask = nil } }
                 do {
                     let health = try await PropGenerationClient(endpoint: saved.endpoint, token: saved.token).health()
                     guard !Task.isCancelled, checkID == id else { return }
@@ -138,10 +128,10 @@ struct PropGenerationSettingsSection: View {
                     message = (error as? PropGenerationError)?.errorDescription
                         ?? "暂时无法连接生成服务，请检查连接后重试。"
                 }
-            }
         } catch {
             hasError = true
             message = "许愿机配置无法读取，请先保存正确配置。"
+        }
         }
     }
 }

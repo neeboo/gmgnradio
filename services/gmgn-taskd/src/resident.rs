@@ -275,7 +275,7 @@ fn object_text(payload: &Value, invalid: &'static str, limit: usize) -> Result<S
     if !payload.is_object() {
         return Err(error(invalid));
     }
-    let text = serde_json::to_string(payload).map_err(|_| error(invalid))?;
+    let text = crate::canonical_json::to_string(payload).map_err(|_| error(invalid))?;
     if text.len() > limit {
         return Err(error(if invalid == "invalid_state_value" {
             "state_value_too_large"
@@ -312,13 +312,13 @@ fn message_entry(item: &Item) -> Result<Entry> {
 }
 
 /// Deterministic content fingerprint for request-id idempotency. The state
-/// value is canonical JSON (object key order is normalized by serde_json), and
+/// value is canonical JSON (object key order is explicitly normalized), and
 /// attachments are recorded in the order the client provided them.
 fn content_digest(request: &CommitRequest) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut body = Vec::new();
     body.extend_from_slice(
-        &serde_json::to_vec(&request.value).map_err(|_| error("invalid_state_value"))?,
+        &crate::canonical_json::to_vec(&request.value).map_err(|_| error("invalid_state_value"))?,
     );
     for item in &request.events {
         let entry = event_entry(item)?;
@@ -379,7 +379,7 @@ pub fn commit(transaction: &Transaction<'_>, request: &CommitRequest) -> Result<
     }
     // Normalize attachments before touching the database so a malformed item
     // fails fast and rolls nothing back.
-    let value = serde_json::to_string(&request.value).map_err(|_| error("invalid_state_value"))?;
+    let value = crate::canonical_json::to_string(&request.value).map_err(|_| error("invalid_state_value"))?;
     if value.len() > STATE_VALUE_LIMIT {
         return Err(error("state_value_too_large"));
     }
@@ -869,12 +869,13 @@ mod tests {
         request.events = vec![Item {
             id: Uuid::new_v4().to_string(),
             kind: "wish.claimed".into(),
-            payload: json!({"by": "resident"}),
+            payload: serde_json::from_str(r#"{"by":"resident","detail":{"z":2,"a":1}}"#).unwrap(),
         }];
         let first = send(&mut connection, &request);
         assert_eq!(first.revision, 1);
         // Retry with identical content in a different JSON key order.
         request.value = serde_json::from_str(r#"{"state": "content", "alpha": 1}"#).unwrap();
+        request.events[0].payload = serde_json::from_str(r#"{"detail":{"a":1,"z":2},"by":"resident"}"#).unwrap();
         let replay = send(&mut connection, &request);
         assert_eq!(
             replay,

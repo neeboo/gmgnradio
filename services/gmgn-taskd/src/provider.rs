@@ -46,7 +46,7 @@ async fn load(
         req = req.bearer_auth(token);
     }
     if let Some(body) = body {
-        req = req.json(&body);
+        req = req.json(&crate::canonical_json::sorted(&body));
     }
     if let Some(key) = key {
         req = req.header("Idempotency-Key", key);

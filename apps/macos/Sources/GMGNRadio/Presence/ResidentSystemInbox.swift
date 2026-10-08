@@ -1,11 +1,10 @@
 import Foundation
 import Combine
-import os
 
 /// One user-readable system delivery (wish task progress/completion/failure).
 /// This is a projection only: applying it never acknowledges the background
 /// consumer, whose ACK semantics stay in the delivery pipeline.
-public struct ResidentSystemDelivery: Equatable, Sendable {
+public struct ResidentSystemDelivery: Codable, Equatable, Sendable {
     public let eventID: String
     public let taskID: String
     public let kind: String
@@ -76,197 +75,77 @@ public struct ResidentSystemInboxArchive: Codable, Equatable, Sendable {
     }
 }
 
-/// The shared unread truth for system task deliveries across the stage and
-/// Live Cam windows. Content comes only from formal projection data; reading
-/// is a separate, explicit user action and is never implied by the background
-/// consumer's acknowledgement.
-///
-/// 持久化走统一状态合同（gmgn-taskd inbox 域，由注入的 restore/persist 闭包
-/// 承担）。保存是等待式的：apply/markRead 只在可靠落库后才返回 true，失败
-/// 如实出现在 persistenceError 且绝不静默重试——同内容的下一次正式投递或
-/// 显式读取才是重试入口。读取是独立的显式动作，永远不与后台消费者的确认
-/// （ACK）混淆。
+/// Confirmed inbox projection. Raw delivery/read events are resolved by Rust.
 @MainActor
 public final class ResidentSystemInboxStore: ObservableObject {
-    /// 界面只留**一句人话**；失败原因（哪一段、什么错）一条不少地进日志。
-    nonisolated static let diagnosticLog = Logger(subsystem: "ai.gmgn.radio", category: "ResidentSystemInbox")
-    /// Terminal task prompts hide this many seconds after their last actual
-    /// state change; the record itself stays in history and in the badge.
-    public static let terminalPromptLifetime: TimeInterval = 30
-
     @Published private(set) var buckets: [ResidentSystemInboxScope: [ResidentSystemInboxEntry]] = [:]
     @Published public private(set) var persistenceError: String?
-
-    public typealias Restore = (ResidentSystemInboxScope) async throws -> [ResidentSystemInboxEntry]?
-    public typealias Persist = (ResidentSystemInboxScope, [ResidentSystemInboxEntry]) async throws -> Void
-
+    public typealias Legacy = (ResidentSystemInboxScope) async throws -> [ResidentSystemInboxEntry]?
+    private let client: RustInboxClient
     private let clock: () -> Date
-    private let restoreHandler: Restore?
-    private let persistHandler: Persist?
-    /// 仍有未落库失败的作用域：错误保持可见，其内存真相不被恢复覆盖。
-    private var failedScopes: Set<ResidentSystemInboxScope> = []
-    /// 每作用域串行提交链：后一次提交排在前一次之后，始终携带最新内存内容
-    /// 与最新 revision，自身并发不会互相打出 revision_conflict。
-    private var commitChains: [ResidentSystemInboxScope: Task<Bool, Never>] = [:]
-    private var restoreTasks: [ResidentSystemInboxScope: Task<Void, Never>] = [:]
-
-    public init(clock: @escaping () -> Date = Date.init,
-                restore: Restore? = nil,
-                persist: Persist? = nil) {
-        self.clock = clock
-        self.restoreHandler = restore
-        self.persistHandler = persist
+    private let legacy: Legacy?
+    private var snapshots: [ResidentSystemInboxScope: RustInboxClient.Snapshot] = [:]
+    private var restores: [ResidentSystemInboxScope: Task<Void, Never>] = [:]
+    public init(client: RustInboxClient? = nil, clock: @escaping () -> Date = Date.init, legacy: Legacy? = nil) {
+        self.client = client ?? RustInboxClient(root: WorldAuthorityEndpoint.taskServiceRoot())
+        self.clock = clock; self.legacy = legacy
     }
-
-    /// 恢复一个作用域：优先读已落库记录；闭包也可能返回旧 JSON 归档的导入
-    /// 条目（由闭包保证只在该作用域尚无落库记录时返回）。导入内容会立即
-    /// 持久化，重复恢复天然幂等。恢复不覆盖仍有未保存失败的作用域。
+    private func adopt(_ value: RustInboxClient.Snapshot, scope: ResidentSystemInboxScope) {
+        guard value.revision >= (snapshots[scope]?.revision ?? 0) else { return }
+        snapshots[scope] = value; buckets[scope] = value.entries; persistenceError = nil
+    }
     public func restore(worldID: String, residentScope: String) async {
         let scope = ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)
-        if let running = restoreTasks[scope] { await running.value; return }
-        let task = Task<Void, Never> { [weak self] in
-            guard let self, let restoreHandler = self.restoreHandler else { return }
+        if let prior = restores[scope] { await prior.value; return }
+        let operation = Task { [weak self] in
+            guard let self else { return }
             do {
-                let entries = try await restoreHandler(scope)
-                if let entries, !entries.isEmpty, !self.failedScopes.contains(scope) {
-                    self.buckets[scope] = entries.sorted { $0.updatedAt > $1.updatedAt }
-                    if self.failedScopes.isEmpty { _ = await self.persistIfNeeded(scope) }
+                var value = try await client.read(scope: scope)
+                if !value.legacyImported {
+                    let entries = try await legacy?(scope) ?? []
+                    value = try await client.importLegacy(entries, scope: scope)
                 }
-            } catch {
-                self.failedScopes.insert(scope)
-                self.persistenceError = "系统消息恢复失败：\(error.localizedDescription)；已显示的内容保留在内存。"
-            }
+                adopt(value, scope: scope)
+            } catch { persistenceError = "系统消息读取未能确认，请稍后重试。" }
         }
-        restoreTasks[scope] = task
-        await task.value
+        restores[scope] = operation
+        await operation.value
+        restores[scope] = nil
     }
-
-    /// Applies one delivery. **同一条消息的身份是它自己的幂等键 `eventID`**：
-    /// id 相同就是同一状态 —— 即使文案或终态这一轮因为会话事实漂移，也绝不翻未读、
-    /// 绝不重锚（只把展示字段刷成最新投影）。id 不同而内容一字不差同样是 no-op：
-    /// 重复投递不重复、不重复落库（除非上一次保存失败 —— 那时由同一条重试）。
-    /// 只有**真的**新状态才原地合并、翻未读，并且只在合并后的状态可靠落库后才报成功。
     @discardableResult
     public func apply(_ delivery: ResidentSystemDelivery, worldID: String, residentScope: String) async -> Bool {
         let scope = ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)
-        var bucket = buckets[scope] ?? []
-        let now = clock()
-        if let index = bucket.firstIndex(where: { $0.taskKey == delivery.taskID }) {
-            let entry = bucket[index]
-            // 同一事件 ⇒ 同一状态。`isRead` / `readAt` / `updatedAt` / `deliveredAt`
-            // 一个字都不许动：终态那一栏来自宿主呈现（会话事实、面板最近 20 条窗口），
-            // 它今天与上次不同并不代表"这件事又有了新进展"。
-            if entry.lastEventID == delivery.eventID {
-                var refreshed = entry
-                refreshed.kind = delivery.kind
-                refreshed.title = delivery.title
-                refreshed.status = delivery.status
-                refreshed.detail = delivery.detail
-                refreshed.terminal = delivery.terminal
-                guard refreshed != entry else {
-                    guard failedScopes.contains(scope) else { return false }
-                    return await persistIfNeeded(scope)
-                }
-                bucket[index] = refreshed
-                buckets[scope] = bucket
-                return await persistIfNeeded(scope)
-            }
-            let unchanged = entry.title == delivery.title && entry.status == delivery.status
-                && entry.detail == delivery.detail && entry.kind == delivery.kind
-                && entry.terminal == delivery.terminal
-            guard !unchanged else {
-                guard failedScopes.contains(scope) else { return false }
-                return await persistIfNeeded(scope)
-            }
-            var updated = entry
-            updated.lastEventID = delivery.eventID
-            updated.kind = delivery.kind
-            updated.title = delivery.title
-            updated.status = delivery.status
-            updated.detail = delivery.detail
-            updated.terminal = delivery.terminal
-            updated.isRead = false
-            updated.readAt = nil
-            updated.updatedAt = now
-            bucket[index] = updated
-        } else {
-            bucket.insert(ResidentSystemInboxEntry(
-                taskKey: delivery.taskID, lastEventID: delivery.eventID, kind: delivery.kind,
-                title: delivery.title, status: delivery.status, detail: delivery.detail,
-                terminal: delivery.terminal, isRead: false, readAt: nil,
-                deliveredAt: now, updatedAt: now), at: 0)
-        }
-        bucket.sort { $0.updatedAt > $1.updatedAt }
-        buckets[scope] = bucket
-        return await persistIfNeeded(scope)
+        do {
+            let value = try await client.deliver([delivery], scope: scope)
+            adopt(value, scope: scope); return value.changed
+        } catch { persistenceError = "这条系统消息尚未确认保存，请稍后重试。"; return false }
     }
-
     public func entries(worldID: String, residentScope: String) -> [ResidentSystemInboxEntry] {
         buckets[ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)] ?? []
     }
-
     public func entry(taskKey: String, worldID: String, residentScope: String) -> ResidentSystemInboxEntry? {
         entries(worldID: worldID, residentScope: residentScope).first { $0.taskKey == taskKey }
     }
-
     public func unreadCount(worldID: String, residentScope: String) -> Int {
-        entries(worldID: worldID, residentScope: residentScope).filter { !$0.isRead }.count
+        snapshots[ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)]?.unreadCount ?? 0
     }
-
-    /// Reading is explicit: only the inbox detail's deliberate open calls this.
-    /// Success means the read state is durably persisted, not merely applied.
     @discardableResult
-    public func markRead(taskKey: String, worldID: String, residentScope: String) async -> Bool {
+    public func markRead(taskKey: String, worldID: String, residentScope: String, expectedEventID: String? = nil) async -> Bool {
         let scope = ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)
-        guard var bucket = buckets[scope],
-              let index = bucket.firstIndex(where: { $0.taskKey == taskKey }),
-              !bucket[index].isRead else { return false }
-        bucket[index].isRead = true
-        bucket[index].readAt = clock()
-        buckets[scope] = bucket
-        return await persistIfNeeded(scope)
+        guard let event = expectedEventID ?? entry(taskKey: taskKey, worldID: worldID, residentScope: residentScope)?.lastEventID else { return false }
+        do {
+            let value = try await client.markRead(taskKey: taskKey, expectedEventID: event, scope: scope)
+            adopt(value, scope: scope); return value.changed
+        } catch { persistenceError = "已读状态未能确认，未读提示已保留，请刷新后重试。"; return false }
     }
-
-    /// When the task's on-site prompt stops showing: `nil` for non-terminal
-    /// tasks (they persist), or 30s after the last actual change for terminal
-    /// ones. Expiry only hides the prompt; history and the badge are unaffected.
     public func promptExpiry(taskKey: String, worldID: String, residentScope: String) -> Date? {
-        guard let entry = entry(taskKey: taskKey, worldID: worldID, residentScope: residentScope),
-              entry.terminal else { return nil }
-        return entry.updatedAt.addingTimeInterval(Self.terminalPromptLifetime)
+        snapshots[ResidentSystemInboxScope(worldID: worldID, residentScope: residentScope)]?.promptExpiries[taskKey]
     }
-
     public func visibleEntries(worldID: String, residentScope: String, now: Date? = nil) -> [ResidentSystemInboxEntry] {
         let now = now ?? clock()
-        return entries(worldID: worldID, residentScope: residentScope).filter { entry in
-            !entry.terminal || now < entry.updatedAt.addingTimeInterval(Self.terminalPromptLifetime)
+        return entries(worldID: worldID, residentScope: residentScope).filter {
+            guard let expiry = promptExpiry(taskKey: $0.taskKey, worldID: worldID, residentScope: residentScope) else { return true }
+            return now < expiry
         }
-    }
-
-    /// 提交该作用域的当前内存内容。同作用域提交串行化；任何一次失败可见、
-    /// 记入 failedScopes，由下一次显式投递/读取重试——绝不空转重试。
-    private func persistIfNeeded(_ scope: ResidentSystemInboxScope) async -> Bool {
-        guard persistHandler != nil else { return true }
-        let previous = commitChains[scope]
-        let task = Task<Bool, Never> { [weak self] in
-            guard let self, let persistHandler = self.persistHandler else { return false }
-            _ = await previous?.value
-            do {
-                try await persistHandler(scope, self.buckets[scope] ?? [])
-                self.failedScopes.remove(scope)
-                if self.failedScopes.isEmpty { self.persistenceError = nil }
-                return true
-            } catch {
-                self.failedScopes.insert(scope)
-                // 界面上只有一句人话；哪一段没存上、原始错误是什么，全部进日志。
-                Self.diagnosticLog.error(
-                    "收件箱落盘失败：scope=\(String(describing: scope), privacy: .public) 条数=\(self.buckets[scope]?.count ?? 0) error=\(error.localizedDescription, privacy: .public)"
-                )
-                self.persistenceError = "这条系统消息暂时没存上，稍后会自动重试。"
-                return false
-            }
-        }
-        commitChains[scope] = task
-        return await task.value
     }
 }

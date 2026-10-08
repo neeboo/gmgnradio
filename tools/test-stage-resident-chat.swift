@@ -34,7 +34,45 @@ func declaration(_ signature: String, in text: String) -> String {
     }
     fatalError("Unbalanced declaration")
 }
-let state = declaration("final class StageResidentChatState:", in: overlay)
+let nativeState = declaration("final class StageResidentChatState:", in: overlay)
+let nativeImages = """
+let images = ResidentAttachmentStore(
+        directory: E2ERuntime.applicationSupportBase?
+            .appendingPathComponent("gmgn radio/ResidentAttachments", isDirectory: true))
+"""
+precondition(nativeState.contains(nativeImages), "fixture must replace only the native endpoint constructor")
+let state = nativeState.replacingOccurrences(of: nativeImages, with: "let images = AttachmentFixture.makeStore()")
+let privateAttachmentGlue = #"""
+@MainActor enum AttachmentFixture {
+    static func settings() -> RustProductSettingsClient {
+        let rpc = try! PrivateRPC(CommandLine.arguments[1])
+        return RustProductSettingsClient(call: { [rpc] method, data in try rpc.call(method, data) })
+    }
+    static func makeStore() -> ResidentAttachmentStore {
+        let rpc = try! PrivateRPC(CommandLine.arguments[1])
+        let directory = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true).appendingPathComponent("stage-draft-\(UUID())", isDirectory: true)
+        return ResidentAttachmentStore(directory: directory,
+            authority: RustChatAttachmentClient(call: { [rpc] method, data in try rpc.call(method, data) }))
+    }
+    static func png() -> Data {
+        NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:12,pixelsHigh:12,bitsPerSample:8,
+            samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,
+            bytesPerRow:0,bitsPerPixel:0)!.representation(using:.png,properties:[:])!
+    }
+    static func issued(_ store: ResidentAttachmentStore, text: String, date: Date) async throws -> ResidentChatSubmission {
+        await store.add(imageData: png())
+        let issued = try await store.takeSubmission(text: text)
+        return .init(text: text, attachments: issued.attachments, id: issued.id, createdAt: date)
+    }
+    static func wait(_ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        while !condition() {
+            guard Date() < deadline else {throw FixtureFailure.timedOut}
+            try await Task.sleep(for:.milliseconds(10))
+        }
+    }
+}
+"""#
 // ── 窗口失焦：不许关掉装修会话 ────────────────────────────────────────────────
 // 装修的"在手"状态只是一份**本地草稿**（`placement`/`candidate`，`preview` 从不改世界），
 // 切到别的窗口去说话不构成"我放弃这次编辑"；The Sims 也不会因为切窗口就退出建造模式。
@@ -418,6 +456,7 @@ import AppKit
 import Observation
 import simd
 import os
+\#(privateAttachmentGlue)
 \#(rotationHandleAnchor)
 @MainActor @Observable
 \#(speechStore)
@@ -430,6 +469,7 @@ struct NSEvent {
     let keyCode: UInt16
     var scrollingDeltaY: Double = 0
     var hasPreciseScrollingDeltas = false
+    var timestamp: TimeInterval = 0
     /// 建造模式快捷键（R / Shift+R、Delete、Cmd+Z）要读的字段。
     struct ModifierFlags: OptionSet {
         let rawValue: UInt
@@ -464,7 +504,7 @@ struct NSEvent {
     }
     func clearMovement() { movements.removeAll() }
     func setSpeedBoosted(_ value: Bool) { boosted = value }
-    func dollyCamera(scrollDelta: Float, precise: Bool) { dollyCalls += 1 }
+    func dollyCamera(scrollDelta: Float, precise: Bool, eventTimestamp: TimeInterval = 0) { dollyCalls += 1 }
 }
 @MainActor final class Interaction: Responder {
     let spatialStage = Store()
@@ -498,7 +538,7 @@ struct NSEvent {
 @MainActor final class Controller {
     final class Avatar { func setActivity(_ activity: StageAvatarActivity) {} }
     let residentChat = StageResidentChatState()
-    let wishMachineTasks = WishMachineTaskPresentationStore()
+    let wishMachineTasks = WishMachineTaskPresentationStore(productSettings: AttachmentFixture.settings())
     let stageContentView: ChatContent? = ChatContent()
     var voiceState = RealtimeVoiceConnectionState.disconnected
     let avatarRuntime = Avatar()
@@ -579,7 +619,7 @@ enum StageAvatarActivity { case listening, speaking, idle }
 }
 @MainActor final class LiveCamPanel {
     var interactionView: LiveCamPanel { self }
-    let wishMachineTasks = WishMachineTaskPresentationStore()
+    let wishMachineTasks = WishMachineTaskPresentationStore(productSettings: AttachmentFixture.settings())
     func restoreSubmission(_ submission: ResidentChatSubmission) {}
     \#(liveCamPanelTaskSetter)
 }
@@ -588,11 +628,12 @@ enum StageAvatarActivity { case listening, speaking, idle }
 @MainActor final class LiveCamRecovery {
     let messageField = RecoveryField()
     let composer = RecoveryComposer()
-    let images = ResidentAttachmentStore()
+    let images = AttachmentFixture.makeStore()
     var recovery = ResidentDraftRecovery()
     func onComposerVisibilityChanged(_ visible: Bool) {}
     func updateComposerActions() {}
     func updateReplyDisclosure() {}
+    func applyStatusNotice(_ text: String, kind: ResidentStatusNoticeKind) {}
     \#(liveCamRestore)
 }
 /// 测试用的「准备中」闸门：靠状态观测而不是 sleep 的时间差，避免 harness 偶发。
@@ -602,24 +643,25 @@ enum StageAvatarActivity { case listening, speaking, idle }
     func open() { pending?.resume(); pending = nil }
 }
 @main struct Tests {
-    @MainActor static func main() async {
+    @MainActor static func main() async throws {
         var count = 0, failures = 0
         func check(_ condition: Bool, _ text: String) { count += 1; if !condition { failures += 1; print("FAIL: \(text)") } }
         let state = StageResidentChatState()
-        check(state.takeMessage() == nil && !state.isThinking, "blank message is not submitted")
+        check(await state.takeMessage() == nil && !state.isThinking, "blank message is not submitted")
         state.draft = "  去点唱机放首歌  \n"
-        check(state.takeMessage()?.text == "去点唱机放首歌" && state.draft.isEmpty && state.isThinking, "submit trims message and starts waiting")
+        check(await state.takeMessage()?.text == "去点唱机放首歌" && state.draft.isEmpty && state.isThinking, "submit trims message and starts waiting")
         state.draft = "下一条"
-        check(state.takeMessage()?.text == "下一条" && state.draft.isEmpty && state.isThinking, "human guidance can be submitted while the loop is thinking")
+        check(await state.takeMessage()?.text == "下一条" && state.draft.isEmpty && state.isThinking, "human guidance can be submitted while the loop is thinking")
         state.finish("正在播放")
         check(state.reply == "正在播放" && !state.isThinking, "reply exits waiting")
         state.draft = "接着说"
-        check(state.takeMessage()?.text == "接着说", "new message works after reply")
-        let attachment = ResidentImageAttachment(id: UUID(), url: URL(fileURLWithPath: "/tmp/test.png"), displayName: "测试")
-        state.images.restore([attachment])
-        let imageMessage = state.takeMessage()!
+        check(await state.takeMessage()?.text == "接着说", "new message works after reply")
+        await state.images.add(imageData: AttachmentFixture.png())
+        let attachment = state.images.attachments[0]
+        let imageMessage = await state.takeMessage()!
         check(imageMessage.text.isEmpty && imageMessage.attachments == [attachment], "image-only messages can be sent")
         state.restore(imageMessage, error: NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "此后端暂不支持图片"]))
+        try await AttachmentFixture.wait { state.images.attachments == [attachment] && !state.isThinking }
         check(state.images.attachments == [attachment] && state.statusNotice?.contains("此后端暂不支持图片") == true && state.reply.isEmpty, "send failure restores images and explains provider capability separately from reply")
         state.cancel()
         check(!state.isThinking && state.statusNotice != nil && state.reply.isEmpty, "stop exits waiting with app notice, not a resident reply")
@@ -688,8 +730,10 @@ enum StageAvatarActivity { case listening, speaking, idle }
         controller.finishResidentReply("你好")
         check(!content.residentComposer.isHidden && content.visualPicker.isHidden, "visible reply clears the overlapping visual picker")
         controller.residentChat.draft = "后续草稿"
-        controller.restoreResidentSubmission(ResidentChatSubmission(text: "失败消息", attachments: [attachment]), notice: "后端连接中断")
-        check(controller.residentChat.draft == "失败消息\n后续草稿" && controller.residentChat.images.attachments == [attachment], "late delivery failure restores original image and text without losing a newer draft")
+        let controllerFailure = try await AttachmentFixture.issued(controller.residentChat.images, text: "失败消息", date: Date())
+        controller.restoreResidentSubmission(controllerFailure, notice: "后端连接中断")
+        try await AttachmentFixture.wait { controller.residentChat.draft == "失败消息\n后续草稿" }
+        check(controller.residentChat.draft == "失败消息\n后续草稿" && controller.residentChat.images.attachments == controllerFailure.attachments, "late delivery failure restores original image and text without losing a newer draft")
         check(controller.residentChat.statusNotice?.contains("后端连接中断") == true && controller.residentChat.reply == "你好" && !controller.residentChat.isThinking, "restored delivery failure has separate notice and never resubmits")
         controller.finishResidentReply("居民新回复")
         check(controller.residentChat.statusNotice == nil && controller.residentChat.reply == "居民新回复", "new authentic reply clears stale application failure")
@@ -716,29 +760,35 @@ enum StageAvatarActivity { case listening, speaking, idle }
         check(!content.residentComposer.isHidden, "user-initiated turn still reveals the chat")
         controller.setResidentThinking(false)
         content.visualPicker.isHidden = true
-        let imageA = ResidentImageAttachment(id: UUID(), url: URL(fileURLWithPath: "/tmp/A.png"), displayName: "A")
-        let imageB = ResidentImageAttachment(id: UUID(), url: URL(fileURLWithPath: "/tmp/B.png"), displayName: "B")
-        let failureA = ResidentChatSubmission(text: "A", attachments: [imageA], createdAt: Date(timeIntervalSince1970: 1))
-        let failureB = ResidentChatSubmission(text: "B", attachments: [imageB], createdAt: Date(timeIntervalSince1970: 2))
-        for failures in [[failureA, failureB], [failureB, failureA]] {
+        for order in [[0, 1], [1, 0]] {
             let stage = StageResidentChatState()
             let cam = LiveCamRecovery()
+            let stageA = try await AttachmentFixture.issued(stage.images, text: "A", date: Date(timeIntervalSince1970: 1))
+            let stageB = try await AttachmentFixture.issued(stage.images, text: "B", date: Date(timeIntervalSince1970: 2))
+            let camA = try await AttachmentFixture.issued(cam.images, text: "A", date: Date(timeIntervalSince1970: 1))
+            let camB = try await AttachmentFixture.issued(cam.images, text: "B", date: Date(timeIntervalSince1970: 2))
             stage.draft = "新草稿"
             cam.messageField.stringValue = "新草稿"
-            for failure in failures {
-                stage.restore(failure, notice: "失败")
-                cam.restoreSubmission(failure)
+            for index in order {
+                stage.restore([stageA, stageB][index], notice: "失败")
+                cam.restoreSubmission([camA, camB][index])
             }
-            check(stage.draft == "A\nB\n新草稿" && stage.images.attachments == [imageA, imageB], "consecutive stage failure recovery keeps original text and image order")
-            check(cam.messageField.stringValue == "A\nB\n新草稿" && cam.images.attachments == [imageA, imageB], "consecutive Live Cam failure recovery keeps original text and image order")
-            stage.restore(failureA, notice: "重复通知")
-            cam.restoreSubmission(failureA)
+            try await AttachmentFixture.wait { stage.draft == "A\nB\n新草稿" && cam.messageField.stringValue == "A\nB\n新草稿" }
+            check(stage.draft == "A\nB\n新草稿" && stage.images.attachments == stageA.attachments + stageB.attachments, "consecutive stage failure recovery keeps original text and image order")
+            check(cam.messageField.stringValue == "A\nB\n新草稿" && cam.images.attachments == camA.attachments + camB.attachments, "consecutive Live Cam failure recovery keeps original text and image order")
+            stage.restore(stageA, notice: "重复通知")
+            cam.restoreSubmission(camA)
+            try await AttachmentFixture.wait { !stage.images.isPreparing && !cam.images.isPreparing }
             check(stage.draft == "A\nB\n新草稿" && cam.messageField.stringValue == stage.draft, "repeated failure receipt does not duplicate recovered text")
         }
         let edited = StageResidentChatState()
+        let failureA = try await AttachmentFixture.issued(edited.images, text: "A", date: Date(timeIntervalSince1970: 1))
+        let failureB = try await AttachmentFixture.issued(edited.images, text: "B", date: Date(timeIntervalSince1970: 2))
         edited.restore(failureA, notice: "失败")
+        try await AttachmentFixture.wait { edited.draft == "A" }
         edited.draft = "A 已修改\n我的新想法"
         edited.restore(failureB, notice: "失败")
+        try await AttachmentFixture.wait { edited.draft.hasSuffix("B") }
         check(edited.draft.contains("A 已修改\n我的新想法") && edited.draft.hasSuffix("B"), "later failure never overwrites edited recovered text")
         let controls = ComposerControls()
         controls.state.finish("完整的文字回复")
@@ -1351,8 +1401,8 @@ enum StageAvatarActivity { case listening, speaking, idle }
         check(!ResidentImageDropPolicy.allowsHitTesting(eventType: nil, localMouseIsDown: false),
               "没有当前事件时落点完全不存在")
         // 断言 3（+ 断言 1/2 的落点行为）：真的走 store 那一份校验/上限/可见拒绝。
-        let dropDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("gmgn-drop-\(UUID())")
+        let dropDirectory = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+            .appendingPathComponent("gmgn-drop-\(UUID())", isDirectory: true)
         try? FileManager.default.createDirectory(at: dropDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dropDirectory) }
         func droppedFile(_ name: String) -> URL {
@@ -1360,9 +1410,11 @@ enum StageAvatarActivity { case listening, speaking, idle }
             try? Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).write(to: url)
             return url
         }
-        let preparedPNG = Data(repeating: 0x7A, count: 512)
+        let preparedPNG = AttachmentFixture.png()
+        let attachmentRPC = try PrivateRPC(CommandLine.arguments[1])
+        let attachmentAuthority = RustChatAttachmentClient(call: { [attachmentRPC] method, data in try attachmentRPC.call(method, data) })
         let cappedStore = ResidentAttachmentStore(
-            directory: dropDirectory.appendingPathComponent("capped")
+            directory: dropDirectory.appendingPathComponent("capped", isDirectory: true), authority: attachmentAuthority
         ) { _ in preparedPNG }
         await cappedStore.add(urls: (1...6).map { droppedFile("图\($0).png") })
         check(cappedStore.attachments.count == 4,
@@ -1370,7 +1422,7 @@ enum StageAvatarActivity { case listening, speaking, idle }
         check(cappedStore.errorMessage != nil,
               "超过 4 张必须给出可见拒绝，而不是静默丢弃")
         let mixedStore = ResidentAttachmentStore(
-            directory: dropDirectory.appendingPathComponent("mixed")
+            directory: dropDirectory.appendingPathComponent("mixed", isDirectory: true), authority: attachmentAuthority
         ) { _ in preparedPNG }
         await mixedStore.add(urls: [droppedFile("好图.png"), droppedFile("笔记.txt")])
         check(mixedStore.attachments.count == 1 && mixedStore.attachments.first?.displayName == "好图.png",
@@ -1380,7 +1432,7 @@ enum StageAvatarActivity { case listening, speaking, idle }
         // 上一批还在准备时的第二次接入（＋/⌘V/拖拽都走 add(urls:)）同样不许静默丢弃。
         let gate = DropPreparationGate()
         let slowStore = ResidentAttachmentStore(
-            directory: dropDirectory.appendingPathComponent("slow")
+            directory: dropDirectory.appendingPathComponent("slow", isDirectory: true), authority: attachmentAuthority
         ) { _ in
             await gate.wait()
             return preparedPNG
@@ -1413,7 +1465,7 @@ let executable = temporary.appendingPathComponent("test")
 let uiSource = temporary.appendingPathComponent("UI.swift")
 let ui = "import SwiftUI\nimport AppKit\nimport Observation\n@MainActor\n@Observable\n"
     + declaration("final class AgentSpeechStatusStore", in: speechSource) + "\n@MainActor\n"
-    + noticeTypes + "\n@MainActor\n"
+    + noticeTypes + "\n" + privateAttachmentGlue + "\n@MainActor\n"
     + declaration("struct ResidentSpeechErrorNotice:", in: overlay) + "\n@MainActor\n"
     + declaration("struct WishMachineTaskStatusView:", in: overlay) + "\n@MainActor\n"
     + state + "\n@MainActor\n"
@@ -1422,7 +1474,7 @@ let ui = "import SwiftUI\nimport AppKit\nimport Observation\n@MainActor\n@Observ
 try ui.write(to: uiSource, atomically: true, encoding: .utf8)
 // `ResidentStatusBadge.swift` 一并编进来：下面那些断言跑的是**生产那一份**状态→符号
 // 投影与气泡几何，不是 harness 里抄的一份副本。
-let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { sources.appendingPathComponent($0).path }
+let attachmentSources = ["VisualEngine/ResidentStatusBadge.swift", "Presence/ResidentImageAttachment.swift", "Presence/RustChatAttachmentClient.swift", "Presence/RustProductSettingsClient.swift", "Presence/TaskdHTTPTransport.swift", "Presence/PropImagePreparation.swift", "Presence/PropGenerationClient.swift", "Presence/WishMachineTaskPresentation.swift", "Presence/ResidentOwnershipProjection.swift"].map { sources.appendingPathComponent($0).path } + [root.appendingPathComponent("tools/fixtures/PrivateAttachmentAuthority.swift").path]
 // `-disable-sandbox`：Swift 编译器默认用 `sandbox-exec` 隔离宏插件进程，而受限环境下
 // 嵌套 sandbox 会被拒（`sandbox_apply: Operation not permitted`），`@Observable` 于是
 // 编不过。与 `tools/test-agent-speech-playback.swift` / `test-agent-speech-completion.swift`
@@ -1431,4 +1483,6 @@ let checked = try run("/usr/bin/swiftc", ["-disable-sandbox", "-j1", "-typecheck
 guard checked == 0 else { exit(checked) }
 let compiled = try run("/usr/bin/swiftc", ["-disable-sandbox", "-j1", "-parse-as-library", source.path, "-o", executable.path] + attachmentSources)
 guard compiled == 0 else { exit(compiled) }
-exit(try run(executable.path, []))
+if CommandLine.arguments.contains("--compile-only") { print("PASS: stage resident chat actual async attachment consumers compiled"); exit(0) }
+guard CommandLine.arguments.count == 3 else { fatalError("Provide private endpoint and private root, or --compile-only") }
+exit(try run(executable.path, Array(CommandLine.arguments.dropFirst())))

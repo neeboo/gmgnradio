@@ -273,6 +273,11 @@ struct GMGNRadioApp: App {
 /// Narrow presentation seam for the GPUI product entry. All mutations use the
 /// same AppDelegate methods as the original AppKit/SwiftUI surfaces.
 extension AppDelegate {
+    func gpuiErrorNoticeSnapshot() -> [String: Any]? {
+        guard let notice = gpuiErrorNotice else { return nil }
+        return ["revision": gpuiErrorNoticeRevision, "title": notice.title, "message": notice.message]
+    }
+
     func gpuiSubmit(_ submission: ResidentChatSubmission) async throws {
         try await sendResidentSubmission(submission, source: .stage)
     }
@@ -530,8 +535,10 @@ extension AppDelegate {
         switch op {
         case "stage.autonomy.resume": presentation.resumeAutonomy()
         case "stage.autonomy.off":
-            UserDefaults.standard.set(false, forKey: ResidentAutonomySwitch.defaultsKey)
-            NotificationCenter.default.post(name: ResidentAutonomySwitch.didChangeNotification, object: nil)
+            Task { do {
+                _ = try await RustProductSettingsClient.shared.apply(["autonomyEnabled": false])
+                NotificationCenter.default.post(name: ResidentAutonomySwitch.didChangeNotification, object: nil)
+            } catch { presentation.reportAutonomySettingsFailure("自主设置未保存，请检查后台连接。") } }
         default: return false
         }
         return true
@@ -569,8 +576,7 @@ extension AppDelegate {
     func gpuiLyricsSnapshot(isProgramRailVisible: Bool) -> [String: Any] {
         let time = audioGraphStorage?.playbackPosition ?? 0
         let animationTime = Date().timeIntervalSinceReferenceDate
-        let mode = StageLyricModeDirector.resolve(configuredMode: stageLyrics.visualMode,
-            trackID: stageLyrics.trackID, lines: stageLyrics.lines, playbackTime: time)
+        let mode = stageLyrics.resolvedVisualMode
         let motion = StageLyricAudioMotion(features: audioFeatures.current, animationTime: animationTime, mode: mode)
         let flow = StageLyricFlowSceneModel(lines: stageLyrics.lines, playbackTime: time)
         let depth = StageLyricSceneModel(lines: stageLyrics.lines, playbackTime: time)
@@ -663,7 +669,7 @@ extension AppDelegate {
         return ["scope": residentTranscriptScopeKey,
                 "persistenceError": residentSystemInboxStore.persistenceError as Any? ?? NSNull(),
                 "entries": rows.map { entry -> [String: Any] in
-                    ["id": entry.id, "title": entry.title, "status": entry.status,
+                    ["id": entry.id, "eventID": entry.lastEventID, "title": entry.title, "status": entry.status,
                      "detail": entry.detail, "isRead": entry.isRead,
                      "updatedAt": entry.updatedAt.timeIntervalSince1970,
                      "updatedAtText": entry.updatedAt.formatted(date: .abbreviated, time: .shortened),
@@ -671,15 +677,15 @@ extension AppDelegate {
                 }]
     }
 
-    func gpuiOpenInboxEntry(id: String, scope: String) -> Bool {
+    func gpuiOpenInboxEntry(id: String, scope: String, expectedEventID: String) -> Bool {
         let context = currentResidentWorldContext()
         guard scope == residentTranscriptScopeKey, let worldID = context.worldID,
               residentSystemInboxStore.entries(worldID: worldID, residentScope: context.sessionScope)
-                .contains(where: { $0.id == id }) else { return false }
+                .contains(where: { $0.id == id && $0.lastEventID == expectedEventID }) else { return false }
         Task { @MainActor [weak self] in
             guard let self else { return }
             _ = await self.residentSystemInboxStore.markRead(taskKey: id, worldID: worldID,
-                                                            residentScope: context.sessionScope)
+                                                            residentScope: context.sessionScope, expectedEventID: expectedEventID)
             self.pushSystemInboxSnapshots()
         }
         return true
@@ -722,7 +728,7 @@ extension AppDelegate {
         case "chat.attachments.remove":
             guard let raw = command["id"] as? String, let id = UUID(uuidString: raw),
                   store.attachments.contains(where: { $0.id == id }) else { return false }
-            store.remove(id: id)
+            Task {await store.remove(id:id)}
         case "chat.attachments.import":
             guard let paths = command["paths"] as? [String], !paths.isEmpty,
                   paths.allSatisfy({ $0.hasPrefix("/") }) else { return false }
@@ -742,20 +748,18 @@ extension AppDelegate {
             "orbVisible": orbWindowController?.window?.isVisible ?? false]
     }
 
-    func gpuiBuildSubmission(text: String, attachmentIDs: [String]) -> ResidentChatSubmission? {
+    func gpuiBuildSubmission(text: String, attachmentIDs: [String]) async -> ResidentChatSubmission? {
         guard let store = stageWindowController?.gpuiAttachmentStore, store.canSubmit else { return nil }
         let current = store.attachments
         guard current.map({ $0.id.uuidString }) == attachmentIDs else { return nil }
-        let submission = ResidentChatSubmission(text: text, attachments: current)
-        guard submission.canSend else { return nil }
-        _ = store.takeAttachments()
-        return submission
+        do {return try await store.takeSubmission(text:text)}
+        catch {return nil}
     }
 
     func gpuiStopSpeech() { agentSpeechAnnouncer.stop() }
 
-    func gpuiRestoreAttachments(_ attachments: [ResidentImageAttachment]) {
-        stageWindowController?.gpuiAttachmentStore.restore(attachments)
+    func gpuiRestoreSubmission(_ submission: ResidentChatSubmission) async {
+        _ = await stageWindowController?.gpuiAttachmentStore.restoreSubmission(submission)
     }
 
     func gpuiStageSnapshot() -> [String: Any] {
@@ -810,6 +814,8 @@ extension AppDelegate {
                 "videoMode": stageVideos.mode.rawValue, "videoActive": stageVideos.isActive,
                 "videoAssetID": stageVideos.activeAssetID as Any? ?? NSNull(),
                 "videoBrightness": stageVideos.brightness,
+                "videoNotice": stageVideos.authorityError as Any? ?? NSNull(),
+                "videoCanRecoverStop": stageVideos.canRecoverPendingStop,
                 "videoAssets": stageVideos.assets.map { ["id": $0.id, "name": $0.displayName] },
                 "trackID": programStore.activeSlot?.track.id as Any? ?? NSNull(),
                 "boundVideoID": programStore.activeSlot.flatMap { stageVideos.boundAsset(for: $0.track.id)?.id } as Any? ?? NSNull()
@@ -838,12 +844,18 @@ extension AppDelegate {
                 if self.marbleWorldLibrary.errorMessage != nil { self.spatialStage.exitWorld() }
             }
         case "stage.avatar.position":
-            guard let name = command["axis"] as? String, let axis = SpatialAvatarPositionAxis(rawValue: name.uppercased()),
-                  let value = command["value"] as? Double, value.isFinite else { return false }
-            let range: ClosedRange<Double> = axis == .z ? -3...3 : -2...2
-            guard range.contains(value) else { return false }
-            spatialStage.setAvatarPosition(Float(value), axis: axis)
-        case "stage.avatar.reset": spatialStage.resetAvatarPosition()
+            guard let axis = command["axis"] as? String, let value = command["value"] as? Double else { return false }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do { try await spatialStage.setAvatarPosition(rawValue: value, axis: axis) }
+                catch { stageWindowController?.setResidentDeliveryNotice("角色位置未能确认：\(error.localizedDescription)") }
+            }
+        case "stage.avatar.reset":
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do { try await spatialStage.resetAvatarPositionConfirmed() }
+                catch { stageWindowController?.setResidentDeliveryNotice("角色位置重置未能确认：\(error.localizedDescription)") }
+            }
         case "stage.camera.reset": spatialStage.resetCamera()
         case "stage.activity.run":
             guard let id = command["id"] as? String,
@@ -851,16 +863,26 @@ extension AppDelegate {
             runLivingWorldActivity(id: id)
         case "stage.activity.stop": stopLivingWorldActivity()
         case "stage.player.lyrics":
-            guard let id = command["id"] as? String,
-                  let mode = StageLyricsVisualMode.allCases.first(where: { $0.agentValue == id }) else { return false }
-            stageLyrics.setVisualMode(mode)
+            guard let id = command["id"] as? String else { return false }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do { try await stageLyrics.setVisualMode(rawValue: id) }
+                catch { stageWindowController?.setResidentDeliveryNotice("字幕模式未能确认：\(error.localizedDescription)") }
+            }
         case "stage.player.cloud":
-            guard let id = command["id"] as? String, let choice = StagePointCloudChoice(rawValue: id) else { return false }
-            stageVisualDirections.selectPointCloud(choice)
+            guard let id = command["id"] as? String else { return false }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do { try await stageVisualDirections.selectPointCloud(rawValue: id) }
+                catch { stageWindowController?.setResidentDeliveryNotice("点阵选择未能确认：\(error.localizedDescription)") }
+            }
         case "stage.player.particles":
-            guard let value = command["value"] as? Double, value.isFinite,
-                  StageParticleSizing.manualRange.contains(Float(value)) else { return false }
-            stageVisualDirections.setParticleSizeMultiplier(Float(value))
+            guard let value = command["value"] as? Double else { return false }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do { try await stageVisualDirections.setParticleSizeMultiplier(rawValue: value) }
+                catch { stageWindowController?.setResidentDeliveryNotice("粒径设置未能确认：\(error.localizedDescription)") }
+            }
         case "stage.video.mode":
             guard let id = command["id"] as? String, let mode = StageVideoPlaybackMode(rawValue: id) else { return false }
             stageVideos.setMode(mode)
@@ -868,6 +890,7 @@ extension AppDelegate {
             guard let value = command["value"] as? Double, value.isFinite, (0.15...1).contains(value) else { return false }
             stageVideos.setBrightness(Float(value))
         case "stage.video.stop": stageVideos.stop()
+        case "stage.video.recoverStop": stageVideos.recoverPendingByStopping()
         case "stage.video.import":
             let panel = NSOpenPanel()
             panel.allowedContentTypes = [.mpeg4Movie]; panel.allowsMultipleSelection = true
@@ -1401,6 +1424,8 @@ final class AppDelegate:
     var gpuiNavigate: ((String) -> Void)?
     private var gpuiLatestResidentReply = ""
     private var gpuiResidentReplyRevision: UInt64 = 0
+    private var gpuiErrorNoticeRevision: UInt64 = 0
+    private var gpuiErrorNotice: (title: String, message: String)?
 #endif
     private let playbackLogger = Logger(
         subsystem: ProductIdentity.bundleIdentifier,
@@ -1415,24 +1440,56 @@ final class AppDelegate:
     private let stageArtwork = StageArtworkStore()
     private let stagePresentation = StagePresentationModel()
     private let stageVisualDirections = StageVisualDirectionStore()
-    private let stageVideos = StageVideoPlaybackStore()
+    private lazy var stageVideos = makeStageVideoStore()
+    @MainActor private func makeStageVideoStore() -> StageVideoPlaybackStore {
+        let endpoint=WorldAuthorityEndpoint(applicationSupportBase:E2ERuntime.applicationSupportBase)
+        return StageVideoPlaybackStore(defaults:E2ERuntime.defaults,
+            authority:RustStageVideoClient(endpointFile:endpoint.endpointFile,helperPath:endpoint.helperPath,
+                allowsLaunching:true,scope:"stage.videos",hostSessionID:residentAuthorityHostSessionID))
+    }
     private let spatialStage = SpatialStageStore()
     private let avatarRuntime = StageAvatarRuntimeStore.shared
     private let motionPackageStore = try? MotionPackageStore.liveStore()
-    private lazy var marbleWorldLibrary = MarbleWorldLibrary(
-        spatialStage: spatialStage
-    )
+    private lazy var marbleWorldLibrary = makeMarbleWorldLibrary()
+
+    /// Keep actor-bound dependencies inside an explicit actor method rather
+    /// than a lazy property's inferred default-initializer closure.
+    @MainActor
+    private func makeMarbleWorldLibrary() -> MarbleWorldLibrary {
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase)
+        let taskServiceRoot = WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: E2ERuntime.applicationSupportBase)
+        let support = taskServiceRoot.deletingLastPathComponent().deletingLastPathComponent()
+        let authority = RustMarbleControlClient(endpointFile: endpoint.endpointFile,
+            helperPath: endpoint.helperPath, allowsLaunching: true,
+            owner: "marble.worlds", hostSessionID: residentAuthorityHostSessionID)
+        let geometry = authority.makeGeometryClient()
+        let blobRoot = taskServiceRoot.appendingPathComponent("blobs", isDirectory: true)
+        let cache = E2ERuntime.applicationSupportBase.map {
+            MarbleWorldCache(rootURL: $0.appendingPathComponent("gmgn radio/MarbleCache", isDirectory: true))
+        } ?? MarbleWorldCache()
+        let keyProvider = E2ERuntime.applicationSupportBase.map {
+            MarbleAPIKeyProvider(fileURL: $0.appendingPathComponent("ai.gmgn.radio/secrets/world-labs-api-key"))
+        } ?? MarbleAPIKeyProvider()
+        return MarbleWorldLibrary(
+            client: MarbleWorldClient(apiKeyProvider: keyProvider), cache: cache,
+            spatialStage: spatialStage,
+            authority: authority,
+            preparePackage: { @MainActor world in
+                try await UnityMarblePackageBuilder.prepare(world: world, root: support, cache: cache,
+                    geometry: geometry, blobRoot: blobRoot)
+            })
+    }
     private let programStore = DJProgramStore.shared
     private let musicLibraryStore = SyncedMusicLibraryStore.shared
     private var musicLibrarySyncTasks: [MusicProviderID: Task<Void, Never>] = [:]
     private let stageLyrics = StageLyricsStore.shared
     private let agentPreferences = DJAgentPreferences()
-    private let realtimeVoicePreferences = RealtimeVoicePreferences()
     private let realtimeDJSessionController = RealtimeDJSessionController()
     private lazy var agentSpeechAnnouncer = AgentSpeechAnnouncer(
         synthesizer: RustSpeechSynthesizer(configuration: {
             RustSpeechPreferences(defaults: E2ERuntime.defaults).configuration(for: "tts")
-        }, client: RustVoiceClient(root: injectedTaskDaemonRoot), onPlaybackChanged: { [weak self] state in
+        }, client: RustVoiceClient(root: injectedTaskDaemonRoot), scopeID: "app.reply",
+        deliveryMode: "fifo", onPlaybackChanged: { [weak self] state in
             self?.audioGraph.setResidentSpeechPlaying(state.isPlaying)
             self?.avatarRuntime.setResidentSpeechPlayback(
                 isPlaying: state.isPlaying, level: state.level
@@ -1445,7 +1502,23 @@ final class AppDelegate:
     var shortcutSettingsStore: GMGNShortcutSettingsStore {
         shortcutSettings
     }
-    private lazy var musicRuntime = MusicRuntime.live()
+    private lazy var musicRuntime = makeMusicRuntime()
+
+    @MainActor
+    private func makeMusicRuntime() -> MusicRuntime {
+        let taskRoot = injectedTaskDaemonRoot ?? WorldAuthorityEndpoint.taskServiceRoot(
+            applicationSupportBase: E2ERuntime.applicationSupportBase
+        )
+        return MusicRuntime.live(cache: StreamingMusicCache(
+        authority: RustMusicCacheClient(
+            endpointFile: taskRoot.appendingPathComponent("taskd.endpoint.json").path,
+            helperPath: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-taskd").path,
+            allowsLaunching: false,
+            taskRoot: taskRoot,
+            hostSessionID: residentAuthorityHostSessionID
+        )
+        ))
+    }
     private var audioGraphStorage: AudioGraphController?
     private var audioGraph: AudioGraphController {
         if let audioGraphStorage {
@@ -1501,7 +1574,8 @@ final class AppDelegate:
     /// 电视来源 / 标定 / 内容的持久化（显式 root 注入，E2E 下落在测试根）。
     private lazy var screenPersistence = WorldScreenPersistence(
         fileURL: E2ERuntime.applicationSupportDirectory()
-            .appendingPathComponent("gmgn radio/ScreenState.json", isDirectory: false)
+            .appendingPathComponent("gmgn radio/ScreenState.json", isDirectory: false),
+        endpointFile: URL(fileURLWithPath: WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase).endpointFile)
     )
 
     /// 当前世界编号：屏幕记录按世界隔离，切世界不会串。
@@ -1526,6 +1600,10 @@ final class AppDelegate:
     /// 每次真正重绑定都换新的代次：同 loop 在 A→B→A 间往返时，旧 A 的恢复
     /// 等待者靠代次失配退出，不会误清新一轮恢复任务或提前重启自主行为。
     private var residentMemoryBindingGeneration = UUID()
+    private var residentSchedulerBindingKey: String?
+    /// Shared with Wish control authority for this app owner. Backend rebinding
+    /// changes the execution lease, never the authority's host identity.
+    private let residentAuthorityHostSessionID = UUID().uuidString
     /// 最近对话（进程内、有界）：按「世界 + 后端会话」作用域隔离，用户提交时登记
     /// 回合、真实送达/失败/取消时更新同一回合，绝不重复显示；两个聊天表面共用
     /// 这份快照，口径一致。不做持久化：现有唯一按回合存储的是模型长期记忆，
@@ -1718,7 +1796,8 @@ final class AppDelegate:
         ) {
             Task { [weak self] in
                 guard let self else { return }
-                await programStore.restoreLatest()
+                do { try await programStore.restoreLatest() }
+                catch { programStore.fail("节目恢复失败：\(error.localizedDescription)") }
                 restoreSavedProgramPresentation()
                 do { try await musicLibraryStore.reload() }
                 catch { programStore.fail("歌单读取失败：\(error.localizedDescription)") }
@@ -1779,10 +1858,20 @@ final class AppDelegate:
         installE2EHostControlIfEnabled()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let context = livingWorldContext, context.state.heldProp != nil else { return .terminateNow }
+        _ = enqueueResidentLifecycleReturn(.applicationExit, context: context)
+        guard let task = residentLifecycleReturnTask ?? residentAvatarReturnTask else { return .terminateNow }
+        Task { @MainActor in
+            _ = await task.value
+            // Unknown keeps the durable held record; quitting does not claim it was returned.
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
     func applicationWillTerminate(_ notification: Notification) {
         e2eHostControl?.stop()
         residentLoopSchedulingTask?.cancel()
-        _ = returnHeldPropBeforeResidentStop(reason: "退出应用")
         residentAgentLoop?.invalidate()
         shortcutCoordinator?.stop()
         avatarRuntime.removeObserver(desktopPresenceObserverID)
@@ -1980,36 +2069,35 @@ final class AppDelegate:
                     self?.livingWorldContext?.state.objectStates[objectID]?
                         .generatedProp?.displayName ?? objectID
                 },
-                // 持久化：写进 App 数据根下的 `gmgn radio/ScreenState.json`（显式 root
-                // 注入）。**只落盘原始页面 URL 与屏幕定义**，解析器产出的签名媒资地址
-                // 永远只在内存里。重启后由 restore* 补回会话缓存。
+                // Rust SQLite 保存页面 URL 和定义；旧 JSON 仅供一次只读导入。
+                // 签名媒资地址只留在内存，持久回执确认后再发布屏幕状态。
                 persistDefinition: { [weak self] definition in
                     guard let self else { return }
-                    self.screenPersistence.setDefinition(
+                    try await self.screenPersistence.setDefinition(
                         definition, objectID: definition.objectID,
                         worldID: self.currentScreenWorldID
                     )
                 },
                 persistContent: { [weak self] content in
                     guard let self else { return }
-                    self.screenPersistence.setContent(
+                    try await self.screenPersistence.setContent(
                         content, objectID: content.objectID,
                         worldID: self.currentScreenWorldID
                     )
                 },
                 restoreDefinition: { [weak self] objectID in
                     guard let self else { return nil }
-                    return self.screenPersistence
+                    return try await self.screenPersistence
                         .record(worldID: self.currentScreenWorldID).definitions[objectID]
                 },
                 restoreContent: { [weak self] objectID in
                     guard let self else { return nil }
-                    return self.screenPersistence
+                    return try await self.screenPersistence
                         .record(worldID: self.currentScreenWorldID).contents[objectID]
                 },
                 removePersisted: { [weak self] objectID in
                     guard let self else { return }
-                    self.screenPersistence.remove(
+                    try await self.screenPersistence.remove(
                         objectID: objectID, worldID: self.currentScreenWorldID
                     )
                 }
@@ -2031,8 +2119,17 @@ final class AppDelegate:
                     profile: .fullStage,
                     viewportSize: SIMD2(Float(size.width), Float(size.height))
                 )
+            },
+            mediaCache: ScreenMediaCacheClient(endpointFile:
+                URL(fileURLWithPath: WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase).endpointFile)),
+            playbackAuthority: RustScreenPlaybackClient(endpointFile:
+                URL(fileURLWithPath: WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase).endpointFile)),
+            worldID: { [weak self] in
+                guard let id = self?.currentScreenWorldID, !id.isEmpty else { return nil }
+                return id
             }
         )
+        store.onPersistenceError = { [weak self] message in self?.showResidentVoiceStatus(message) }
         store.startTracking()
         // 「操作屏幕」那个入口：底部控制条上的按钮 → 覆盖层，覆盖层的进出 → 按钮与提示条。
         // 两边都只认这一条线（舞台不认识覆盖层，覆盖层不认识舞台的控件），
@@ -2255,14 +2352,17 @@ final class AppDelegate:
             )
             return
         }
+        Task { @MainActor in
         do {
-            try context.startActivity(id: definition.id)
+            guard self.livingWorldContext === context else { throw CancellationError() }
+            try await context.startActivityMeasured(id: definition.id)
             menu.report("已安排：\(definition.displayName ?? id)")
         } catch {
             menu.report("活动未能开始：\(error.localizedDescription)")
             livingWorldLogger.error(
                 "菜单活动启动失败：id=\(id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
             )
+        }
         }
     }
 
@@ -2316,13 +2416,17 @@ final class AppDelegate:
             try livingWorldContext?.stopActivity(
                 reason: "用户从菜单选择动作"
             )
-            try motionPackageStore.activate(id: motion.id)
-            avatarRuntime.refresh()
+            Task { @MainActor [self] in
+                do {
+                    try await motionPackageStore.activateAsync(id: motion.id)
+                    avatarRuntime.refresh()
+                    livingWorldLogger.info("已从菜单请求角色动作：motion=\(motion.name, privacy: .public)")
+                } catch {
+                    livingWorldLogger.error("菜单动作选择失败：id=\(id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)")
+                }
+            }
             // 「播了一个动作」不是「进入小窗」的动作：这里以前会顺带 `showLiveCam()`，
             // 于是任何一次动作都把窗口形态改掉。动作照常播放，窗口形态不动。
-            livingWorldLogger.info(
-                "已从菜单播放角色动作：motion=\(motion.name, privacy: .public)"
-            )
         } catch {
             livingWorldLogger.error(
                 "菜单动作播放失败：id=\(id, privacy: .public)，error=\(error.localizedDescription, privacy: .public)"
@@ -2391,11 +2495,11 @@ final class AppDelegate:
     }
 
     func toggleLyricsVisualMode() {
-        let modes = StageLyricsVisualMode.allCases
-        let currentIndex = modes.firstIndex(of: stageLyrics.visualMode) ?? 0
-        let nextMode = modes[(currentIndex + 1) % modes.count]
-        stageLyrics.setVisualMode(nextMode)
-        showStage()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do { try await stageLyrics.cycleVisualMode(); showStage() }
+            catch { stageWindowController?.setResidentDeliveryNotice("字幕模式未能确认：\(error.localizedDescription)") }
+        }
     }
 
     func startAIProgram() {
@@ -2439,8 +2543,8 @@ final class AppDelegate:
                 }
                 committedQueue = queue
                 programPlaybackQueue = queue
-                activeProgram = plan
-                programStore.publish(plan)
+                try await programStore.publish(plan)
+                activeProgram = programStore.plan
                 try await playPreparedWithFallback(prepared,
                     isCurrentSelection: isCurrent,
                     onSelectionCommitted: { ownedGeneration = self.musicSelectionGeneration })
@@ -2459,9 +2563,7 @@ final class AppDelegate:
         immediateUserInstruction: String?
     ) async throws -> ProgramPlan {
         let agent = try CodexTrackRankingAgent.live()
-        let brief = Self.currentProgramBrief(
-            immediateUserInstruction: immediateUserInstruction
-        )
+        let brief = try await musicRuntime.dailyProgramBrief(instruction: immediateUserInstruction)
         let plan = try await musicRuntime.makeProgramPlan(
             brief: brief,
             agent: agent
@@ -2546,8 +2648,9 @@ final class AppDelegate:
                         failResidentVoice(error.localizedDescription, requestID: requestID)
                     }
                 }
+                try await RustProductSettingsClient.shared.ensureLoaded()
                 let capture = try PushToTalkAudioCapture(
-                    preferredDeviceID: realtimeVoicePreferences.load().microphoneDeviceID,
+                    preferredDeviceID: RustProductSettingsClient.shared.confirmed?.values.microphoneDeviceID,
                     receive: { pcm, level in
                         if case .dropped = audio.continuation.yield((pcm, level)) {
                             audio.continuation.finish()
@@ -2755,20 +2858,12 @@ final class AppDelegate:
 
     @discardableResult
     private func returnHeldPropBeforeResidentStop(reason: String) -> Bool {
-        guard let context = livingWorldContext, let held = context.state.heldProp else { return true }
-        let service = residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-            guard let self, let context else { return false }
-            return self.livingWorldContext === context
-        })
-        do {
-            let command = try service.returnHeldCommand(objectID: held.objectID)
-            try service.commit(command, expectedLayoutRevision: context.state.layoutRevision,
-                               requestID: "resident.stop.return.\(context.state.layoutRevision).\(held.objectID)")
-            synchronizeResidentPropPresentation()
-            return true
-        } catch {
-            showResidentVoiceStatus("\(reason)已执行，但手持物件未能正式放回，状态仍保留：\(error.localizedDescription)")
-            return false
+        guard let context = livingWorldContext else { return true }
+        switch reason {
+        case "退出应用": return enqueueResidentLifecycleReturn(.applicationExit, context: context)
+        case "暂停居民自主生活": return enqueueResidentLifecycleReturn(.residentPause, context: context)
+        case "用户停止居民", "停止生活活动": return enqueueResidentLifecycleReturn(.userStop, context: context)
+        default: return true // Playback/action changes do not create a lifecycle return grant.
         }
     }
 
@@ -2932,30 +3027,44 @@ final class AppDelegate:
     }
 
     private func presentPlaybackError(_ error: Error) {
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiErrorNoticeRevision += 1
+        gpuiErrorNotice = ("这首音乐暂时播放不了", error.localizedDescription)
+#else
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "这首音乐暂时播放不了"
         alert.informativeText = error.localizedDescription
         alert.runModal()
+#endif
     }
 
     private func presentProgramError(_ error: Error) {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
+        let title: String
+        let message: String
         let nsError = error as NSError
         if
             nsError.domain == NSURLErrorDomain,
             nsError.code
                 == NSURLErrorAppTransportSecurityRequiresSecureConnection
         {
-            alert.messageText = "音乐资源连接失败"
-            alert.informativeText =
+            title = "音乐资源连接失败"
+            message =
                 "音乐服务返回了不安全的播放地址，应用已阻止连接。"
         } else {
-            alert.messageText = "DJ 暂时无法完成这个操作"
-            alert.informativeText = error.localizedDescription
+            title = "DJ 暂时无法完成这个操作"
+            message = error.localizedDescription
         }
+#if GMGN_GPUI_PRODUCT_BOOTSTRAP
+        gpuiErrorNoticeRevision += 1
+        gpuiErrorNotice = (title, message)
+#else
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = message
         alert.runModal()
+#endif
     }
 
     private func restoreSavedProgramPlayback() {
@@ -2984,7 +3093,7 @@ final class AppDelegate:
                         $0.track.id == restored.prepared.slot.track.id
                     }
                 ) {
-                    programStore.activateSlot(at: restoredIndex)
+                    try await programStore.activateSlot(at: restoredIndex)
                 }
                 playbackLogger.info(
                     "节目恢复完成：track=\(restored.prepared.slot.track.id, privacy: .public)，title=\(restored.prepared.slot.track.title, privacy: .public)，state=\(String(describing: restored.playbackState), privacy: .public)"
@@ -3069,19 +3178,7 @@ final class AppDelegate:
     ) {
         musicSelectionGeneration &+= 1
         _ = stopResidentLoop(reason: "选择播放曲目")
-        guard
-            !isStartingProgramPlayback,
-            let plan = programStore.selectProgram(id: programID)
-                ?? (
-                    programStore.plan?.brief.id == programID
-                        ? programStore.plan
-                        : nil
-                ),
-            plan.slots.indices.contains(slotIndex)
-        else {
-            return
-        }
-        activeProgram = plan
+        guard !isStartingProgramPlayback else { return }
         isStartingProgramPlayback = true
         residentJukeboxPlaybackOwner = nil
         localMusicPlayer.pause()
@@ -3098,6 +3195,9 @@ final class AppDelegate:
                 isStartingProgramPlayback = false
             }
             do {
+                guard let plan = try await programStore.selectProgram(id: programID),
+                      plan.slots.indices.contains(slotIndex) else { return }
+                activeProgram = programStore.plan
                 try await programPlaybackQueue.select(
                     plan,
                     at: slotIndex
@@ -3137,7 +3237,7 @@ final class AppDelegate:
                     await musicRuntime.recordPlaybackCompleted(completed)
                 }
                 guard
-                    let next = await programPlaybackQueue
+                    let next = try await programPlaybackQueue
                         .advanceAfterCompletion()
                 else {
                     activeProgram = nil
@@ -3158,18 +3258,14 @@ final class AppDelegate:
     private func playPreviousProgramTrack() {
         musicSelectionGeneration &+= 1
         _ = stopResidentLoop(reason: "切换上一首")
-        guard
-            activeProgram != nil,
-            let previous = programPlaybackQueue.returnToPrevious()
-        else {
-            return
-        }
-        updateStageProgramNavigation()
+        guard activeProgram != nil else { return }
         Task { [weak self] in
             guard let self else {
                 return
             }
             do {
+                guard let previous = try await programPlaybackQueue.returnToPrevious() else { return }
+                updateStageProgramNavigation()
                 try await playPreparedWithFallback(previous)
             } catch {
                 programStore.fail(error.localizedDescription)
@@ -3194,7 +3290,7 @@ final class AppDelegate:
             }
             do {
                 guard
-                    let next = await programPlaybackQueue
+                    let next = try await programPlaybackQueue
                         .advanceAfterCompletion()
                 else {
                     activeProgram = nil
@@ -3243,7 +3339,7 @@ final class AppDelegate:
                 guard allowFallback else {
                     throw error
                 }
-                prepared = await programPlaybackQueue
+                prepared = try await programPlaybackQueue
                     .replaceCurrentAfterFailure()
                 guard isCurrentSelection() else { throw CancellationError() }
                 playbackLogger.info(
@@ -3305,7 +3401,14 @@ final class AppDelegate:
 
         previousCommittedPlaybackTrack = previouslyCommittedTrack
         committedPlaybackTrack = slot.track
-        programStore.activateSlot(at: index)
+        let knowledgePlaybackID = UUID().uuidString
+        Task { [self] in
+            do {
+                try await RustMusicKnowledgeClient.live.record(.played(trackID: slot.track.id, completed: false, at: Date()),
+                    requestID: "play-start:\(knowledgePlaybackID)")
+            } catch { playbackLogger.error("开始播放事实记录失败：\(String(describing: error), privacy: .public)") }
+        }
+        try await programStore.activateSlot(at: index)
         stageLyrics.clear()
         Task { [weak self] in
             guard let self else {
@@ -3476,38 +3579,6 @@ final class AppDelegate:
         try? await realtimeDJSessionController.updateContext(context)
     }
 
-    private static func currentProgramBrief(
-        immediateUserInstruction: String? = nil,
-        now: Date = Date(),
-        calendar: Calendar = .current
-    ) -> ProgramBrief {
-        let hour = calendar.component(.hour, from: now)
-        let moodTags: [String]
-        let energyArc: [Double]
-        switch hour {
-        case 0 ..< 6:
-            moodTags = ["深夜", "松弛", "陪伴"]
-            energyArc = [0.2, 0.35, 0.25]
-        case 6 ..< 11:
-            moodTags = ["清晨", "清醒", "明亮"]
-            energyArc = [0.35, 0.65, 0.55]
-        case 11 ..< 18:
-            moodTags = ["白天", "专注", "流动"]
-            energyArc = [0.45, 0.7, 0.55]
-        default:
-            moodTags = ["夜晚", "放松", "氛围"]
-            energyArc = [0.4, 0.7, 0.35]
-        }
-        return ProgramBrief(
-            id: "program-\(UUID().uuidString)",
-            targetDuration: 1_800,
-            moodTags: moodTags,
-            energyArc: energyArc,
-            conversationMode: .ambient,
-            immediateUserInstruction: immediateUserInstruction
-        )
-    }
-
     private func configureLivingWorld() {
         guard livingWorldContext == nil else { return }
 
@@ -3574,6 +3645,10 @@ final class AppDelegate:
                 applicationSupportBase: E2ERuntime.applicationSupportBase
             )
             livingWorldContext = context
+            let controlEndpoint = WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase)
+            context.bindWorldControl(client: RustWorldControlClient(endpointFile: controlEndpoint.endpointFile, helperPath: controlEndpoint.helperPath),
+                identity: .init(worldID: context.manifest.worldID, residentScope: currentResidentWorldContext().sessionScope,
+                    hostSessionID: residentAuthorityHostSessionID))
             avatarRuntime.removeMotionPlaybackObserver(residentMotionPlaybackObserverID)
             residentMotionPlaybackObserverID = avatarRuntime.observeMotionPlayback { [weak self] event in
                 self?.handleResidentMotionPlayback(event)
@@ -3604,6 +3679,17 @@ final class AppDelegate:
                     }
                 }
             }
+            context.onRustEventsPublished = { [weak self, weak context] events in
+                guard let self, let context, self.livingWorldContext === context,
+                      self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                let loop = self.ensureResidentLoop()
+                for event in events {
+                    if let observation = ResidentWorldObservation.event(event,
+                        worldID: context.manifest.worldID, scopeID: "", authorityFact: true) {
+                        loop.receiveEvent(observation)
+                    }
+                }
+            }
             context.onSnapshotChanged = { [weak self] snapshot in
                 self?.applyLivingWorldSnapshot(snapshot)
             }
@@ -3620,7 +3706,11 @@ final class AppDelegate:
             if context.snapshot.liveCamera == nil,
                let initialCameraID = package.manifest.cameras.first?.id
             {
-                try context.selectCamera(id: initialCameraID)
+                Task { @MainActor [weak self, weak context] in
+                    guard let self, let context, self.livingWorldContext === context else { return }
+                    do { try await context.selectCamera(id: initialCameraID, source: .ui) }
+                    catch { self.livingWorldLogger.error("初始镜头权威切换失败：\(String(describing: type(of: error)), privacy: .public)") }
+                }
             } else {
                 applyLivingWorldSnapshot(context.snapshot)
             }
@@ -4214,7 +4304,7 @@ final class AppDelegate:
         )
         // 面板上的"恢复自动领取"= 宿主的一个动作：任务级续办与 run 级停止一起解开。
         stageWindowController?.setWishContinuationResumeHandler { [weak self] id in
-            self?.resumeWishAutomaticContinuation(id: id)
+            Task { @MainActor in await self?.resumeWishAutomaticContinuation(id: id) }
         }
         // 建造模式：鼠标移动 → 格子拾取 → footprint 判定 → 整块着色。
         stageWindowController?.onResidentPropGridCursor = { [weak self] normalized in
@@ -4302,7 +4392,7 @@ final class AppDelegate:
                 self?.openSystemInbox()
             }
             liveCamWindowController.setWishContinuationResumeHandler { [weak self] id in
-                self?.resumeWishAutomaticContinuation(id: id)
+                Task { @MainActor in await self?.resumeWishAutomaticContinuation(id: id) }
             }
             self.liveCamWindowController = liveCamWindowController
             publishResidentTranscript()
@@ -4427,9 +4517,14 @@ final class AppDelegate:
         else {
             return
         }
-        let plan = SyncedPlaylistProgramBuilder.makePlan(from: playlist)
-        programStore.publish(plan)
-        playProgramTrack(programID: plan.brief.id, at: trackIndex)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let plan = try await SyncedPlaylistProgramBuilder.makePlan(from: playlist)
+                try await programStore.publish(plan)
+                playProgramTrack(programID: plan.brief.id, at: trackIndex)
+            } catch { presentProgramError(error) }
+        }
     }
 
     private func loadNextSyncedPlaylistPage(playlistID: String) {
@@ -4441,7 +4536,6 @@ final class AppDelegate:
             return
         }
         let offset = playlist.tracks.count
-        let providerID = playlist.providerID
         Task { [weak self] in
             guard let self else {
                 return
@@ -4452,14 +4546,16 @@ final class AppDelegate:
                 )
             }
             do {
+                let ticket = try await musicLibraryStore.beginPage(playlistID: playlistID,
+                    offset: offset, limit: 20, strict: true)
+                defer { Task { await self.musicLibraryStore.endPage(ticket) } }
                 let page = try await musicRuntime.fetchPlaylistPage(
-                    providerID: providerID,
-                    playlistID: playlistID,
-                    offset: offset,
-                    limit: 20
+                    providerID: ticket.providerID,
+                    playlistID: ticket.playlistID,
+                    offset: ticket.offset,
+                    limit: ticket.limit
                 )
-                musicLibraryStore.append(page)
-                try await musicLibraryStore.flush()
+                try await musicLibraryStore.append(page, ticket: ticket)
                 playbackLogger.info(
                     "歌单渐进加载：playlist=\(playlistID, privacy: .public)，offset=\(offset)，loaded=\(page.tracks.count)，total=\(page.totalTrackCount)"
                 )
@@ -4665,10 +4761,16 @@ final class AppDelegate:
     private var residentLoopSchedulingTask: Task<Void, Never>?
     private let propGenerationStore = PropGenerationStore()
     private var wishMachineConfiguration: PropGenerationConfiguration?
+    private var wishMachineConfigurationTask: Task<Void, Never>?
+    private lazy var wishMachineConfigurationAuthority = RustGenerationConfigurationClient(
+        root: injectedTaskDaemonRoot ?? WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: E2ERuntime.applicationSupportBase))
     private var wishMachineServiceNotice = "许愿机服务尚未配置，请在空间设置中配置。"
+    private var wishPresentationTask: Task<Void, Never>?
+    private var wishPresentationRefreshPending = false
     private lazy var wishMachineCoordinator = WishMachineCoordinator(store: propGenerationStore,
         directory: E2ERuntime.applicationSupportBase?
             .appendingPathComponent("gmgn radio/WishMachine", isDirectory: true),
+        wishControlHostSessionID: residentAuthorityHostSessionID,
         canClaim: { [weak self] job in self?.wishMachineClaimEvidence(for: job) })
     private struct ResidentWishImageRegistration {
         let attachment: ResidentImageAttachment
@@ -4831,6 +4933,63 @@ final class AppDelegate:
         residentAgentLoop?.setBackgroundEnabled(false)
     }
 
+    private func residentRustPropFacts(context: WorldAgentContext, client: RustWorldPropClient) async throws -> Data {
+        guard livingWorldContext === context, spatialStage.selectedWorldID == context.manifest.worldID,
+              let framing = livingWorldColliderFraming, let bounds = residentPropGridBounds(context: context),
+              let avatar = avatarRuntime.snapshot.avatar,
+              let (environmentURL, coordinates) = try await marbleWorldLibrary.localCollider(for: context.manifest.worldID)
+        else { throw RustWorldPropError.rejected("world_prop_native_not_ready") }
+        let avatarSnapshot = avatarRuntime.snapshot
+        let environment = try await RustPropNativeMeshSampler.sample(modelURL:environmentURL,
+            transform:framing.colliderTransform(sourceCoordinates:coordinates))
+        try await client.putBlob(localPath:environment.modelURL.path, sha256:environment.sha256)
+        var objects: [String: Any] = [:]
+        for (id, item) in context.state.objectStates.sorted(by: { $0.key < $1.key }) {
+            guard let prop = item.generatedProp, let asset = residentOwnedPropAssets[id],
+                  residentPropAssetVerification(objectID:id, prop:prop, rehashFile:false).failure == nil,
+                  spatialStage.isResidentPropPrepared(assetID:prop.assetID, modelURL:asset.descriptor.modelURL)
+            else { continue }
+            let sample = try await RustPropNativeMeshSampler.sample(modelURL:asset.descriptor.modelURL)
+            guard ResidentPropAssetVerification.declaredSHA256(prop.assetID) == sample.sha256 else {
+                throw RustWorldPropError.rejected("world_prop_asset_unverified")
+            }
+            try await client.putBlob(localPath:sample.modelURL.path, sha256:sample.sha256)
+            objects[id] = ["assetID":prop.assetID,"blobRef":"sha256:\(sample.sha256)",
+                "triangles":try JSONSerialization.jsonObject(with:sample.trianglesJSON)]
+        }
+        var slots: [String] = []
+        if let validate = spatialStage.residentPropAttachmentValidationHandler {
+            for point in PropAttachmentPoint.allCases {
+                do { try validate(avatar.id, point); slots.append(point.worldSlot.rawValue) } catch { }
+            }
+        }
+        var bindings: [String: Any] = [:]
+        for (activity, binding) in context.nativePropActivityBindingSources {
+            guard let raw = context.state.objectStates[binding.objectID]?.metadata[binding.metadataKey] else { continue }
+            let sha = SHA256.hash(data:Data(raw.utf8)).map { String(format:"%02x",$0) }.joined()
+            bindings[activity] = ["objectID":binding.objectID,"metadataKey":binding.metadataKey,"metadataSHA256":sha]
+        }
+        let anchors = Dictionary(uniqueKeysWithValues:context.manifest.waypoints.filter(\.enabled).map {
+            ($0.id, [$0.position.x,$0.position.y,$0.position.z])
+        })
+        let blockingVolumes: [[String: Any]] = context.manifest.collisionVolumes.filter(\.isBlocking).map { volume in
+            let q = volume.rotation
+            let yaw = atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z))
+            return ["shape":"box","id":volume.id,"volume":[
+                "center":[volume.center.x,volume.center.y,volume.center.z],
+                "halfExtents":[volume.halfExtents.x,volume.halfExtents.y,volume.halfExtents.z],"yaw":yaw]]
+        }
+        guard livingWorldContext === context, spatialStage.selectedWorldID == context.manifest.worldID,
+              avatarRuntime.snapshot.avatar == avatarSnapshot.avatar else { throw CancellationError() }
+        return try JSONSerialization.data(withJSONObject:["environmentBlobRef":"sha256:\(environment.sha256)",
+            "environment":["triangles":try JSONSerialization.jsonObject(with:environment.trianglesJSON),
+                "blockingVolumes":blockingVolumes,
+                "bounds":["minimumX":bounds.minimumX,"maximumX":bounds.maximumX,"minimumZ":bounds.minimumZ,"maximumZ":bounds.maximumZ],
+                "seed":[context.state.agentTransform.position.x,context.state.agentTransform.position.y,context.state.agentTransform.position.z]],
+            "avatar":["assetID":avatar.id,"selectionRevision":avatarSnapshot.revision,"format":avatar.format.rawValue,"slots":slots],
+            "objects":objects,"activityBindings":bindings,"anchorPositions":anchors])
+    }
+
     private func residentPropPlacementService(context: WorldAgentContext,
                                               isCurrent: @escaping @MainActor () -> Bool) -> ResidentPropPlacementService {
         ResidentPropPlacementService(context: context,
@@ -4973,470 +5132,119 @@ final class AppDelegate:
     }
 
     /// Receipts and claim ownership are the only source of local asset paths.
+    private lazy var residentNativePropAuthority = RustWorldPropClient(endpointFile:URL(fileURLWithPath:
+        WorldAuthorityEndpoint(applicationSupportBase:E2ERuntime.applicationSupportBase).endpointFile))
+
     private func synchronizeOwnedResidentProps() async {
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
               context.manifest.worldID == WishMachineScene.worldID else {
             residentOwnedPropAssets = [:]; residentPropAssetContext = nil
-            // 字节收据与资产记录**同生共死**：只留一边会让"资产未验证"的期望值指向一条
-            // 已经不存在的记录（那就是第二种真相）。
-            residentPropAssetFacts = [:]
-            // 资产失败是**按上下文**记住的：换世界（或这一刻不是许愿机那个世界）时作废，
-            // 否则一个世界的坏资产会在另一个世界里继续冒充"资产未就绪"。
-            // 台账（`residentPropInventoryBacklog`）**刻意不在这里清**：领取与"还没入库"
-            // 是跨世界仍然成立的事实，回到那个世界后既有的 5 秒同步周期会继续补做。
-            residentPropAssetFailures = [:]
+            residentPropAssetFacts = [:]; residentPropAssetFailures = [:]
             spatialStage.residentPropOutputs = []; spatialStage.residentPropPreview = nil
-            spatialStage.residentHeldProp = nil
-            spatialStage.residentPropDisplayStand = nil
+            spatialStage.residentHeldProp = nil; spatialStage.residentPropDisplayStand = nil
             stageWindowController?.updateResidentPropEditor(.empty)
             return
         }
         let contextID = ObjectIdentifier(context)
         if residentPropAssetContext != contextID {
             residentOwnedPropAssets = [:]; residentPropNotices = [:]; residentPropAssetFailures = [:]
-            residentPropAssetFacts = [:]
-            residentPropAssetContext = contextID
+            residentPropAssetFacts = [:]; residentPropAssetContext = contextID
         }
         guard !residentPropPreparationRunning else { return }
         residentPropPreparationRunning = true
         defer { residentPropPreparationRunning = false }
-        // 自愈要写世界状态，写路径与下面那条"已领取但入库被拒"的补做**同一条**
-        // （`prepareResidentPropMutation` + `service.commit`），所以服务在这里就建出来，
-        // 两个循环共用同一个（`isCurrent` 的判据一个字不改）。
-        let service = residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-            guard let self, let context else { return false }
-            return self.livingWorldContext === context && self.spatialStage.selectedWorldID == context.manifest.worldID
-        })
-        /// 这一轮"摆正"要给用户看的话（按物件）。在**既有那几条会 removeValue 的路径之后**
-        /// 统一发出去，否则"已按主轴摆正"会被"入库成功"冲掉 —— 用户就只看到结果、看不到原因。
-        /// **历史存档自愈**的说明走同一条通道：两者都是"这件东西的元数据被改过、凭什么"，
-        /// 而且都必须在那些 `removeValue` **之后**才发。
-        var orientationNotices: [String: String] = [:]
+        guard spatialStage.canPrepareResidentProp(worldID:context.manifest.worldID) else { return }
         let scope = currentResidentWorldContext().sessionScope
-        let jobs = wishMachineCoordinator.residentJobs(worldID: context.manifest.worldID, residentScope: scope).filter { $0.stage == .claimed }
-        // The Metal view publishes its resident-prop handlers on the first
-        // eligible draw, which races launch. Defer the whole pass while the
-        // renderer is unready: no task, ownership or model record is touched,
-        // and the existing refreshWishMachine cycle retries automatically.
-        if ResidentPropStartupRecovery.action(
-            rendererReady: spatialStage.canPrepareResidentProp(worldID: context.manifest.worldID),
-            error: nil
-        ) == .deferUntilRendererReady {
-            return
-        }
+        let identity = RustWorldPropClient.Identity(worldID:context.manifest.worldID,
+            residentScope:scope, hostSessionID:residentAuthorityHostSessionID)
+        let client = residentNativePropAuthority
+        let jobs = wishMachineCoordinator.residentJobs(worldID:context.manifest.worldID,residentScope:scope)
+            .filter { $0.stage == .claimed }
         for job in jobs.filter({ residentOwnedPropAssets[$0.objectID] == nil }).prefix(2) {
             do {
-                guard let record = propGenerationStore.jobs.first(where: { $0.id == job.jobID }),
-                      let receipt = record.receipt, receipt.state == .completed, let inspection = receipt.result?.inspection,
-                      let path = record.localModelPath, job.modelPath == path else { throw ResidentPropHostError.assetUnavailable }
-                // ---- 物件**一律**来自用户的素材生成：不再手拼几何（用户 2026-10-02 的决定）----
-                //
-                // 原话「不能再用集合拼了」：物件的形状与外观**只**来自生成（素材图 → 3D），
-                // 不再由我们用基础几何替他拼一个固定造型 —— 几何拼那条路已停用
-                // （`WorldPrimitiveTelevision` 类型保留、产品路径**零调用**，文件头写明了原因）。
-                //
-                // 生成器把形状做歪时（真机 2026-10-01「平面电视」交回来的是把参考图贴在各面上的
-                // 大立方体），正确做法是**按用户给的三维尺寸逐轴缩放到位** —— 素材会被拉伸，
-                // 那正是"素材 + 他的尺寸"这个取舍本身；**不是**拿一个手拼的替代品糊上去，
-                // 也**不再**给"重新生成 / 手拼几何"两条路让他挑（那个选项整个清掉了）。
-                //
-                // 尺寸只走**唯一一份**策略（`WorldPropSizePolicy`，见下面 `dimensionResolution`）：
-                // app 不自己另写缩放，也不在这里再判一遍"要不要拉"。
-                let url = URL(fileURLWithPath: path)
-                let hash = inspection.sha256
-                let bytes = inspection.bytes
-                try await Task.detached(priority: .utility) {
-                    guard hash.count == 64, hash.allSatisfy({ $0.isHexDigit }), bytes > 0, bytes <= 32 * 1024 * 1024 else { throw ResidentPropHostError.assetUnavailable }
-                    let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey])
-                    guard values.isRegularFile == true, values.isSymbolicLink != true, values.fileSize == bytes else { throw ResidentPropHostError.assetUnavailable }
-                    let data = try Data(contentsOf: url, options: .mappedIfSafe)
-                    let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-                    guard data.count == bytes, digest == hash.lowercased() else { throw ResidentPropHostError.assetUnavailable }
-                }.value
-                try Task.checkCancellation()
-                guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-                let descriptor = ResidentPropRenderDescriptor(objectID: job.objectID, worldID: job.worldID,
-                    assetID: "sha256:" + hash.lowercased(), modelURL: url, targetHeightMeters: Float(job.heightMeters),
-                    position: .zero, yaw: 0)
-                let prepared = try await spatialStage.prepareResidentProp(descriptor)
-                guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-                // 尺寸标定在**这一处**从"请求尺寸"落成世界尺寸，而且只用唯一那份策略
-                // （`WorldPropSizePolicy`）：`job.heightMeters` 是生成请求的高度，原始网格的
-                // 实测三维来自渲染器（`prepared.minimum/maximum`）。
-                //
-                // **用户说了尺寸就按他说的轴归一**（提交时的 `size_intent`）：真机那把剑
-                // （"一把 1.1 米的剑"）说的是**最长边** 1.1 m，原来按高度归一成了 8.285 m 长、
-                // 比舱室还长、摆放被拒后从房间里消失。没有意图时才走自动推断（细长物件 > 4 按最长边）。
-                let extent = prepared.maximum - prepared.minimum
-                // **摆正之前**那一份测量（原始网格 AABB）。身份基线要在存档自己的坐标系里
-                // 算，而"摆正政策落地之前登记的存档"用的就是这个坐标系（见下面 `baseline`）。
-                let rawExtent = WorldVector3(x: extent.x, y: extent.y, z: extent.z)
-                // ---- 摆正（朝向归一）----------------------------------------------------
-                // 生成服务交回来的网格**不保证立着**（真机那把剑的 AABB 是 1.005 × 0.133 × 0.057，
-                // 躺着）。这一步只在**入库这一处**做一次，三条路按优先级，而且**都不许猜**：
-                //   ① 回执 `authoritative_size` 里声明的 `up_axis` / `forward_axis`（最干净）；
-                //   ② 由网格自身的主轴推断（最长边明显不在 Y 轴上 ⇒ 躺着生成）；
-                //   ③ 都说不清 ⇒ **保留原样**并在面板上说清楚（`unresolved`）。
-                // 摆正**先于**尺寸策略：转正之后的 AABB 才是"这件东西多大"的输入，
-                // 于是 1.1 m 的请求得到一把立着的 1.1 m 剑，而不是 8.28 m 长的横棍。
-                let declared = receipt.result?.workflowAuthoritativeSize
-                let orientation = WorldPropOrientationPolicy.resolve(
-                    sourceExtent: rawExtent,
-                    declaredUpAxis: declared?.upAxis,
-                    declaredForwardAxis: declared?.forwardAxis
-                )
-                let orientedExtent = WorldPropOrientationPolicy.orientedExtent(
-                    of: rawExtent, by: orientation
-                )
-                let sourceExtent = orientedExtent
-                // 摆正这件事**必须说出来**（转了要说、"保留原样"更要说）：用户看到物件换了
-                // 姿态（或者本该换却没换），画面里得有东西解释这是谁干的、凭什么。
-                // 已经立着的资产（绝大多数）notice 是 nil，不打扰。
-                // 记在这里、**最后再发**：下面几条既有路径都会 `removeValue`，早发会被冲掉。
-                if let notice = orientation.notice {
-                    orientationNotices[job.objectID] = "\(job.name)：\(notice)"
-                }
-                // 契约的意图 → 世界状态的意图：轴/出处就是同一批字面量，越界 ⇒ nil（不静默）。
-                let sizeIntent = job.sizeIntent.flatMap {
-                    WorldPropSizeIntent(axis: $0.axis.rawValue, meters: $0.meters, source: $0.source.rawValue)
-                }
-                // ---- 三轴尺寸意图：**三个数就是三个数**（逐轴）--------------------------------
-                //
-                // 用户给了完整长宽高（`mode == "dimensions"`）时，世界里那一份 `size` **严格等于**
-                // 他给的三轴 `(x/1000, y/1000, z/1000)`：渲染端按 `size[i] / 摆正后网格跨度[i]`
-                // **逐轴**缩放，碰撞盒/承托/摆放判据读的是**同一份 `size`**（`effectiveSize`）——
-                // 分叉只可能来自"两处各推一份尺寸"，而这里只有一个出口。
-                //
-                // 用户 2026-10-02 的产品决定（「不能再用集合拼了」）：形状歪了就**逐轴拉到位** ——
-                // 素材会被拉伸，那正是"素材 + 他的尺寸"这个取舍本身；不拿手拼几何替代，也不再给
-                // 两条路让他挑（`dimensionsVerdict` 因此不再返回 `.shapeTooFar`，
-                // 托盘预览读的是同一个裁决 ⇒ 预览与最终产物不可能长得不一样）。
-                //
-                // 只有一件事会打扰用户：**拉过去明显不可用**（逐轴落不了地，或某根轴贴到契约下限）。
-                // 那时给**唯一**那条建议：换一张正面产品图重新生成。三个数兑现了就一个字都不说。
-                var dimensionResolution: WorldPropSizePolicy.Resolution?
-                if let intent = job.sizeIntent, intent.mode == .dimensions,
-                   let millimeters = intent.millimeters,
-                   let spec = WorldPropSizeMillimeters(x: Float(millimeters.x),
-                                                       y: Float(millimeters.y),
-                                                       z: Float(millimeters.z)) {
-                    let wanted = "\(String(format: "%g", millimeters.x)) × "
-                        + "\(String(format: "%g", millimeters.y)) × "
-                        + "\(String(format: "%g", millimeters.z)) 毫米"
-                    // 裁决**只有一处**（`dimensionsVerdict`）：托盘预览读的是同一个它。
-                    switch WorldPropSizePolicy.dimensionsVerdict(sourceExtent: sourceExtent,
-                                                                 millimeters: spec) {
-                    case let .exact(resolution):
-                        dimensionResolution = resolution
-                        // 有轴已经贴到契约下限：逐轴拉过去明显不可用 ⇒ 可见说明 + 那条唯一建议。
-                        if millimeters.edges.contains(where: {
-                            Float($0) <= WorldPropSizeMillimeters.minimumMillimeters
-                        }) {
-                            orientationNotices[job.objectID] = "\(job.name)：你要的 \(wanted)"
-                                + " 里有一根轴已经贴到下限（"
-                                + String(format: "%g", WorldPropSizeMillimeters.minimumMillimeters)
-                                + " 毫米），逐轴拉过去会明显不可用 ⇒ 建议换一张正面产品图重新生成。"
-                        }
-                    case .shapeTooFar:
-                        // 产品决定之后这一支**不可达**（`dimensionsVerdict` 只返回 `.exact` /
-                        // `.unrealizable`）。留着只为穷尽匹配；万一它回来，也照样逐轴兑现 ——
-                        // 绝不退回手拼几何，也绝不静默降级成等比。
-                        dimensionResolution = WorldPropSizePolicy.intended(
-                            sourceExtent: sourceExtent, millimeters: spec)
-                    case .unrealizable:
-                        // 逐轴落不了地（三个数越界 / 低于可见下限 / 网格量不出跨度）：说清楚，
-                        // **不**当"没有意图"静默退回单轴，也不再提"几何拼"。
-                        orientationNotices[job.objectID] = "\(job.name)：你要的 \(wanted) 没法逐轴"
-                            + "兑现（三个数越界、或整体小于 "
-                            + String(format: "%.2f", WorldPropSizePolicy.minimumExtentMeters)
-                            + " 米、或这份网格量不出三轴跨度）⇒ 先按原来那一份尺寸显示；"
-                            + "建议换一张正面产品图重新生成。"
-                    }
-                }
-                // 三轴意图优先（逐轴、就是那三个数）；只有单轴意图时才按那一根轴等比归一；
-                // 都没有才走今天的自动推断。
-                let intendedSize = dimensionResolution ?? sizeIntent.flatMap {
-                    WorldPropSizePolicy.intended(sourceExtent: sourceExtent, axis: $0.axis, meters: $0.meters)
-                }
-                guard let autoSize = intendedSize ?? WorldPropSizePolicy.automatic(
-                    sourceExtent: sourceExtent,
-                    requestedHeight: Float(job.heightMeters)) else {
+                guard let record = propGenerationStore.jobs.first(where:{ $0.id == job.jobID }),
+                      let receipt = record.receipt, receipt.state == .completed,
+                      let inspection = receipt.result?.inspection,
+                      let path = record.localModelPath, job.modelPath == path else {
                     throw ResidentPropHostError.assetUnavailable
                 }
-                let prop = WorldGeneratedProp(objectID: job.objectID, sourceWishID: job.id.uuidString,
-                    assetID: descriptor.assetID, displayName: job.name,
-                    size: autoSize.size, sourceHeight: sourceExtent.y,
-                    sizeIntent: sizeIntent,
-                    // 已经立着的资产不写这个键 ⇒ 元数据与改造前逐字节相同。
-                    orientation: orientation.shouldArchive ? orientation : nil)
-                // 用户**手动定过尺寸**的物件：世界状态里那一份 `size` 是唯一定稿，自动基线不再
-                // 要求逐位相等 —— 要求相等就等于"改过尺寸的物件在下一次准备时被判成资产归属
-                // 不一致"，那件物件会从房间里消失（正是这次要修的观感缺陷）。
-                // 带尺寸意图的物件同理（它是"提交时说的"，不是"这次量出来的"）。
-                let storedProp = context.state.objectStates[job.objectID]?.generatedProp
-                // ---- 历史存档自愈：把**派生字段**对齐到今天，并且说出来 ----------------
-                // 真机 2026-10-01 的「2B 白色长剑（外形摆件）」是在**朝向归一**落地之前登记的：
-                // 权威里那条存档的 `size` 是"躺着生成的网格按最长边归一"的产物
-                // （1.100 × 0.146 × 0.062 米、`sourceHeight` = 原始 Y 跨度 0.133 米、没有
-                // `orientation` 键），而今天同一份网格（`assetID` 就是模型字节的 sha256，
-                // 字节一个都没变）从原始 GLB + 领取记录推出来的是**立着**的
-                // （0.146 × 1.100 × 0.062 米）。两边的三个数字只是换了一次位置。
-                //
-                // **为什么必须写回存档，而不是只在判据里换个坐标系比**：渲染目标高度是
-                // `prop.effectiveSize.y`（`residentPropDescriptor`），碰撞盒也读同一份
-                // `size`。留着躺着的 `size` 再按今天的旋转去画 ⇒ 画面里那把剑只有 0.146 米高
-                // （0.146 / 摆正后的 1.005 米 = 0.145 倍），而碰撞盒仍然是 1.1 米长躺着的盒子
-                // —— 画面与碰撞盒分叉，那正是"两份尺寸"这条架构禁令的形状。
-                //
-                // 判据与规则都在 `WorldPropArchiveRebase`（纯函数、可离线逐项断言）：
-                // 身份必须逐位相同、存档那份尺寸必须是同一份网格的等比缩放（可解释），
-                // 而且**只换** `size` / `sourceHeight` / `orientation`；`sizeLocked` /
-                // `sizeIntent` / `collision` / `authoritativeSize` 这些用户自己的字段原样保留。
-                // 修不了的一律**可见地拒绝**（把具体差异说出来），绝不静默硬改。
-                var healedStoredProp = storedProp
-                if context.state.objectStates[job.objectID] != nil {
-                    guard let existing = storedProp else { throw ResidentPropHostError.ownershipMismatch }
-                    switch WorldPropArchiveRebase.decide(
-                        stored: existing, derived: prop,
-                        meshExtent: rawExtent, orientedExtent: sourceExtent,
-                        requestedHeight: Float(job.heightMeters),
-                        requestIDPrefix: "rebase." + job.id.uuidString
-                    ) {
-                    case .unchanged:
-                        break
-                    case let .refuse(detail):
-                        // 不静默：把**具体差异**说出来（身份不同 / 不是等比缩放 / 尺寸非法）。
-                        throw ResidentPropHostError.archiveNotRepairable(detail)
-                    case let .rebase(healed, record):
-                        // 一次修复必须**看得见**：说明走"摆正说明"那条既有通道（它在那几条
-                        // `removeValue` 之后统一发），权威里则留下内容寻址的回执
-                        // （`rebase.<jobID>.<指纹>`），于是"谁在什么时候把哪几个数字从多少
-                        // 改成了多少"查得到，而且同一份修复重放不会写第二遍。
-                        orientationNotices[job.objectID] = record.summary
-                        let previousAsset = residentOwnedPropAssets[job.objectID]
-                        let previousFacts = residentPropAssetFacts[job.objectID]
-                        var healedDescriptor = descriptor
-                        healedDescriptor.orientation = healed.orientationRotation
-                        // 内存里的这一份先换上，是为了让下面那次提交里的 `prepare(healed)`
-                        // 认得出**修好之后**的那一份（它按身份比对，不是按旧字节）；
-                        // 写失败就原样退回 —— 内存必须与落盘的那一份一致。
-                        residentOwnedPropAssets[job.objectID] =
-                            ResidentOwnedPropAsset(prop: healed, descriptor: healedDescriptor)
-                        // 自愈换的只是派生字段（尺寸/朝向），**资产字节一个都没变** ⇒ 收据照旧。
-                        residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(
-                            for: healedDescriptor, bytes: bytes)
-                        do {
-                            try await prepareResidentPropMutation(.rebase(healed), context: context)
-                            try service.commit(.rebase(healed),
-                                               expectedLayoutRevision: context.state.layoutRevision,
-                                               requestID: record.requestID)
-                            healedStoredProp = healed
-                        } catch {
-                            if let previousAsset {
-                                residentOwnedPropAssets[job.objectID] = previousAsset
-                                // 收据与资产记录**一起退回**：只退一边会让"资产未验证"的
-                                // 期望值指向一条已经不存在的记录。
-                                residentPropAssetFacts[job.objectID] = previousFacts
-                            } else {
-                                residentOwnedPropAssets.removeValue(forKey: job.objectID)
-                                residentPropAssetFacts.removeValue(forKey: job.objectID)
-                            }
-                            throw error
-                        }
-                    }
+                let url = URL(fileURLWithPath:path)
+                let sample = try await RustPropNativeMeshSampler.sample(modelURL:url)
+                guard sample.sha256 == inspection.sha256.lowercased() else {
+                    throw ResidentPropHostError.assetUnavailable
                 }
-                // ---- 身份基线必须落在**存档自己的坐标系**里 ----------------------------
-                // `size` 是一次**量法**的结果，而量法会变：摆正（`WorldPropOrientation`）
-                // 2026-10-01 18:20 才落地，而 `2B 白色长剑` 是 17:15 登记的 —— 那条存档里
-                // 没有 `orientation` 键，它的 `size` 是拿**原始** AABB 量的。今天同一份网格
-                // 摆正之后再量，同一件东西得到的是另一组数字（三个分量换了一次位置），
-                // 于是 `matchesIdentity` 的尺寸那一腿逐位不等 ⇒ `ownershipMismatch`
-                // ⇒ 资产被判成"未备好"（面板上那句"物件存档与领取记录不一致"）
-                // ⇒ 那把剑**从房间里消失**（用户报的"白色大剑不见了"）。
-                //
-                // `matchesIdentity` 的注释已经写明"怎么量不算身份"（`sourceHeight` 与
-                // `orientation` 刻意不参与），这里只是把同一句话在 `size` 上落实：基线回到
-                // 存档那个坐标系里重算一次。**判据一个字都没放宽** —— 同一个坐标系里仍然
-                // 逐位要求相等，`sizeLocked` / `sizeIntent` 那两条既有豁免原样保留。
-                // 上面那一步自愈成功之后，这里读的就是**修好之后**的那一份
-                // （`healedStoredProp`）；没被修（一致 / 有用户自己的尺寸 / 身份不同却仍能对上
-                // 坐标系）时它与 `storedProp` 是同一个值。
-                let baseline = healedStoredProp.map { stored in
-                    WorldGeneratedProp(
-                        objectID: prop.objectID, sourceWishID: prop.sourceWishID,
-                        assetID: prop.assetID, displayName: prop.displayName,
-                        size: WorldPropSizePolicy.recordedBaseline(
-                            sourceExtent: rawExtent, orientation: stored.orientation,
-                            sizeIntent: sizeIntent,
-                            requestedHeight: Float(job.heightMeters)) ?? autoSize.size,
-                        sourceHeight: rawExtent.y, sizeIntent: sizeIntent,
-                        orientation: stored.orientation
-                    )
-                } ?? prop
-                if context.state.objectStates[job.objectID] != nil {
-                    guard let stored = healedStoredProp, stored.matchesIdentity(of: baseline) else { throw ResidentPropHostError.ownershipMismatch }
+                let values = try url.resourceValues(forKeys:[.isRegularFileKey,.fileSizeKey,.isSymbolicLinkKey])
+                guard values.isRegularFile == true, values.isSymbolicLink != true,
+                      values.fileSize == inspection.bytes else { throw ResidentPropHostError.assetUnavailable }
+                let preparing = ResidentPropRenderDescriptor(objectID:job.objectID,worldID:job.worldID,
+                    assetID:"sha256:" + sample.sha256,modelURL:url,targetHeightMeters:Float(job.heightMeters),
+                    position:.zero,yaw:0)
+                _ = try await spatialStage.prepareResidentProp(preparing)
+                guard livingWorldContext === context, spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                try await client.putBlob(localPath:url.path,sha256:sample.sha256)
+                let (authorityState, revision) = try await context.rustPropAuthoritySnapshot(client:client,identity:identity)
+                // A durable tombstone is a readback fact; the Rust service also refuses resurrection.
+                if authorityState.propTombstones?[job.objectID] != nil {
+                    _ = residentPropInventoryBacklog.resolve(objectID:job.objectID)
+                    residentPropNotices[job.objectID] = "\(job.name) 已经删除（永久），不再补做入库。"
+                    continue
                 }
-                // 旧存档（改造前登记的）没有 `orientation`，而它的 `sourceHeight` 是按**原始**
-                // 网格量的。网格字节没变（`assetID` 就是 sha256），所以这里把"同一份网格的新
-                // 量法"补上：尺寸/尺寸意图/代理/锁**全部以存档那一份为准**，只补朝向与高度基准。
-                // 不写回存档 ⇒ 不静默改用户已经保存的东西；渲染与碰撞本会话立刻正确。
-                // （自愈那一支例外：它**已经**把派生字段写回权威了，这里读到的就是那一份，
-                //   于是"画面高度"与"碰撞盒尺寸"仍然只有一份来源。）
-                let delivered = healedStoredProp.map { stored in
-                    WorldGeneratedProp(
-                        objectID: stored.objectID, sourceWishID: stored.sourceWishID,
-                        assetID: stored.assetID, displayName: stored.displayName,
-                        size: stored.size, sourceHeight: sourceExtent.y,
-                        sizeLocked: stored.sizeLocked, collision: stored.collision,
-                        authoritativeSize: stored.authoritativeSize, sizeIntent: stored.sizeIntent,
-                        orientation: stored.orientation ?? (orientation.shouldArchive ? orientation : nil)
-                    )
-                } ?? prop
-                var preparedDescriptor = descriptor
-                preparedDescriptor.orientation = delivered.orientationRotation
-                residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop: delivered, descriptor: preparedDescriptor)
-                // 上面那条 `Task.detached` 里刚刚**实测**过字节数与 sha256（`bytes` / `hash`）：
-                // 留成收据，"资产未验证"的期望值从此有出处。
-                residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(
-                    for: preparedDescriptor, bytes: bytes)
-                residentPropNotices.removeValue(forKey: job.objectID)
-                residentPropAssetFailures.removeValue(forKey: job.objectID)
-                // 握点推断说了什么，同样**必须说出来**：这条说明走的就是上面
-                // `orientationNotices[job.objectID]` 那条既有的可见通道（同一格 →
-                // 末尾统一 `residentPropNotices` + `showResidentVoiceStatus`），
-                // 不新开第二条 notice 通道。入库这一处是唯一同时握有"最终世界尺寸 +
-                // 摆正旋转"的地方（`delivered`），所以握点说明与握点标定读的是
-                // 同一次 `PropGripInference` 推断 —— 一句话不会只说给日志听。
-                if let gripNotice = ResidentPropAttachmentEligibility.suggestedGripNotice(for: delivered) {
-                    let prefix = orientationNotices[job.objectID].map { $0 + " " } ?? "\(job.name)："
-                    orientationNotices[job.objectID] = prefix + gripNotice
-                }
-                // 夹取时**说出来**（夹取是"静默改数字"之外唯一诚实的做法）；
-                // 按用户说的尺寸落定时也说出来，让"尺寸是怎么定的"看得见。
-                if let reason = autoSize.reason {
-                    let message = "\(job.name)：\(reason)"
-                    residentPropNotices[job.objectID] = message
-                    showResidentVoiceStatus(message)
-                } else if let sizeIntent, sizeIntent.source == .user {
-                    let message = "\(job.name)：按你说的尺寸 \(sizeIntent.summary)（场景内最长边 "
-                        + String(format: "%.2f", autoSize.longestEdge) + " m）。"
-                    residentPropNotices[job.objectID] = message
-                    showResidentVoiceStatus(message)
-                }
-                // ---- 这里不再有"手拼几何"这个选项（用户 2026-10-02 的决定）------------------
-                // 原来这一处会在"生成器没做对"（生成网格不是板形）时把两条路摆给用户：
-                // ① 重新生成 ② 手拼几何。现在一律：素材生成 + 按他的三轴**逐轴拉到位**
-                // （形状差得远也拉，见上面 `dimensionResolution`）—— 不再提供手拼这条路，
-                // 也不再拿"生成器做得不像"去打扰他；只有**明显不可用**（逐轴落不了地 / 有轴
-                // 贴到契约下限）才可见地建议换一张正面产品图重新生成。
-            } catch {
-                // Losing the renderer or cancelling while switching worlds is
-                // not an asset failure; only real damage/size/GPU errors are.
-                // A switched world/context retires the old one silently.
-                guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-                switch ResidentPropStartupRecovery.action(
-                    rendererReady: spatialStage.canPrepareResidentProp(worldID: context.manifest.worldID),
-                    error: error
-                ) {
-                case let .report(description):
-                    // 资产真的坏了（缺失/校验失败/尺寸/GPU）：原因**留住**。
-                    // 面板里那一条不能因为"模型没备好"就消失 —— 「已入库」与
-                    // 「我的物件里看得见」是同一条事实（库存记录），而"现在能不能摆"
-                    // 是另一条事实（资产）。两条都要说，不许互相冒充。
-                    residentPropAssetFailures[job.objectID] = description
-                    let message = "\(job.name)：\(description)"
-                    if residentPropNotices[job.objectID] != message { showResidentVoiceStatus(message); residentPropNotices[job.objectID] = message }
-                case .ignoreRendererLoss, .deferUntilRendererReady, .prepare:
-                    break
-                }
-            }
-        }
-        guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-        // 台账只认**库存记录**：已经进了库存的条目不该继续挂在"等待入库"上
-        // （换世界、存档回滚、或在别的路径上补做成功都会走到这里）。
-        residentPropInventoryBacklog.prune { context.state.objectStates[$0]?.generatedProp != nil }
-        // 用户**有意删掉**的那一件（墓碑还在）不再补做入库，也不再假装还欠着一次入库。
-        //
-        // 为什么：删除是永久的（`docs/plans/2026-10-02-prop-deletion-semantics.md` §4：
-        // 软删是为了可审计，不是为了可回滚），而**这一条重入路径同时也是面板上
-        // 「重试入库」按钮走的那一条**（`retryResidentPropInventory` → 这里）。放开它，
-        // 等于"用户每删一件，下一个同步周期它自己长回来"—— 那比卡住更坏。
-        //
-        // 所以这里做的是**收口**而不是静默跳过：台账里那条待办当场销掉，并给出人话。
-        // 旧行为（留着待办 + 那句"空间就绪后会自动补做"）是一句**永远做不到的承诺**，
-        // 正是这一轮要修的形状。
-        for job in jobs where context.state.propTombstones?[job.objectID] != nil {
-            guard residentPropInventoryBacklog.resolve(objectID: job.objectID) else { continue }
-            let message = "\(job.name) 已经删除（永久），不再补做入库。"
-            if residentPropNotices[job.objectID] != message {
-                showResidentVoiceStatus(message)
-                residentPropNotices[job.objectID] = message
-            }
-        }
-        // 「还欠一次入库」的判据**只有一处**：`WorldState.canRedoInventoryRegistration(objectID:)`
-        // —— 它与 `applyPropLayout(.register)` 的回执去重判据**同源**（见
-        // `WorldRuntime/WorldPropLayout.swift`）。面板上「重试入库」的可用性读的是
-        // **同一个函数**（`residentPropWishFacts` 里的 `canRedoInventoryRegistration`），
-        // 于是"按钮亮了却做不到"与"做不到却亮着"在结构上都不可能。
-        for job in jobs where context.state.canRedoInventoryRegistration(objectID: job.objectID) {
-            guard let asset = residentOwnedPropAssets[job.objectID] else { continue }
-            do {
-                try await prepareResidentPropMutation(.register(asset.prop), context: context)
-                try service.commit(.register(asset.prop), expectedLayoutRevision: context.state.layoutRevision, requestID: "claimed." + job.id.uuidString)
-                residentPropNotices.removeValue(forKey: job.objectID)
-                if residentPropInventoryBacklog.resolve(objectID: job.objectID) {
-                    // 之前对用户说过"已领取，入库尚未保存"：补做成功必须**看得见结果**
-                    // （任务行/系统消息同时变成"已领取并入库"），旧那句话被这句取代。
+                let rebase = authorityState.objectStates[job.objectID] != nil
+                let raw = try await client.register(identity,wishID:job.id.uuidString,
+                    expectedRevision:revision,layoutRevision:authorityState.layoutRevision,
+                    requestID:(rebase ? "rebase." : "claimed.") + job.id.uuidString + "." + sample.sha256 + "." + identity.hostSessionID,
+                    blobRef:"sha256:" + sample.sha256,triangles:sample.trianglesJSON,rebase:rebase)
+                guard livingWorldContext === context, spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                try await context.adoptRustPropReceipt(raw)
+                guard let prop = context.state.objectStates[job.objectID]?.generatedProp,
+                      prop.assetID == preparing.assetID else { throw RustWorldPropError.executionUnknown }
+                // Exact authority values drive output. Native never derives dimensions or orientation here.
+                var descriptor = ResidentPropRenderDescriptor(objectID:prop.objectID,worldID:job.worldID,
+                    assetID:prop.assetID,modelURL:url,targetHeightMeters:prop.effectiveSize.y,
+                    position:.zero,yaw:0)
+                descriptor.orientation = prop.orientationRotation
+                descriptor.targetSizeMeters = prop.effectiveSize
+                _ = try await spatialStage.prepareResidentProp(descriptor)
+                guard livingWorldContext === context, spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                residentOwnedPropAssets[job.objectID] = ResidentOwnedPropAsset(prop:prop,descriptor:descriptor)
+                residentPropAssetFacts[job.objectID] = Self.residentPropByteReceipt(for:descriptor,bytes:inspection.bytes)
+                residentPropAssetFailures.removeValue(forKey:job.objectID)
+                residentPropNotices.removeValue(forKey:job.objectID)
+                if residentPropInventoryBacklog.resolve(objectID:job.objectID) {
                     showResidentVoiceStatus("\(job.name) 已入库。")
                 }
+                if let notice = prop.orientation?.notice {
+                    residentPropNotices[job.objectID] = "\(job.name)：\(notice)"
+                }
             } catch {
-                guard self.livingWorldContext === context, self.spatialStage.selectedWorldID == context.manifest.worldID else { return }
-                switch ResidentPropStartupRecovery.action(
-                    rendererReady: spatialStage.canPrepareResidentProp(worldID: context.manifest.worldID),
-                    error: error
-                ) {
-                case let .report(description):
-                    // 「已领取但没进库存」**不许静默、不许冒充成功**：
-                    // 1) 记进补做台账（等承托几何就绪那一刻补做，见 `finishResidentPropGridDerivation`）；
-                    // 2) 把服务给出的原因原样说给用户。
-                    //
-                    // 判定一个字都没放宽：`environmentNotReady` 仍然是拒绝写入。这里修的
-                    // 是"被拒之后没人补做"——真机 2026-10-01 `2B 白色长剑` 的
-                    // `layoutReceipts` 里没有 `claimed.<jobID>`、`state.json` 的
-                    // `objectStates` 里也没有它，而任务行/系统消息却按"模型已备好"
-                    // 写着"已领取并入库"。
-                    let pending = ResidentPropInventoryBacklog.Pending(
-                        objectID: job.objectID, name: job.name, reason: description,
-                        // 分类只读**服务抛出来的那个错误值**，不放宽任何判定：
-                        // `environmentNotReady` 依旧是拒绝写入，只是它"还会好"。
-                        waitsForSupportGeometry: (error as? ResidentPropPlacementError) == .environmentNotReady)
-                    residentPropInventoryBacklog.record(pending)
-                    let message = ResidentPropInventoryBacklog.pendingNotice(pending)
-                    if residentPropNotices[job.objectID] != message { showResidentVoiceStatus(message); residentPropNotices[job.objectID] = message }
-                case .ignoreRendererLoss, .deferUntilRendererReady, .prepare:
-                    break
+                guard livingWorldContext === context, spatialStage.selectedWorldID == context.manifest.worldID else { return }
+                let reason: String
+                switch error {
+                case RustWorldPropError.executionUnknown, RustWorldPropError.unavailable:
+                    reason = "入库回执尚未确认，保留原请求等待权威核验。"
+                case RustWorldPropError.rejected(let code):
+                    reason = "入库未保存（\(code)）。"
+                default:
+                    reason = error.localizedDescription
+                }
+                residentPropAssetFailures[job.objectID] = reason
+                let pending = ResidentPropInventoryBacklog.Pending(objectID:job.objectID,name:job.name,
+                    reason:reason,waitsForSupportGeometry:false)
+                residentPropInventoryBacklog.record(pending)
+                let message = ResidentPropInventoryBacklog.pendingNotice(pending)
+                if residentPropNotices[job.objectID] != message {
+                    residentPropNotices[job.objectID] = message
+                    showResidentVoiceStatus(message)
                 }
             }
         }
-        // 摆正的说明放在**最后**：它说的是"这件东西的姿态是怎么定的"，
-        // 比"入库成功"更值得留在面板上（后者是流程，前者是事实）。
-        for (objectID, message) in orientationNotices.sorted(by: { $0.key < $1.key }) {
-            guard residentPropNotices[objectID] != message else { continue }
-            residentPropNotices[objectID] = message
-            showResidentVoiceStatus(message)
-        }
+        residentPropInventoryBacklog.prune { context.state.objectStates[$0]?.generatedProp != nil }
         synchronizeResidentPropPresentation()
     }
 
-    /// 承托几何刚就绪：把"已领取但入库被拒"的待办补做一次。
-    ///
-    /// 这是**既有的**就绪信号（一次网格派生的收尾），不是新轮询、也不是定时器。
-    /// 幂等由三层一起保证：
-    /// 1. `drain` 只报"还不在库存里"的条目，几何没就绪时一件都不报；
-    /// 2. 真正写入的唯一出口仍是 `synchronizeOwnedResidentProps` → 摆放服务的
-    ///    `register`（同一份 fail-closed 判定），它按 `objectStates` 跳过已在库的；
-    /// 3. 提交用的回执键是既有的 `claimed.<jobID>`，`WorldSimulation.applyPropLayout`
-    ///    按回执去重，所以同一件东西写两遍在状态层就不可能发生。
+    /// Existing readiness notification refreshes the inventory projection.
+    /// Rust owns registration, measurement and receipt idempotence. A lost HTTP
+    /// reply retains the original request and checks its durable receipt first.
     private func drainResidentPropInventoryBacklog(reason: String) {
         guard !residentPropInventoryBacklog.isEmpty else { return }
         let attempted = residentPropInventoryBacklog.drain(
@@ -5446,7 +5254,7 @@ final class AppDelegate:
             })
         guard !attempted.isEmpty else { return }
         livingWorldLogger.notice(
-            "入库补做：\(reason, privacy: .public) 几何就绪，补做 \(attempted.count, privacy: .public) 件（\(attempted.joined(separator: ","), privacy: .public)）；写入仍走摆放服务的 register。"
+            "入库核验：\(reason, privacy: .public)，核验 \(attempted.count, privacy: .public) 件（\(attempted.joined(separator: ","), privacy: .public)）；写入由 Rust register 管理。"
         )
         Task { @MainActor [weak self] in await self?.synchronizeOwnedResidentProps() }
     }
@@ -5660,16 +5468,134 @@ final class AppDelegate:
         safelyReturnHeldProp(reason: "换角色")
     }
 
+    private var residentSystemReturnPending = Set<String>()
+    private var residentSystemReturnRequestIDs: [String: String] = [:]
+    private var residentAvatarReturnTask: Task<Bool, Never>?
     private func safelyReturnHeldProp(reason: String) {
         guard let context = livingWorldContext, let held = context.state.heldProp else { return }
-        do {
-            try context.commitPropLayout(.returnHeld(objectID: held.objectID, avatarAssetID: held.avatarAssetID),
-                expectedLayoutRevision: context.state.layoutRevision,
-                requestID: "system.return.\(reason).\(context.state.layoutRevision)") { _ in }
-            synchronizeResidentPropPresentation()
-        } catch {
-            showResidentVoiceStatus("\(reason)时物件自动放回失败：\(error.localizedDescription)")
+        if reason == "换空间" {
+            _ = enqueueResidentLifecycleReturn(.worldDetached, context: context, selectedWorldID: spatialStage.selectedWorldID)
+            return
         }
+        guard let currentAvatar = avatarRuntime.snapshot.avatar, currentAvatar.id != held.avatarAssetID else { return }
+        let key = context.manifest.worldID + "|" + held.objectID + "|" + held.avatarAssetID
+        guard residentSystemReturnPending.insert(key).inserted else { return }
+        let requestID = "system.avatar-return." + UUID().uuidString
+        residentSystemReturnRequestIDs[key] = requestID
+        residentAvatarReturnTask = Task { @MainActor [weak self, weak context] in
+            guard let self, let context else { return false }
+            do {
+                let identity = self.residentPropUIIdentity(context: context)
+                let client = self.residentNativePropAuthority
+                let binding = try await client.systemReturnBinding(identity)
+                struct Binding: Decodable { struct Snapshot: Decodable { struct Record: Decodable { let state: WorldState; let recordRevision: UInt64 }; let record: Record }; let heldBindingSHA256: String; let snapshot: Snapshot }
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let observedBinding = try decoder.decode(Binding.self, from: binding)
+                let state = observedBinding.snapshot.record.state, revision = observedBinding.snapshot.record.recordRevision
+                guard state.heldProp?.objectID == held.objectID, state.heldProp?.avatarAssetID == held.avatarAssetID else { throw RustWorldPropError.executionUnknown }
+                let facts = try await self.residentRustPropFacts(context: context, client: client)
+                let observed = try await client.observe(identity, expectedRevision: revision, layoutRevision: state.layoutRevision, facts: facts)
+                let avatarFacts = (try JSONSerialization.jsonObject(with: facts) as? [String: Any])?["avatar"] as? [String: Any]
+                guard let actualAvatar = avatarFacts?["assetID"] as? String, let selection = avatarFacts?["selectionRevision"] as? NSNumber,
+                      actualAvatar == self.avatarRuntime.snapshot.avatar?.id,
+                      selection.uint64Value == self.avatarRuntime.snapshot.revision else { throw RustWorldPropError.executionUnknown }
+                let receipt = try await client.systemAvatarReturn(identity, expectedRevision: revision, layoutRevision: state.layoutRevision,
+                    geometryID: observed.geometryID, requestID: requestID, objectID: held.objectID,
+                    previousAvatarAssetID: held.avatarAssetID, avatarAssetID: actualAvatar, selectionRevision: selection.uint64Value,
+                    heldBindingSHA256: observedBinding.heldBindingSHA256)
+                guard self.livingWorldContext === context else { throw RustWorldPropError.executionUnknown }
+                try await context.adoptRustPropReceipt(receipt)
+                self.residentSystemReturnPending.remove(key)
+                self.residentSystemReturnRequestIDs.removeValue(forKey: key)
+                self.synchronizeResidentPropPresentation()
+                return true
+            } catch {
+                // Retain the unique request association after an ambiguous failure.
+                self.showResidentVoiceStatus("\(reason)时归还回执未确认，保留手持记录（world_prop_return_unconfirmed）。")
+                return false
+            }
+        }
+    }
+
+    private var residentLifecycleReturnTask: Task<Bool, Never>?
+    @discardableResult
+    private func enqueueResidentLifecycleReturn(_ kind: RustWorldPropClient.LifecycleReturnKind, context: WorldAgentContext,
+                                               selectedWorldID: String? = nil) -> Bool {
+        guard let held = context.state.heldProp else { return true }
+        let identity = residentPropUIIdentity(context: context), client = residentNativePropAuthority
+        let key = identity.worldID + "|" + held.objectID + "|" + held.avatarAssetID
+        guard residentSystemReturnPending.insert(key).inserted else { return false }
+        let requestID = "system.lifecycle-return." + UUID().uuidString
+        residentSystemReturnRequestIDs[key] = requestID
+        residentLifecycleReturnTask = Task { @MainActor [weak self, context] in
+            guard let self else { return false }
+            do {
+                struct Binding: Decodable { struct Snapshot: Decodable { struct Record: Decodable { let state: WorldState; let recordRevision: UInt64 }; let record: Record }; let heldBindingSHA256: String; let snapshot: Snapshot }
+                let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+                let binding = try decoder.decode(Binding.self, from: await client.systemReturnBinding(identity))
+                let state = binding.snapshot.record.state
+                guard state.worldID == identity.worldID, state.heldProp?.objectID == held.objectID,
+                      state.heldProp?.avatarAssetID == held.avatarAssetID else { throw RustWorldPropError.executionUnknown }
+                let reply = try await client.systemLifecycleReturn(identity, expectedRevision: binding.snapshot.record.recordRevision,
+                    layoutRevision: state.layoutRevision, requestID: requestID, objectID: held.objectID,
+                    previousAvatarAssetID: held.avatarAssetID, heldBindingSHA256: binding.heldBindingSHA256,
+                    kind: kind, selectedWorldID: selectedWorldID)
+                try await context.adoptRustPropReceipt(reply)
+                guard context.state.heldProp == nil else { throw RustWorldPropError.executionUnknown }
+                self.residentSystemReturnPending.remove(key)
+                self.residentSystemReturnRequestIDs.removeValue(forKey: key)
+                if self.livingWorldContext === context { self.synchronizeResidentPropPresentation() }
+                return true
+            } catch {
+                self.showResidentVoiceStatus("归还回执未确认，保留持久手持记录（world_prop_return_unconfirmed）。")
+                return false
+            }
+        }
+        return false // Enqueued is not a completed world mutation.
+    }
+
+    private func residentPropUIIdentity(context: WorldAgentContext) -> RustWorldPropClient.Identity {
+        // The selection callback runs after renderer detachment. Keep the old
+        // context's actual resident-world scope, never the new unavailable scope.
+        .init(worldID: context.manifest.worldID, residentScope: "resident.world." + Data(context.manifest.worldID.utf8).base64EncodedString(),
+              hostSessionID: residentAuthorityHostSessionID)
+    }
+    private func residentPropUICommand(_ command: WorldPropLayoutCommand) throws -> Data {
+        var raw: [String: Any]
+        switch command {
+        case .place(let id, let placement): raw = ["op":"place","objectID":id,"position":[placement.position.x,placement.position.y,placement.position.z],"yaw":placement.yaw,"surfaceID":placement.surfaceID]
+        case .withdraw(let id): raw = ["op":"withdraw","objectID":id]
+        case .hold(let id, _, let calibration): raw = ["op":"hold","objectID":id,"slot":calibration.hand.rawValue]
+        case .adjustGrip(let id, _, let calibration): raw = ["op":"adjustGrip","objectID":id,"offset":[calibration.localOffset.x,calibration.localOffset.y,calibration.localOffset.z],"rotation":[calibration.localRotation.x,calibration.localRotation.y,calibration.localRotation.z,calibration.localRotation.w]]
+        case .returnHeld(let id, _): raw = ["op":"returnHeld","objectID":id]
+        case .dropHeld(let id, _, _): raw = ["op":"dropHeld","objectID":id]
+        case .delete(let id, let reason): raw = ["op":"delete","objectID":id]; if let reason { raw["reason"] = reason }
+        case .undo: raw = ["op":"undo"]
+        case .resize(let id, let size): raw = ["op":"resize","objectID":id,"targetLongestEdge":max(size.x,size.y,size.z)]
+        case .enableCapability(let id, let template): raw = ["op":"enableCapability","objectID":id,"templateID":template]
+        case .register, .rebase, .rebindHeldAvatar: throw RustWorldPropError.rejected("world_prop_unsupported_ui_command")
+        }
+        return try JSONSerialization.data(withJSONObject: raw)
+    }
+    private func commitResidentRustPropUI(_ raw: Data, context: WorldAgentContext, editorID: UUID,
+                                         layoutRevision: UInt64, requestID: String) async throws {
+        guard isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
+        let identity = residentPropUIIdentity(context: context), client = residentNativePropAuthority
+        let (state, revision) = try await context.rustPropAuthoritySnapshot(client: client, identity: identity)
+        guard state.layoutRevision == layoutRevision else { throw RustWorldPropError.rejected("revision_conflict") }
+        let operation = (try JSONSerialization.jsonObject(with: raw) as? [String: Any])?["op"] as? String
+        var geometryID: String?
+        if ["place","hold","adjustGrip","returnHeld","dropHeld","undo","resize","enableCapability"].contains(operation ?? "") {
+            let facts = try await residentRustPropFacts(context: context, client: client)
+            geometryID = try await client.observe(identity, expectedRevision: revision, layoutRevision: layoutRevision, facts: facts).geometryID
+        }
+        guard isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
+        let intent = try await client.uiIntent(identity, expectedRevision: revision, layoutRevision: layoutRevision, command: raw)
+        guard isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
+        let receipt = try await client.uiCommand(identity, intent: intent, expectedRevision: revision, layoutRevision: layoutRevision,
+            geometryID: geometryID, requestID: requestID)
+        guard isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw RustWorldPropError.executionUnknown }
+        try await context.adoptRustPropReceipt(receipt)
     }
 
     private func configureResidentPropEditor(_ controller: StageWindowController) {
@@ -5679,60 +5605,55 @@ final class AppDelegate:
                   self.residentPropEditingWorldID == context.manifest.worldID,
                   self.spatialStage.selectedWorldID == context.manifest.worldID else { throw ResidentPropPlacementError.inactiveContext }
             try await self.prepareResidentPropMutation(.place(objectID: id, placement: placement), context: context)
-            return try self.residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-                guard let self, let context else { return false }
-                return self.isResidentPropEditorCurrent(context: context, editorID: editorID)
-            }).preview(objectID: id, placement: placement)
+            let identity = self.residentPropUIIdentity(context: context), client = self.residentNativePropAuthority
+            let (state, revision) = try await context.rustPropAuthoritySnapshot(client: client, identity: identity)
+            let facts = try await self.residentRustPropFacts(context: context, client: client)
+            let observed = try await client.observe(identity, expectedRevision: revision, layoutRevision: state.layoutRevision, facts: facts)
+            let reply = try await client.preview(identity, expectedRevision: revision, layoutRevision: state.layoutRevision,
+                geometryID: observed.geometryID, command: self.residentPropUICommand(.place(objectID: id, placement: placement)))
+            guard self.isResidentPropEditorCurrent(context: context, editorID: editorID),
+                  let value = try JSONSerialization.jsonObject(with: reply) as? [String: Any], value["canPlace"] as? Bool == true,
+                  let receipt = value["receipt"] as? [String: Any], let pose = receipt["placement"], var item = state.objectStates[id] else {
+                throw RustWorldPropError.rejected("world_prop_placement_blocked")
+            }
+            let projected = try JSONDecoder().decode(WorldPropPlacement.self, from: JSONSerialization.data(withJSONObject: pose))
+            item.transform = WorldTransform(position: projected.position,
+                rotation: WorldQuaternion(x:0,y:sin(projected.yaw/2),z:0,w:cos(projected.yaw/2)), scale: item.transform.scale)
+            item.isEnabled = true
+            return item
         }, commit: { [weak self] command, revision, requestID in
             guard let self, let context = self.livingWorldContext,
                   let editorID = self.residentPropEditingID,
                   self.residentPropEditingWorldID == context.manifest.worldID,
                   self.spatialStage.selectedWorldID == context.manifest.worldID else { throw ResidentPropPlacementError.inactiveContext }
             try await self.prepareResidentPropMutation(command, context: context)
-            let service = self.residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-                guard let self, let context else { return false }
-                return self.isResidentPropEditorCurrent(context: context, editorID: editorID)
-            })
-            try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
+            try await self.commitResidentRustPropUI(self.residentPropUICommand(command), context: context,
+                editorID: editorID, layoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
             return self.residentPropEditorSnapshot(context: context)
         }, hold: { [weak self] id, point, revision, requestID in
             guard let self, let context = self.livingWorldContext,
                   let editorID = self.residentPropEditingID,
                   self.isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
-            let service = self.residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-                guard let self, let context else { return false }
-                return self.isResidentPropEditorCurrent(context: context, editorID: editorID)
-            })
-            // 拿起来 / 就地换挂点：同一个入口（面板上"手/背后/腰间"那一行读的就是它）。
-            let command = try service.holdCommand(objectID: id, point: point)
-            try await self.prepareResidentPropMutation(command, context: context)
-            try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
+            let raw = try JSONSerialization.data(withJSONObject: ["op":"hold","objectID":id,"slot":point.rawValue])
+            try await self.commitResidentRustPropUI(raw, context: context, editorID: editorID, layoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
             return self.residentPropEditorSnapshot(context: context)
         }, adjustHeldGrip: { [weak self] id, offset, rotation, revision, requestID in
             guard let self, let context = self.livingWorldContext,
                   let editorID = self.residentPropEditingID,
                   self.isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
-            let service = self.residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-                guard let self, let context else { return false }
-                return self.isResidentPropEditorCurrent(context: context, editorID: editorID)
-            })
-            let command = try service.adjustGripCommand(objectID: id, localOffset: offset, localRotation: rotation)
-            try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
+            let raw = try JSONSerialization.data(withJSONObject: ["op":"adjustGrip","objectID":id,
+                "offset":[offset.x,offset.y,offset.z],"rotation":[rotation.x,rotation.y,rotation.z,rotation.w]])
+            try await self.commitResidentRustPropUI(raw, context: context, editorID: editorID, layoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
             return self.residentPropEditorSnapshot(context: context)
         }, returnHeld: { [weak self] id, revision, requestID in
             guard let self, let context = self.livingWorldContext,
                   let editorID = self.residentPropEditingID,
                   self.isResidentPropEditorCurrent(context: context, editorID: editorID) else { throw ResidentPropPlacementError.inactiveContext }
-            let service = self.residentPropPlacementService(context: context, isCurrent: { [weak self, weak context] in
-                guard let self, let context else { return false }
-                return self.isResidentPropEditorCurrent(context: context, editorID: editorID)
-            })
-            let command = try service.returnHeldCommand(objectID: id)
-            try await self.prepareResidentPropMutation(command, context: context)
-            try service.commit(command, expectedLayoutRevision: revision, requestID: requestID)
+            let raw = try JSONSerialization.data(withJSONObject: ["op":"returnHeld","objectID":id])
+            try await self.commitResidentRustPropUI(raw, context: context, editorID: editorID, layoutRevision: revision, requestID: requestID)
             self.synchronizeResidentPropPresentation()
             return self.residentPropEditorSnapshot(context: context)
         }, refreshSnapshot: { [weak self] in
@@ -5886,7 +5807,7 @@ final class AppDelegate:
         guard let context = livingWorldContext, spatialStage.selectedWorldID == context.manifest.worldID,
               let wishID = UUID(uuidString: jobID) else { throw ResidentPropPlacementError.inactiveContext }
         let scope = currentResidentWorldContext().sessionScope
-        _ = try wishMachineCoordinator.claim(id: wishID, worldID: context.manifest.worldID, residentScope: scope)
+        _ = try await wishMachineCoordinator.claim(id: wishID, worldID: context.manifest.worldID, residentScope: scope)
         livingWorldLogger.notice("摆件面板领取 step=claim 任务=\(jobID, privacy: .public) 结果=已登记")
         // 领成之后走**既有**入库那条路（它就是 agent 工具领完那次重入调用的同一个函数）。
         await synchronizeOwnedResidentProps()
@@ -6509,7 +6430,7 @@ final class AppDelegate:
             residentPropEditingID = UUID()
             livingWorldLogger.notice("装修：进入装修 world=\(context.manifest.worldID, privacy: .public)")
             residentPropEditingBackgroundEnabled = residentAgentLoop?.snapshot.backgroundEnabled ?? false
-            residentPropEditingPreferenceEnabled = UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1")
+            residentPropEditingPreferenceEnabled = RustProductSettingsClient.shared.confirmed?.values.autonomyEnabled ?? false
             temporarilyPauseResidentForPropEditing()
             liveCamMessageID = nil
             // 先把**原因**写下来，再取消在飞的轮次：真机 2026-10-02 16:56:00.786 /
@@ -6539,7 +6460,7 @@ final class AppDelegate:
             livingWorldLogger.notice("装修：退出装修 world=\(worldID, privacy: .public)，格子已停用。")
             publishResidentPropGrid()
             guard spatialStage.selectedWorldID == worldID, livingWorldContext?.manifest.worldID == worldID else { return }
-            if UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1") == residentPropEditingPreferenceEnabled {
+            if (RustProductSettingsClient.shared.confirmed?.values.autonomyEnabled ?? false) == residentPropEditingPreferenceEnabled {
                 residentAgentLoop?.setBackgroundEnabled(residentPropEditingBackgroundEnabled)
             } else { refreshResidentAutonomy() }
             residentAgentLoop?.receiveEvent(.init(id: UUID().uuidString, kind: "room.layout.changed",
@@ -6553,12 +6474,12 @@ final class AppDelegate:
             residentScope: worldContext.sessionScope)
     }
 
-    private func pauseResidentWishContinuations() {
+    private func pauseResidentWishContinuations() async {
         guard !residentPropTemporaryCancellation else { return }
         guard let scope = residentWishScope, let loop = residentAgentLoop,
               scope.loopID == ObjectIdentifier(loop) else { return }
         do {
-            try wishMachineCoordinator.pauseContinuations(worldID: scope.worldID, residentScope: scope.residentScope)
+            try await wishMachineCoordinator.pauseContinuations(worldID: scope.worldID, residentScope: scope.residentScope)
         } catch {
             showResidentVoiceStatus("本次行动已停止，许愿任务仍保留。自动领取的暂停状态保存失败，重启后可能恢复，请暂勿重启并稍后重试停止。")
         }
@@ -6584,7 +6505,7 @@ final class AppDelegate:
     /// 它不新建生成任务、不替用户领取，也不代表后台获得任何新权限：领取与摆放
     /// 仍由居民按本轮授权执行。
     @discardableResult
-    private func resumeWishAutomaticContinuation(id: UUID) -> Bool {
+    private func resumeWishAutomaticContinuation(id: UUID) async -> Bool {
         guard let scope = residentWishScope, let loop = residentAgentLoop,
               scope.loopID == ObjectIdentifier(loop) else {
             // 一次操作不能"点了没反应"：接不上当前居民会话/许愿机空间时也要说清楚。
@@ -6595,6 +6516,7 @@ final class AppDelegate:
         // 这个用户可见的状态也已经被这一个动作解开了。
         loop.resumeAutonomyByUser()
         do {
+            try await wishMachineCoordinator.waitUntilReady()
             let existing = try wishMachineCoordinator.read(id: id, worldID: scope.worldID,
                 residentScope: scope.residentScope)
             guard existing.autoContinuationPaused == true else {
@@ -6602,7 +6524,7 @@ final class AppDelegate:
                 return true
             }
             let alreadyPlaced = existing.stage == .claimed ? residentWishPlacementAlreadyCompleted(existing) : nil
-            _ = try wishMachineCoordinator.resumeContinuations(id: id, worldID: scope.worldID,
+            _ = try await wishMachineCoordinator.resumeContinuations(id: id, worldID: scope.worldID,
                 residentScope: scope.residentScope, authorizationID: UUID(),
                 placementAlreadyCompleted: alreadyPlaced)
             if alreadyPlaced == true {
@@ -6726,6 +6648,8 @@ final class AppDelegate:
         let ids = residentAgentLoop?.lastFinishedTurnSubmissionIDs ?? []
         guard !ids.isEmpty else { return }
         if residentChatTranscript.markSilentlyCompleted(ids: ids) {
+            stageWindowController?.finishResidentAttachments(ids:ids)
+            liveCamWindowController?.finishResidentAttachments(ids:ids)
             publishResidentTranscript()
         }
     }
@@ -6746,6 +6670,8 @@ final class AppDelegate:
         // 的身份不臆造回合，也不重复显示。
         let deliveredIDs = residentAgentLoop?.lastFinishedTurnSubmissionIDs ?? []
         if !deliveredIDs.isEmpty {
+            stageWindowController?.finishResidentAttachments(ids:deliveredIDs)
+            liveCamWindowController?.finishResidentAttachments(ids:deliveredIDs)
             residentChatTranscript.markDelivered(ids: deliveredIDs, reply: reply)
             publishResidentTranscript()
         }
@@ -6767,6 +6693,7 @@ final class AppDelegate:
 
     private func ensureResidentLoop() -> ResidentAgentLoop {
         if let residentAgentLoop {
+            bindResidentSchedulerIfRequested(loop: residentAgentLoop)
             bindResidentWishScope(currentResidentWorldContext(), loop: residentAgentLoop)
             rebindResidentLoopMemory()
             return residentAgentLoop
@@ -6796,12 +6723,38 @@ final class AppDelegate:
                 // （换空间、退出、自主可用性/网络回收、后台预算回收），它们不是用户
                 // 意图。任务级暂停是持久的、只能人工解除的，因此只由 onUserStop 落盘。
             },
-            onUserStop: { [weak self] in self?.pauseResidentWishContinuations() }
+            onUserStop: { [weak self] in Task { @MainActor in await self?.pauseResidentWishContinuations() } }
         )
         residentAgentLoop = loop
+        bindResidentSchedulerIfRequested(loop: loop)
         bindResidentWishScope(currentResidentWorldContext(), loop: loop)
         rebindResidentLoopMemory()
         return loop
+    }
+
+    /// Every resident turn uses the Rust scheduler without changing its backend.
+    private func bindResidentSchedulerIfRequested(loop: ResidentAgentLoop) {
+        AgentConversationService.shared.setRustResidentMode(true)
+        let world = currentResidentWorldContext()
+        let key = "\(ObjectIdentifier(loop))|\(residentTranscriptScopeKey)"
+        guard residentSchedulerBindingKey != key else { return }
+        residentSchedulerBindingKey = key
+        guard let worldID = world.worldID else {
+            loop.bindRustScheduler(nil, availability: { false })
+            return
+        }
+        let scope = world.sessionScope
+        let endpoint = WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase)
+        let scheduler = RustResidentSchedulerClient(worldID: worldID, residentScope: scope,
+            endpointFile: endpoint.endpointFile, hostSessionID: residentAuthorityHostSessionID)
+        loop.bindRustScheduler(scheduler, availability: { [weak self, weak loop] in
+            guard let self, let loop, self.residentAgentLoop === loop else { return false }
+            let current = self.currentResidentWorldContext()
+            return current.worldID == worldID && current.sessionScope == scope
+                && self.residentSchedulerBindingKey == key
+                && self.residentPropEditingWorldID == nil
+                && AgentConversationService.shared.hasUsableConversationBackend
+        })
     }
 
     private func synchronizeResidentLoopPresentation() {
@@ -6882,7 +6835,7 @@ final class AppDelegate:
         // 用户在设置里重新打开"允许居民自主安排活动"就是一次明确的人类操作：
         // 它必须真的解开此前的"停止自主行动"。停止不是永久契约，也不该要求
         // 用户猜一句能让居民调用 update_resident_intent 的话。
-        if UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1") {
+        if RustProductSettingsClient.shared.confirmed?.values.autonomyEnabled == true {
             residentAgentLoop?.resumeAutonomyByUser()
         }
         refreshResidentAutonomy()
@@ -6927,7 +6880,7 @@ final class AppDelegate:
                 scheduleResidentMemoryRestoreIfNeeded(loop: loop)
                 return
             }
-            loop.setBackgroundEnabled(UserDefaults.standard.bool(forKey: "resident.autonomous.enabled.v1"))
+            loop.setBackgroundEnabled(RustProductSettingsClient.shared.confirmed?.values.autonomyEnabled ?? false)
             loop.tick()
         } else {
             _ = returnHeldPropBeforeResidentStop(reason: "暂停居民自主生活")
@@ -7014,7 +6967,8 @@ final class AppDelegate:
     }
 
     private func residentWishPlacementGrant(objectID: String, placement: WorldPropPlacement,
-                                             worldID: String, residentScope: String) throws -> ResidentPropDelegatedGrant {
+                                             worldID: String, residentScope: String) async throws -> ResidentPropDelegatedGrant {
+        try await wishMachineCoordinator.waitUntilReady()
         guard currentResidentWorldContext().worldID == worldID,
               currentResidentWorldContext().sessionScope == residentScope,
               residentOwnedPropAssets[objectID] != nil,
@@ -7024,7 +6978,7 @@ final class AppDelegate:
         let target = WishPlacementTarget(surfaceID: placement.surfaceID,
             position: .init(x: Double(placement.position.x), y: Double(placement.position.y), z: Double(placement.position.z)),
             yaw: Double(placement.yaw))
-        let delegation = try wishMachineCoordinator.resolvePlacementGrant(worldID: worldID,
+        let delegation = try await wishMachineCoordinator.resolvePlacementGrant(worldID: worldID,
             residentScope: residentScope, objectID: objectID, surfaceID: placement.surfaceID, target: target)
         let effective = delegation.explicitTarget ?? delegation.boundTarget
         let grantedPlacement = effective.map { target in
@@ -7037,15 +6991,16 @@ final class AppDelegate:
     }
 
     private func recordResidentWishPlacement(_ grant: ResidentPropDelegatedGrant, placement: WorldPropPlacement,
-                                              worldID: String, residentScope: String) throws {
+                                              worldID: String, residentScope: String) async throws {
         let target = WishPlacementTarget(surfaceID: placement.surfaceID,
             position: .init(x: Double(placement.position.x), y: Double(placement.position.y), z: Double(placement.position.z)),
             yaw: Double(placement.yaw))
-        try wishMachineCoordinator.recordPlacementCompletion(worldID: worldID, residentScope: residentScope,
+        try await wishMachineCoordinator.recordPlacementCompletion(worldID: worldID, residentScope: residentScope,
             objectID: grant.objectID, requestID: grant.requestID, surfaceID: placement.surfaceID, target: target)
     }
 
-    private func reconcileResidentWishPlacements(_ worldContext: ResidentWorldContext) throws {
+    private func reconcileResidentWishPlacements(_ worldContext: ResidentWorldContext) async throws {
+        try await wishMachineCoordinator.waitUntilReady()
         guard let context = livingWorldContext, context.manifest.worldID == worldContext.worldID else { return }
         // A crash can happen after the world saved the placement but before the
         // wish journal recorded completion. Read the committed command, never
@@ -7058,7 +7013,7 @@ final class AppDelegate:
             let target = WishPlacementTarget(surfaceID: placement.surfaceID,
                 position: .init(x: Double(placement.position.x), y: Double(placement.position.y), z: Double(placement.position.z)),
                 yaw: Double(placement.yaw))
-            try wishMachineCoordinator.recordPlacementCompletion(worldID: context.manifest.worldID,
+            try await wishMachineCoordinator.recordPlacementCompletion(worldID: context.manifest.worldID,
                 residentScope: worldContext.sessionScope, objectID: objectID, requestID: delegation.requestID,
                 surfaceID: placement.surfaceID, target: target)
         }
@@ -7135,7 +7090,7 @@ final class AppDelegate:
                   let inputSchema = schema["inputSchema"] as? [String: Any] else { return nil }
             return ResidentWorldToolSession.AdditionalTool(name: name, description: description,
                 inputSchema: inputSchema, validate: { _ in true }, handle: { id, arguments in
-                    let result = loopTools.handle(name: name, argumentsJSON: arguments)
+                    let result = await loopTools.handle(name: name, argumentsJSON: arguments)
                     return RealtimeDJToolResult(callID: id, resultJSON: result.data, isError: result.isError)
                 })
         }
@@ -7179,11 +7134,11 @@ final class AppDelegate:
                     try await self.prepareResidentPropMutation(command, context: context)
                 }, resolveDelegatedGrant: { [weak self] objectID, placement in
                     guard let self, isCurrent() else { throw CancellationError() }
-                    return try self.residentWishPlacementGrant(objectID: objectID, placement: placement,
+                    return try await self.residentWishPlacementGrant(objectID: objectID, placement: placement,
                         worldID: worldID, residentScope: residentScope)
                 }, recordDelegatedPlacement: { [weak self] grant, placement in
                     guard let self, isCurrent() else { throw CancellationError() }
-                    try self.recordResidentWishPlacement(grant, placement: placement,
+                    try await self.recordResidentWishPlacement(grant, placement: placement,
                         worldID: worldID, residentScope: residentScope)
                 }, ownershipRow: { [weak self, weak context] objectID in
                     // `read_owned_props` 回执里那两句（`ownership_state` /
@@ -7198,6 +7153,21 @@ final class AppDelegate:
                     // 回执里不写 `screen` 这个键，绝不替一件没有屏幕的物件说"能播"。
                     guard let self, let context, isCurrent() else { return nil }
                     return self.residentScreenCapability(objectID: objectID, context: context)
+                }, rustTool: { [weak self, weak context] name, callID, arguments in
+                    guard let self, let context, isCurrent(),
+                          let dispatch = ResidentWorldToolSession.rustDispatchAuthority,
+                          dispatch.worldID == worldID, dispatch.residentScope == residentScope,
+                          dispatch.callID == callID, dispatch.toolName == name else {
+                        throw RustWorldPropError.rejected("world_prop_unauthorized")
+                    }
+                    let client = RustWorldPropClient(endpointFile:URL(fileURLWithPath:
+                        WorldAuthorityEndpoint(applicationSupportBase:E2ERuntime.applicationSupportBase).endpointFile))
+                    let identity = RustWorldPropClient.Identity(worldID:worldID,residentScope:residentScope,
+                        hostSessionID:dispatch.hostSessionID)
+                    return try await context.executeRustPropTool(name, callID:callID, arguments:arguments,
+                        client:client, identity:identity,
+                        nativeFacts:{ try await self.residentRustPropFacts(context:context,client:client) },
+                        isCurrent:isCurrent)
                 }).tools : []
         // 电视机：三条工具（play_screen / stop_screen / read_screen）。
         // 与点唱机同一条纪律 —— 只说"放个视频"而没给链接是**信息不足**，
@@ -7275,8 +7245,16 @@ final class AppDelegate:
             },
             onCancel: { outcome.abort(); visionImages.removeAll() },
             additionalTools: additionalTools + musicTools.tools + visionTools + wishTools + referenceTools + propTools + screenTools,
-            maximumCalls: AgentConversationService.shared.effectiveBackendID == .dsh ? nil : 32
+            maximumCalls: AgentConversationService.shared.effectiveBackendID == .dsh ? nil : 32,
+            rustOperationAuthority: { name, canonical in
+                RustResidentToolBindingFactory.decision(scopeID: messageID, worldID: worldID,
+                    revision: context.snapshot.revision, name: name, canonical: canonical)
+            }
         )
+        let rustOwner = residentAgentLoop?.claimedRustBinding(runID: messageID).flatMap { claim in
+            try? RustResidentToolBindingFactory(session: session, claim: claim,
+                endpointFile: WorldAuthorityEndpoint(applicationSupportBase: E2ERuntime.applicationSupportBase).endpointFile)
+        }
         return ResidentConversationTools(
             visionCapable: visionToolbox != nil,
             worldID: worldID,
@@ -7285,14 +7263,20 @@ final class AppDelegate:
                 self?.residentAgentLoop?.recordToolProgress(runID: messageID, toolName: name, phase: .started)
                 // 所有工具（含视觉）都经 session.call：租约/取消/次数/deadline
                 // 一律走会话账本；原生图片只取自盒内成功回执的强类型产物。
-                let result = await session.call(requestID: requestID, name: name, argumentsJSON: arguments)
+                let result: RealtimeDJToolResult
+                if let rustOwner { result = await rustOwner.call(callID: requestID, name: name, arguments: arguments) }
+                else { result = await session.call(requestID: requestID, name: name, argumentsJSON: arguments) }
                 let image = visionImages.take(callID: requestID, succeeded: !result.isError)
                 self?.residentAgentLoop?.recordToolProgress(runID: messageID, toolName: name,
                     phase: result.isError ? .failed : .returned)
                 return ResidentCodexToolReply(resultJSON: result.resultJSON, isError: result.isError, image: image)
             },
             cancel: { session.cancel() },
-            allowsSilentCompletion: { loopTools.allowsSilentCompletion }
+            allowsSilentCompletion: { loopTools.allowsSilentCompletion }, rustBinding: rustOwner?.binding,
+            rustDSHBinding: try? rustOwner?.dshBinding(),
+            rustClaudeBinding: AgentConversationService.shared.effectiveBackendID == .claudeCode ? (try? rustOwner?.claudeBinding(
+                adapterExecutableURL: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/gmgn-mcpd"),
+                environment: ProcessInfo.processInfo.environment)) : nil
         )
     }
 
@@ -7459,11 +7443,16 @@ final class AppDelegate:
 
     private func configureWishMachineService() {
         configureWishMessageDelivery()
-        do {
-            let configuration = try PropGenerationConfigurationStore(
-                fileURL: injectedPropGenerationConfigURL
-                    ?? PropGenerationConfigurationStore.defaultFileURL
-            ).load()
+        wishMachineConfigurationTask?.cancel()
+        wishMachineConfigurationTask = Task { @MainActor [weak self] in
+          guard let self else { return }
+          do {
+            let taskRoot = injectedTaskDaemonRoot ?? WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: E2ERuntime.applicationSupportBase)
+            let receipt = try await wishMachineConfigurationAuthority.load(
+                currentFile: injectedPropGenerationConfigURL ?? taskRoot.deletingLastPathComponent().appendingPathComponent("secrets/prop-generation.json"),
+                legacyFile: injectedPropGenerationConfigURL == nil ? PropGenerationConfigurationStore.defaultFileURL : nil)
+            let configuration = try await wishMachineConfigurationAuthority.configuration(receipt)
+            guard !Task.isCancelled else { return }
             guard configuration != wishMachineConfiguration else { return }
             wishMachineConfiguration = nil
             propGenerationStore.clearConfiguration()
@@ -7475,9 +7464,11 @@ final class AppDelegate:
             wishMachineConfiguration = configuration
             wishMachineServiceNotice = "服务配置已读取；是否成功提交以工具回执为准。"
         } catch {
+            guard !Task.isCancelled else { return }
             wishMachineConfiguration = nil
             propGenerationStore.clearConfiguration()
             wishMachineServiceNotice = "许愿机服务配置无法读取，请在空间设置中检查。"
+        }
         }
     }
 
@@ -7490,7 +7481,7 @@ final class AppDelegate:
         }
     }
 
-    private func authorizeWishImages(_ input: ResidentAgentLoop.Input, worldContext: ResidentWorldContext) throws -> UUID? {
+    private func authorizeWishImages(_ input: ResidentAgentLoop.Input, worldContext: ResidentWorldContext) async throws -> UUID? {
         guard !input.isBackground, worldContext.worldID == WishMachineScene.worldID,
               AgentConversationService.shared.supportsWorldTools, let loop = residentAgentLoop,
               loop.isCurrent(runID: input.runID) else { return nil }
@@ -7513,10 +7504,13 @@ final class AppDelegate:
         // Looking at an image does not submit anything. A current human turn can
         // reference its own earlier images; the generation tool still requires a
         // clear manufacturing request, and one authorization can create only one item.
-        try wishMachineCoordinator.registerImages(attachments,
+        try await wishMachineCoordinator.registerImages(attachments,
             worldID: WishMachineScene.worldID, residentScope: worldContext.sessionScope,
             conversationID: conversationID.uuidString)
-        try wishMachineCoordinator.authorize(registeredImageIDs: attachments.map(\.id),
+        guard loop.isCurrent(runID: input.runID), currentResidentWorldContext().sessionScope == worldContext.sessionScope else {
+            throw CancellationError()
+        }
+        try await wishMachineCoordinator.authorize(registeredImageIDs: attachments.map(\.id),
             worldID: WishMachineScene.worldID, residentScope: worldContext.sessionScope,
             conversationID: conversationID.uuidString,
             authorizationID: input.runID, source: .init(author: "用户提供", license: "未核验，仅限个人测试"))
@@ -7547,9 +7541,13 @@ final class AppDelegate:
         // 把模拟状态的 id 与执行器的相位拼在一起：执行器空转时它给的是"没有 id + 安全待机
         // 的 loop"，于是 `phase == "loop"` 会在什么都没跑的时候成立。领取要的是"真的在跑"。
         let running = context.runningActivity
+        let authority = context.currentRustActivityRun
         return WishMachineClaimEvidence(worldID: job.worldID, activityID: running?.id,
             phase: running?.phase.rawValue,
-            distanceMeters: sqrt(dx * dx + dy * dy + dz * dz), outputAvailable: outputAvailable)
+            distanceMeters: sqrt(dx * dx + dy * dy + dz * dz), outputAvailable: outputAvailable,
+            activityRequestID:authority?.requestID,activityGeneration:authority?.generation,
+            phaseGeneration:authority?.phaseGeneration,activityHostSessionID:authority?.hostSessionID,
+            objectID:spatialStage.wishMachineOutput?.id)
     }
 
     /// The shared unread truth for system task deliveries across both windows.
@@ -7558,23 +7556,20 @@ final class AppDelegate:
     /// 持久化走统一状态合同（gmgn-taskd inbox 域）；旧 JSON 归档只在作用域
     /// 尚无落库记录时只读导入一次，绝不改写、绝不删除旧文件。
     private lazy var residentSystemInboxStore: ResidentSystemInboxStore = {
-        let storage = ResidentSystemInboxStateStorage(client: ResidentStateClient(
-            transport: ResidentTaskDaemonStateTransport(client: PropTaskDaemonClient(root: injectedTaskDaemonRoot))))
-        let legacyArchiveURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first?.appendingPathComponent("GMGNRadio", isDirectory: true)
+        let client = RustInboxClient(
+            root: WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: E2ERuntime.applicationSupportBase),
+            allowsLaunching: true)
+        let legacyArchiveURL = (E2ERuntime.applicationSupportBase
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)?.appendingPathComponent("GMGNRadio", isDirectory: true)
             .appendingPathComponent("ResidentSystemInbox.json")
         return ResidentSystemInboxStore(
-            restore: { scope in
-                let stateScope = ResidentStateScope(worldID: scope.worldID, residentScope: scope.residentScope)
-                if let durable = try await storage.restore(scope: stateScope) { return durable }
+            client: client, legacy: { scope in
                 guard let legacyArchiveURL,
                       let archive = ResidentSystemInboxStateStorage.legacyArchive(at: legacyArchiveURL) else { return nil }
                 let imported = ResidentSystemInboxStateStorage.legacyEntries(
                     from: archive, worldID: scope.worldID, residentScope: scope.residentScope)
                 return imported.isEmpty ? nil : imported
-            },
-            persist: { scope, entries in try await storage.persist(scope: ResidentStateScope(
-                worldID: scope.worldID, residentScope: scope.residentScope), entries: entries) })
+            })
     }()
 
     private func openSystemInbox() {
@@ -7595,7 +7590,7 @@ final class AppDelegate:
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     _ = await self.residentSystemInboxStore.markRead(taskKey: taskKey,
-                        worldID: worldID, residentScope: context.sessionScope)
+                        worldID: worldID, residentScope: context.sessionScope, expectedEventID: row.eventID)
                     self.pushSystemInboxSnapshots()
                 }
             }
@@ -7627,7 +7622,7 @@ final class AppDelegate:
         guard let worldID = context.worldID else { controller.reload([]); return }
         let rows = residentSystemInboxStore.entries(worldID: worldID, residentScope: context.sessionScope)
             .map { entry in
-                ResidentSystemInboxWindowController.Row(id: entry.id, title: entry.title,
+                ResidentSystemInboxWindowController.Row(id: entry.id, eventID: entry.lastEventID, title: entry.title,
                     status: entry.status,
                     detail: [entry.status, entry.detail].filter { !$0.isEmpty }.joined(separator: "\n"),
                     isRead: entry.isRead, updatedAt: entry.updatedAt)
@@ -7746,6 +7741,25 @@ final class AppDelegate:
     }
 
     private func synchronizeWishMachinePresentation() {
+        wishPresentationRefreshPending = true
+        guard wishPresentationTask == nil else { return }
+        wishPresentationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.wishPresentationTask = nil }
+            repeat {
+                self.wishPresentationRefreshPending = false
+                await self.applyWishMachinePresentation()
+            } while self.wishPresentationRefreshPending && !Task.isCancelled
+        }
+    }
+
+    private func applyWishMachinePresentation() async {
+        do { try await wishMachineCoordinator.waitUntilReady() }
+        catch {
+            spatialStage.wishMachineState = .failed
+            showResidentVoiceStatus("许愿任务状态读取失败，请稍后重试。")
+            return
+        }
         updateWishMessageScope()
         guard let worldID = currentResidentWorldContext().worldID, worldID == WishMachineScene.worldID else {
             spatialStage.wishMachineOutput = nil
@@ -7779,9 +7793,9 @@ final class AppDelegate:
             do {
                 switch spatialStage.wishMachineOutputStatus {
                 case .ready(let id) where id == job.objectID:
-                    try wishMachineCoordinator.clearOutputRenderFailure(id: job.id, worldID: worldID, residentScope: scope)
+                    try await wishMachineCoordinator.clearOutputRenderFailure(id: job.id, worldID: worldID, residentScope: scope)
                 case .failed(let id, let message) where id == job.objectID:
-                    try wishMachineCoordinator.recordOutputRenderFailure(id: job.id, worldID: worldID,
+                    try await wishMachineCoordinator.recordOutputRenderFailure(id: job.id, worldID: worldID,
                         residentScope: scope, message: message)
                 default:
                     break
@@ -7796,6 +7810,8 @@ final class AppDelegate:
                 return
             }
         }
+        guard currentResidentWorldContext().worldID == worldID,
+              currentResidentWorldContext().sessionScope == scope else { return }
         // 托盘端哪一件**只由 job 事实（stage/modelPath/尺寸意图）与现场推导决定**，
         // 与那条持久化记录**无关**。这里曾经用 `identities.subtracting(failedIDs)` 把有记录的
         // 产物整件减掉 —— 那正是"派生结论被当成持久事实"的现场（真机 2026-10-02「超大荧幕电视」）。
@@ -8148,7 +8164,7 @@ final class AppDelegate:
             guard published.id == event.id, published.taskId == taskID, published.worldID == scope.worldID,
                   published.residentScope == scope.residentScope, published.kind == "wish." + event.kind.rawValue,
                   published.payload == payload else { throw PropTaskDaemonError.invalidFrame }
-            try wishMachineCoordinator.markEventPublished(id: event.id)
+            try await wishMachineCoordinator.markEventPublished(id: event.id)
         }
     }
 
@@ -8261,10 +8277,9 @@ final class AppDelegate:
         let observation = ResidentAgentLoop.Event(id: "wish." + factID.uuidString,
             kind: kind + "." + taskID.uuidString + "." + factID.uuidString,
             summary: String(decoding: data, as: UTF8.self))
-        let terminal = ["wish.failed", "wish.cancelled", "wish.interrupted", "wish.placed"].contains(kind)
         if loop.snapshot.isStopped {
             loop.receiveEvent(observation)
-        } else if terminal || resumed || (kind == "wish.outputReady" && automatic && job.stage != .claimed) {
+        } else if automatic {
             loop.receiveContinuationEvent(observation)
         } else { loop.receiveEvent(observation) }
     }
@@ -8437,11 +8452,11 @@ final class AppDelegate:
         defer { avatarRuntime.endResidentThinking(runID: messageID) }
         let worldContext = currentResidentWorldContext()
         if let loop = residentAgentLoop { bindResidentWishScope(worldContext, loop: loop) }
-        try reconcileResidentWishPlacements(worldContext)
+        try await reconcileResidentWishPlacements(worldContext)
         let requestWorld = livingWorldContext
         liveCamMessageID = messageID
         defer { if liveCamMessageID == messageID { liveCamMessageID = nil } }
-        let wishAuthorizationID = try authorizeWishImages(input, worldContext: worldContext)
+        let wishAuthorizationID = try await authorizeWishImages(input, worldContext: worldContext)
         // 奉命轮 = 本轮由人类输入发起，或后台 run 已被人类引导接手。领取授权
         // 按每次工具调用实时求值：停止只停自主，不吊销人类当轮的明确指令。
         let worldTools = makeResidentWorldTools(messageID: messageID, wishAuthorizationID: wishAuthorizationID,
@@ -8672,7 +8687,7 @@ final class AppDelegate:
                 guard musicSelectionGeneration == selectionGeneration else {
                     throw DJAgentMusicLibraryError.interrupted
                 }
-                try commitMusicLibraryPreparation(plan: plan, queue: queue, index: index)
+                try await commitMusicLibraryPreparation(plan: plan, queue: queue, index: index)
             }
         )
     }
@@ -8696,17 +8711,17 @@ final class AppDelegate:
         return try await makeMusicLibraryAgentService().prepare(playlistID: playlistID, trackID: trackID)
     }
 
-    private func commitMusicLibraryPreparation(plan: ProgramPlan, queue: ProgramPlaybackQueue, index: Int) throws {
+    private func commitMusicLibraryPreparation(plan: ProgramPlan, queue: ProgramPlaybackQueue, index: Int) async throws {
         try Task.checkCancellation()
         guard !isStartingProgramPlayback else { throw DJAgentMusicLibraryError.busy }
         musicSelectionGeneration &+= 1
         localMusicPlayer.stop()
         residentJukeboxPlaybackOwner = nil
         committedPlaybackTrack = nil
-        activeProgram = plan
+        try await programStore.publish(plan)
+        try await programStore.activateSlot(at: index)
+        activeProgram = programStore.plan
         programPlaybackQueue = queue
-        programStore.publish(plan)
-        programStore.activateSlot(at: index)
         stageWindowController?.setPlaybackState(.ready)
         updateStageProgramNavigation()
     }
@@ -8764,8 +8779,9 @@ final class AppDelegate:
         guard activeProgram != nil else {
             throw DJAgentRadioActionError.noProgram
         }
+        let skippedKnowledgeTrack = committedPlaybackTrack
         guard
-            let next = await programPlaybackQueue
+            let next = try await programPlaybackQueue
                 .advanceAfterCompletion()
         else {
             throw DJAgentRadioActionError.trackNotFound
@@ -8775,13 +8791,18 @@ final class AppDelegate:
             requestOpening: false,
             allowFallback: false
         )
+        if let skippedKnowledgeTrack {
+            do { try await RustMusicKnowledgeClient.live.record(.skipped(trackID: skippedKnowledgeTrack.id, at: Date())) }
+            catch { playbackLogger.error("跳过事实记录失败：\(String(describing: error), privacy: .public)") }
+        }
     }
 
     func playPreviousTrack() async throws {
         musicSelectionGeneration &+= 1
+        let skippedKnowledgeTrack = committedPlaybackTrack
         guard
             activeProgram != nil,
-            let previous = programPlaybackQueue.returnToPrevious()
+            let previous = try await programPlaybackQueue.returnToPrevious()
         else {
             throw DJAgentRadioActionError.trackNotFound
         }
@@ -8790,6 +8811,10 @@ final class AppDelegate:
             requestOpening: false,
             allowFallback: false
         )
+        if let skippedKnowledgeTrack {
+            do { try await RustMusicKnowledgeClient.live.record(.skipped(trackID: skippedKnowledgeTrack.id, at: Date())) }
+            catch { playbackLogger.error("跳过事实记录失败：\(String(describing: error), privacy: .public)") }
+        }
     }
 
     func pauseMusic() async throws {
@@ -8879,7 +8904,7 @@ final class AppDelegate:
                 guard backgroundProgramRequestID == requestID else {
                     return
                 }
-                programStore.publishDraft(proposal)
+                try await programStore.publishDraft(proposal)
                 updateStageProgramNavigation()
                 playbackLogger.info(
                     "后台编排任务完成：id=\(requestID.uuidString, privacy: .public)，title=\(proposal.title ?? "未命名节目", privacy: .public)，tracks=\(proposal.slots.count)"
@@ -8973,8 +8998,8 @@ final class AppDelegate:
         }
         residentJukeboxPlaybackOwner = nil
         localMusicPlayer.pause()
-        activeProgram = proposal
-        programStore.publish(proposal)
+        try await programStore.publish(proposal)
+        activeProgram = programStore.plan
         updateStageProgramNavigation()
         try await playPreparedWithFallback(
             prepared,
@@ -9040,24 +9065,19 @@ final class AppDelegate:
                     programPlaybackQueue.current != nil
                 {
                     insertedIntoActiveProgram = true
-                    let revised = DJProgramEditor.revise(
-                        current: current,
+                    let revised = try await programStore.revise(
                         activeSlotIndex: activeSlotIndex,
                         proposal: proposal,
                         mode: .insertNext
                     )
                     musicSelectionGeneration &+= 1
-                    activeProgram = revised
-                    programStore.publish(revised)
-                    programStore.activateSlot(at: activeSlotIndex)
-                    await programPlaybackQueue.replaceUpcoming(
-                        with: Array(
-                            revised.slots.dropFirst(activeSlotIndex + 1)
-                        )
-                    )
+                    try await programStore.publish(revised)
+                    try await programStore.activateSlot(at: activeSlotIndex)
+                    activeProgram = programStore.plan
+                    try await programPlaybackQueue.replaceUpcoming(programID: revised.brief.id, programRevision: revised.revision, startingAt: activeSlotIndex + 1)
                 } else {
                     insertedIntoActiveProgram = false
-                    programStore.publishDraft(proposal)
+                    try await programStore.publishDraft(proposal)
                 }
                 updateStageProgramNavigation()
                 await refreshAgentContext()
@@ -9173,7 +9193,7 @@ final class AppDelegate:
     func setLyricsMode(
         _ mode: StageLyricsVisualMode
     ) async throws {
-        stageLyrics.setVisualMode(mode)
+        try await stageLyrics.setVisualMode(mode)
     }
 
     func setSpatialEnvironment(
@@ -9234,7 +9254,7 @@ final class AppDelegate:
             },
             authorizeWish: { [weak self] attachmentPaths in
                 guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
-                return try self.e2eAuthorizeWish(attachmentPaths: attachmentPaths)
+                return try await self.e2eAuthorizeWish(attachmentPaths: attachmentPaths)
             },
             invokeTool: { [weak self] name, arguments in
                 guard let self else { throw E2EHostControlError.runtimeUnavailable("宿主已释放") }
@@ -9474,7 +9494,7 @@ final class AppDelegate:
     /// `authorize(registeredImageIDs:...)` 打开一次生成授权；随后由 `tool_call`
     /// 调 `submit_wish_generation`（居民同一工具入口）真正提交。它不写世界状态，
     /// 只把"用户这一轮允许用这张素材生成"这件事登记下来。
-    private func e2eAuthorizeWish(attachmentPaths: [String]) throws -> [String: Any] {
+    private func e2eAuthorizeWish(attachmentPaths: [String]) async throws -> [String: Any] {
         guard livingWorldContext != nil else {
             throw E2EHostControlError.runtimeUnavailable("世界尚未加载")
         }
@@ -9488,13 +9508,13 @@ final class AppDelegate:
         }
         let conversationID = UUID().uuidString
         let authorizationID = UUID()
-        try wishMachineCoordinator.registerImages(
+        try await wishMachineCoordinator.registerImages(
             attachments,
             worldID: worldID,
             residentScope: world.sessionScope,
             conversationID: conversationID
         )
-        try wishMachineCoordinator.authorize(
+        try await wishMachineCoordinator.authorize(
             registeredImageIDs: attachments.map(\.id),
             worldID: worldID,
             residentScope: world.sessionScope,

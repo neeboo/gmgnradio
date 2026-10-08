@@ -29,10 +29,6 @@ enum SpatialScenePreset: String, Codable, CaseIterable, Identifiable,
         }
     }
 
-    var worldDisplayName: String {
-        "gmgn \(displayName)"
-    }
-
     var subtitle: String {
         switch self {
         case .djHouse:
@@ -48,65 +44,6 @@ enum SpatialScenePreset: String, Codable, CaseIterable, Identifiable,
             "waveform.path.ecg"
         case .cosyWoodHouse:
             "fireplace.fill"
-        }
-    }
-
-    var tags: [String] {
-        switch self {
-        case .djHouse:
-            [
-                "gmgn-radio",
-                "dj-house",
-                "image-v3",
-                "recording-studio",
-            ]
-        case .cosyWoodHouse:
-            ["gmgn-radio", "cosy-wood-house"]
-        }
-    }
-
-    var generationModel: String {
-        switch self {
-        case .djHouse:
-            "marble-1.0-draft"
-        case .cosyWoodHouse:
-            "marble-1.1-plus"
-        }
-    }
-
-    var imageMediaAssetID: String? {
-        switch self {
-        case .djHouse:
-            // dj-house-source-v3.png, uploaded to the gmgn Marble account.
-            "b14767e2-448c-4f61-9c17-b051f3cea509"
-        case .cosyWoodHouse:
-            nil
-        }
-    }
-
-    var generationPrompt: String {
-        switch self {
-        case .djHouse:
-            """
-            A premium nighttime electronic music recording studio and \
-            intimate DJ listening room. Matte black acoustic walls, brushed \
-            dark metal, restrained cyan and violet neon accents, a central \
-            professional mixing console, studio monitors, synthesizers and \
-            turntables. Keep a clear walkable floor, realistic interior \
-            scale, cinematic high contrast and warm practical lights. No \
-            people, no text, no logos, no floating interface.
-            """
-        case .cosyWoodHouse:
-            """
-            A complete explorable cosy wood cabin interior made for listening \
-            to records at night. The camera begins at human eye level in a \
-            warm timber living room with a built-in fireplace, a physical \
-            record player and vinyl shelves, soft sofa, wool rugs, reading \
-            lamps and large rain-covered windows looking into a dark pine \
-            forest. Keep realistic room scale, connected walking space, rich \
-            warm materials and restrained cinematic lighting. No text, no \
-            people, no floating interface, no isolated product render.
-            """
         }
     }
 
@@ -774,15 +711,36 @@ final class SpatialStageStore {
     private var calibratedWorldID: String?
     private var activeMovement: Set<SpatialMovement> = []
     @ObservationIgnored
-    private let defaults: UserDefaults
+    private let settings: RustProductSettingsClient
+    @ObservationIgnored
+    private var settingsLoad: Task<Void, Error>?
+    @ObservationIgnored
+    nonisolated(unsafe) private var settingsObserver: NSObjectProtocol?
+    private(set) var settingsError: String?
     @ObservationIgnored
     private var worldVisibilityObservers: [UUID: (Bool) -> Void] = [:]
     @ObservationIgnored
     private var sceneFramingObservers: [UUID: (MarbleSceneFraming) -> Void] = [:]
 
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
+    init(defaults: UserDefaults = .standard, settings: RustProductSettingsClient = .shared) {
+        self.settings = settings
+        let legacy = RustProductSettingsClient.stageLegacySnapshot(defaults)
+        settingsObserver = NotificationCenter.default.addObserver(forName: .init("gmgnProductSettingsConfirmed"), object: settings, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.installBaseAvatarPlacement(self.baseAvatarPlacement)
+            }
+        }
+        settingsLoad = Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await settings.importStageLegacy(legacy: legacy); installBaseAvatarPlacement(baseAvatarPlacement) }
+            catch { settingsError = "角色位置未能确认。"; throw error }
+        }
     }
+
+    deinit { if let settingsObserver { NotificationCenter.default.removeObserver(settingsObserver) } }
+
+    func awaitSettingsReady() async throws { try await settingsLoad?.value }
 
     var shouldRenderEnvironmentEffects: Bool {
         isWorldVisible
@@ -872,36 +830,29 @@ final class SpatialStageStore {
         _ value: Float,
         axis: SpatialAvatarPositionAxis
     ) {
-        guard value.isFinite else { return }
-        var position = stableAvatarPlacement.position
-        switch axis {
-        case .x:
-            position.x = value
-        case .y:
-            position.y = value
-        case .z:
-            position.z = value
-        }
-        stableAvatarPlacement = StageAvatarPlacement(
-            position: position,
-            scale: stableAvatarPlacement.scale,
-            yaw: stableAvatarPlacement.yaw
-        )
-        if transientAvatarPlacement == nil {
-            avatarPlacement = stableAvatarPlacement
-        }
-        defaults.set(
-            [Double(position.x), Double(position.y), Double(position.z)],
-            forKey: avatarPositionStorageKey
-        )
+        Task { do { try await setAvatarPosition(rawValue: Double(value), axis: axis.rawValue) }
+            catch { settingsError = "角色位置未能确认。" } }
     }
 
     func resetAvatarPosition() {
-        defaults.removeObject(forKey: avatarPositionStorageKey)
-        stableAvatarPlacement = baseAvatarPlacement
-        if transientAvatarPlacement == nil {
-            avatarPlacement = stableAvatarPlacement
-        }
+        Task { do { try await resetAvatarPositionConfirmed() }
+            catch { settingsError = "角色位置重置未能确认。" } }
+    }
+
+    func setAvatarPosition(rawValue: Double, axis: String) async throws {
+        let scope = avatarPositionScope
+        let base = baseAvatarPlacement.position
+        try await awaitSettingsReady()
+        _ = try await settings.setAvatarPosition(scope: scope, axis: axis, value: rawValue,
+            basePosition: [Double(base.x), Double(base.y), Double(base.z)])
+        installBaseAvatarPlacement(baseAvatarPlacement); settingsError = nil
+    }
+
+    func resetAvatarPositionConfirmed() async throws {
+        let scope = avatarPositionScope
+        try await awaitSettingsReady()
+        _ = try await settings.resetAvatarPosition(scope: scope)
+        installBaseAvatarPlacement(baseAvatarPlacement); settingsError = nil
     }
 
     /// Applies a world-space offset from the user's calibrated spawn for the
@@ -966,28 +917,21 @@ final class SpatialStageStore {
         )
     }
 
-    private var avatarPositionStorageKey: String {
-        let scope = if let selectedWorldID {
+    private var avatarPositionScope: String {
+        if let selectedWorldID {
             "world.\(selectedWorldID)"
         } else {
             "scene.\(selectedScene.rawValue)"
         }
-        return "ai.gmgn.radio.spatial.avatar-position.\(scope)"
     }
 
     private func storedAvatarPosition() -> SIMD3<Float>? {
-        guard let values = defaults.array(forKey: avatarPositionStorageKey),
+        guard let values = settings.confirmed?.values.avatarPositions[avatarPositionScope],
               values.count == 3
         else {
             return nil
         }
-        let numbers = values.compactMap { ($0 as? NSNumber)?.floatValue }
-        guard numbers.count == 3,
-              numbers.allSatisfy(\.isFinite)
-        else {
-            return nil
-        }
-        return SIMD3<Float>(numbers[0], numbers[1], numbers[2])
+        return SIMD3<Float>(Float(values[0]), Float(values[1]), Float(values[2]))
     }
 
     func setWorldVisible(_ visible: Bool) {

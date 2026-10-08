@@ -15,7 +15,7 @@
 # not be able to perturb the authority.
 [workspace]
 resolver = "2"
-members = ["services/gmgn-taskd", "services/gmgn-mcpd", "services/gmgn-protocol", "services/gmgn-voice-core"]
+members = ["services/gmgn-taskd", "services/gmgn-mcpd", "services/gmgn-protocol", "services/gmgn-voice-core", "services/gmgn-agent-runtime"]
 
 # A member's own `[profile.*]` is ignored once it belongs to a workspace, so the
 # values that used to shape the shipped `gmgn-taskd` release binary are declared
@@ -23,3 +23,7 @@ members = ["services/gmgn-taskd", "services/gmgn-mcpd", "services/gmgn-protocol"
 [profile.release]
 strip = true
 lto = "thin"
+
+[patch."https://github.com/arcships/rutis"]
+rutis = { path = "vendor/rutis/crates/rutis" }
+rutis-agent = { path = "vendor/rutis/crates/rutis-agent" }

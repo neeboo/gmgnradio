@@ -93,7 +93,7 @@ import WorldRuntime
                     } else {
                         try Task.checkCancellation()
                         guard !closed else { throw CancellationError() }
-                        if operation == "wish.claim" { job = try coordinator.claim(id: id, worldID: worldID, residentScope: residentScope) }
+                        if operation == "wish.claim" { job = try await coordinator.claim(id: id, worldID: worldID, residentScope: residentScope) }
                         try await confirmInventory(job)
                     }
                     reply["wishID"] = job.id.uuidString; reply["objectID"] = job.objectID
@@ -157,75 +157,38 @@ import WorldRuntime
     }
 }
 
-/// Required preparation is the real renderer's GLB measurement/normalization,
-/// reusing WorldPropOrientationPolicy and WorldPropSizePolicy. It is explicitly
-/// injected; a model height or task completion is never treated as mesh bounds.
+/// Native imports verified raw GLB bytes and triangles. Rust reads the claimed
+/// wish in its real store and owns measurement, orientation and registration.
 @MainActor final class UnityWishInventoryRegistrar {
     private let store: PropGenerationStore
-    private let authority: WorldAuthorityClient
-    private let prepare: @MainActor (WishMachineJob, PropGenerationRecord) async throws -> WorldGeneratedProp
-    convenience init(root: URL, worldID: String, store: PropGenerationStore) {
-        self.init(root: root, worldID: worldID, store: store, prepare: Self.prepareEmbeddedGLB)
+    private let authority: RustWorldPropClient
+    private let identity: RustWorldPropClient.Identity
+    private let sample: @Sendable (URL) async throws -> RustPropNativeMeshSampler.Sample
+    convenience init(root: URL, worldID: String, residentScope: String, hostSessionID: String, store: PropGenerationStore) {
+        self.init(root: root, identity: .init(worldID: worldID, residentScope: residentScope, hostSessionID: hostSessionID),
+            store: store, sample: { try await RustPropNativeMeshSampler.sample(modelURL: $0) })
     }
-    init(root: URL, worldID: String, store: PropGenerationStore,
-         prepare: @escaping @MainActor (WishMachineJob, PropGenerationRecord) async throws -> WorldGeneratedProp) {
+    init(root: URL, identity: RustWorldPropClient.Identity, store: PropGenerationStore,
+         sample: @escaping @Sendable (URL) async throws -> RustPropNativeMeshSampler.Sample) {
         let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
-        authority = WorldAuthorityClient(worldID: worldID, endpointFile: endpoint.endpointFile,
-            helperPath: endpoint.helperPath, allowsLaunching: false)
-        self.store = store; self.prepare = prepare
+        authority = RustWorldPropClient(endpointFile: URL(fileURLWithPath: endpoint.endpointFile))
+        self.identity = identity; self.store = store; self.sample = sample
     }
-    /// Same actual GLB node transforms and same size/orientation policies as
-    /// the old host, without depending on a displayed SceneKit/Metal frame.
-    /// Unsupported/compressed geometry fails visibly rather than inventing size.
-    static func prepareEmbeddedGLB(_ job: WishMachineJob, _ record: PropGenerationRecord) async throws -> WorldGeneratedProp {
-        guard let path = record.localModelPath, let result = record.receipt?.result else { throw WishMachineError.notReady }
-        let inspection = result.inspection
-        let raw = try await Task.detached(priority: .utility) {
-            let triangles = try GLBColliderDecoder().decode(data: Data(contentsOf: URL(fileURLWithPath: path)))
-            guard !triangles.isEmpty else { throw WishMachineError.unavailable }
-            var minimum = SIMD3<Float>(repeating: .infinity), maximum = SIMD3<Float>(repeating: -.infinity)
-            for triangle in triangles {
-                for vertex in [triangle.first, triangle.second, triangle.third] {
-                    guard vertex.x.isFinite, vertex.y.isFinite, vertex.z.isFinite else { throw WishMachineError.unavailable }
-                    minimum = SIMD3(min(minimum.x, vertex.x), min(minimum.y, vertex.y), min(minimum.z, vertex.z))
-                    maximum = SIMD3(max(maximum.x, vertex.x), max(maximum.y, vertex.y), max(maximum.z, vertex.z))
-                }
-            }
-            return maximum - minimum
-        }.value
-        let declared = result.workflowAuthoritativeSize
-        let orientation = WorldPropOrientationPolicy.resolve(sourceExtent: .init(x: raw.x, y: raw.y, z: raw.z),
-            declaredUpAxis: declared?.upAxis, declaredForwardAxis: declared?.forwardAxis)
-        let extent = WorldPropOrientationPolicy.orientedExtent(of: .init(x: raw.x, y: raw.y, z: raw.z), by: orientation)
-        let intent = job.sizeIntent.flatMap { WorldPropSizeIntent(axis: $0.axis.rawValue, meters: $0.meters, source: $0.source.rawValue) }
-        var size: WorldPropSizePolicy.Resolution?
-        if let requested = job.sizeIntent, requested.mode == .dimensions, let mm = requested.millimeters {
-            guard let spec = WorldPropSizeMillimeters(x: Float(mm.x), y: Float(mm.y), z: Float(mm.z)) else { throw WishMachineError.unavailable }
-            size = WorldPropSizePolicy.intended(sourceExtent: extent, millimeters: spec)
-            guard size != nil else { throw WishMachineError.unavailable }
-        } else if let intent {
-            size = WorldPropSizePolicy.intended(sourceExtent: extent, axis: intent.axis, meters: intent.meters)
-        }
-        guard let resolved = size ?? WorldPropSizePolicy.automatic(sourceExtent: extent, requestedHeight: Float(job.heightMeters)) else { throw WishMachineError.unavailable }
-        guard !result.declaresWorkflowCollision || result.workflowCollision != nil else { throw WishMachineError.unavailable }
-        return WorldGeneratedProp(objectID: job.objectID, sourceWishID: job.id.uuidString,
-            assetID: "sha256:" + inspection.sha256.lowercased(), displayName: job.name,
-            size: resolved.size, sourceHeight: extent.y, collision: result.workflowCollision,
-            // WorldPropSizeIntent archives only a single axis. Full dimensions
-            // are already materialized in size, so do not let provider dimensions
-            // override the user's three explicit numbers via effectiveSize.
-            authoritativeSize: job.sizeIntent?.mode == .dimensions ? nil : declared,
-            sizeIntent: intent, orientation: orientation.shouldArchive ? orientation : nil)
+    private struct Snapshot: Decodable {
+        struct Record: Decodable { let state: WorldState; let recordRevision: UInt64 }
+        let record: Record
+    }
+    private func snapshot() async throws -> Snapshot {
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let result = try decoder.decode(Snapshot.self, from: await authority.snapshot(identity))
+        guard result.record.state.worldID == identity.worldID else { throw RustWorldPropError.invalidResponse }
+        return result
     }
     func readback(objectID: String) async throws -> WorldGeneratedProp? {
-        let client = authority
-        return try await Task.detached(priority: .utility) {
-            guard let record = try client.snapshot() else { throw WorldAuthorityError.noAuthorityRecord }
-            return record.state.objectStates[objectID]?.generatedProp
-        }.value
+        try await snapshot().record.state.objectStates[objectID]?.generatedProp
     }
     func register(_ job: WishMachineJob) async throws -> WorldGeneratedProp {
-        guard job.stage == .claimed, job.worldID == authority.worldID,
+        guard job.stage == .claimed, job.worldID == identity.worldID, job.residentScope == identity.residentScope,
               let record = store.jobs.first(where: { $0.id == job.jobID }),
               let receipt = record.receipt, receipt.state == .completed,
               let inspection = receipt.result?.inspection, let path = record.localModelPath,
@@ -241,43 +204,31 @@ import WorldRuntime
             guard data.count == bytes, actual == hash else { throw WishMachineError.unavailable }
         }.value
         try Task.checkCancellation()
-        let prop = try await prepare(job, record)
-        guard prop.isValid, prop.objectID == job.objectID, prop.sourceWishID == job.id.uuidString,
-              prop.assetID == "sha256:" + hash else { throw WishMachineError.conflictingCall }
-        if let collision = prop.collision {
-            guard let collisionPath = record.localCollisionPath else { throw WishMachineError.notReady }
-            try await Task.detached(priority: .utility) {
-                let url = URL(fileURLWithPath: collisionPath)
-                let facts = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-                guard collision.isValid, facts.isRegularFile == true, facts.isSymbolicLink != true,
-                      facts.fileSize == collision.bytes else { throw WishMachineError.unavailable }
-                let data = try Data(contentsOf: url)
-                guard SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == collision.sha256.lowercased(),
-                      try GLBColliderDecoder().decode(data: data).count == collision.triangles else { throw WishMachineError.unavailable }
-            }.value
+        let measured = try await sample(url)
+        guard measured.modelURL.standardizedFileURL == url.standardizedFileURL, measured.sha256 == hash else { throw WishMachineError.conflictingCall }
+        try await authority.putBlob(localPath: url.path, sha256: hash)
+        // Collision bytes are an actual provider receipt, not a host-computed
+        // prop shape. Rust validates and adopts the stored authoritative receipt.
+        if let collisionPath = record.localCollisionPath {
+            let measuredCollision = try await sample(URL(fileURLWithPath: collisionPath))
+            try await authority.putBlob(localPath: collisionPath, sha256: measuredCollision.sha256)
         }
         try Task.checkCancellation()
-        let client = authority
-        let commitWork = Task.detached(priority: .utility) {
-            try Task.checkCancellation()
-            guard let baseline = try client.snapshot() else { throw WorldAuthorityError.noAuthorityRecord }
-            // A deleted item remains deleted; retry cannot resurrect it.
-            guard baseline.state.propTombstones?[prop.objectID] == nil else { throw WishMachineError.unavailable }
-            if let existing = baseline.state.objectStates[prop.objectID]?.generatedProp {
-                guard existing.sourceWishID == prop.sourceWishID, existing.assetID == prop.assetID else { throw WishMachineError.conflictingCall }
-                return existing // Preserves user-edited size/placement and avoids duplicate commit.
-            }
-            var simulation = WorldSimulation(restoring: baseline.state)
-            try simulation.applyPropLayout(.register(prop), expectedLayoutRevision: baseline.state.layoutRevision,
-                requestID: "claimed." + job.id.uuidString)
-            try Task.checkCancellation()
-            _ = try client.commit(state: simulation.state, expectedRevision: baseline.recordRevision,
-                intent: ["kind": "prop.inventory.register", "objectID": prop.objectID, "wishID": job.id.uuidString])
-            guard let durable = try client.snapshot()?.state.objectStates[prop.objectID]?.generatedProp,
-                  durable == prop else { throw WorldAuthorityError.invalidResponse }
-            return durable
-        }
-        return try await withTaskCancellationHandler(operation: { try await commitWork.value },
-            onCancel: { commitWork.cancel() })
+        let baseline = try await snapshot()
+        let rebase = baseline.record.state.objectStates[job.objectID] != nil
+        let receiptData = try await authority.register(identity, wishID: job.id.uuidString,
+            expectedRevision: baseline.record.recordRevision, layoutRevision: baseline.record.state.layoutRevision,
+            requestID: (rebase ? "rebase." : "claimed.") + job.id.uuidString + "." + hash + "." + identity.hostSessionID,
+            blobRef: "sha256:" + hash, triangles: measured.trianglesJSON, rebase: rebase)
+        struct Receipt: Decodable { let snapshot: Snapshot }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let registrationReceipt = try decoder.decode(Receipt.self, from: receiptData)
+        guard registrationReceipt.snapshot.record.state.worldID == identity.worldID,
+              let registered = registrationReceipt.snapshot.record.state.objectStates[job.objectID]?.generatedProp,
+              registered.objectID == job.objectID, registered.sourceWishID == job.id.uuidString,
+              registered.assetID == "sha256:" + hash else { throw RustWorldPropError.executionUnknown }
+        // Accepted/claim/registration submission is not inventory success.
+        guard let durable = try await readback(objectID: job.objectID), durable == registered else { throw RustWorldPropError.executionUnknown }
+        return durable
     }
 }

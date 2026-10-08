@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import Darwin
+import CryptoKit
 
 enum WishMachineStage: String, Codable, Sendable {
     case submitting, submissionUncertain, generating, generated, ready, failed, cancelled, interrupted, claimed
@@ -50,7 +51,7 @@ struct WishMachineJob: Identifiable, Codable, Equatable, Sendable {
     // Provenance of `autoContinuationPaused`. Only a positive `true` here is evidence of
     // an explicit human stop, and only that may keep demanding a manual release. `nil`
     // means "no proven user intent" — older archives, and any pause another code path
-    // wrote — so `discardPausesWithoutUserIntent()` lifts it as soon as the backend is
+    // wrote — so `await discardPausesWithoutUserIntent()` lifts it as soon as the backend is
     // healthy again. A network, submission, world-switch or availability failure must
     // never be able to produce a state only a human can clear.
     var autoContinuationStoppedByUser: Bool?
@@ -82,6 +83,11 @@ struct WishMachineClaimEvidence {
     let phase: String?
     let distanceMeters: Double
     let outputAvailable: Bool
+    var activityRequestID: String? = nil
+    var activityGeneration: UInt64? = nil
+    var phaseGeneration: UInt64? = nil
+    var activityHostSessionID: String? = nil
+    var objectID: String? = nil
 }
 
 /// Provenance of one resident-discovered public reference image. Kept beside the
@@ -104,15 +110,6 @@ struct WishPlacementTarget: Codable, Equatable, Sendable {
     let position: WishMachineVector3
     let yaw: Double
     var isFinite: Bool { position.isFinite && yaw.isFinite }
-    /// Compares through canonical Float coordinates so JSON-decimal doubles and Float
-    /// round-trips (0.1, 0.3, ...) compare equal consistently.
-    func canonicalEquals(_ other: WishPlacementTarget) -> Bool {
-        surfaceID == other.surfaceID
-            && Float(position.x) == Float(other.position.x)
-            && Float(position.y) == Float(other.position.y)
-            && Float(position.z) == Float(other.position.z)
-            && Float(yaw) == Float(other.yaw)
-    }
 }
 
 /// Structured destination carried by the submit tool when the user explicitly asks to place the result.
@@ -132,7 +129,6 @@ struct WishPlacementDestination: Equatable, Sendable {
 struct WishMachinePendingDraft: Identifiable, Codable, Equatable, Sendable {
     /// 草稿有效期：超过就不再可续。fail-closed 的方向是"让用户重说一次"，
     /// 绝不是"那就新建一次生成"。
-    static let lifetime: TimeInterval = 24 * 60 * 60
 
     let id: UUID
     /// 原那一轮的人类授权（= 那一轮的 runID）。
@@ -160,7 +156,12 @@ struct WishMachinePendingDraft: Identifiable, Codable, Equatable, Sendable {
         destinationSurfaceIDs.map { WishPlacementDestination(surfaceIDs: $0, explicitTarget: destinationTarget) }
     }
 
-    func isExpired(now: Date) -> Bool { now.timeIntervalSince(createdAt) > Self.lifetime }
+}
+
+enum WishMachineDraftResolution: Equatable {
+    case fresh
+    case resume(WishMachinePendingDraft)
+    case ambiguous([WishMachinePendingDraft])
 }
 
 enum WishPlacementDelegationState: String, Codable, Sendable {
@@ -237,6 +238,10 @@ enum WishMachineError: LocalizedError {
     }
 }
 
+private enum WishMutationScope {
+    @TaskLocal static var owner: UUID?
+}
+
 /// Owns user grants and world associations, not resident reasoning or world movement.
 @MainActor final class WishMachineCoordinator: ObservableObject {
     private struct Authorization: Codable {
@@ -266,6 +271,7 @@ enum WishMachineError: LocalizedError {
         var unreadableJobs: [WishMachineUnreadableJob]?
     }
     @Published private(set) var jobs: [WishMachineJob] = []
+    private var workingJobs: [WishMachineJob] = []
     /// **一条坏 job 不许让整个列表消失**：解不出来的那些在这里，原始 JSON 仍在档案里。
     @Published private(set) var unreadableJobs: [WishMachineUnreadableJob] = []
     @Published private(set) var errorMessage: String?
@@ -281,46 +287,113 @@ enum WishMachineError: LocalizedError {
     private var webReferences: [ResidentWebReference] = []
     private var pendingDrafts: [WishMachinePendingDraft] = []
     private var readable = true
+    typealias ControlCall = @Sendable (String, Data) async throws -> Data
+    private let controlCall: ControlCall
+    private let controlOwnerID: String
+    private let controlSessionID: String
+    private var controlRevision = 0
+    @Published private(set) var isLoadingAuthority = true
+    private var readinessTask: Task<Void, Error>?
+    private var mutationOwner: UUID?
+    private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var committedArchive: Archive?
+
+    private func withMutation<T>(_ operation: @MainActor () async throws -> T) async throws -> T {
+        try await waitUntilReady()
+        if let owner = WishMutationScope.owner, owner == mutationOwner {
+            return try await operation()
+        }
+        while mutationOwner != nil {
+            await withCheckedContinuation { mutationWaiters.append($0) }
+        }
+        try Task.checkCancellation()
+        let owner = UUID()
+        mutationOwner = owner
+        defer {
+            mutationOwner = nil
+            if !mutationWaiters.isEmpty { mutationWaiters.removeFirst().resume() }
+        }
+        return try await WishMutationScope.$owner.withValue(owner) {
+            do { return try await operation() }
+            catch {
+                if let archive = committedArchive { installArchive(archive) }
+                throw error
+            }
+        }
+    }
 
     init(store: PropGenerationStore, directory: URL? = nil, archiveFileManager: FileManager = .default,
+         wishControlCall: ControlCall? = nil,
+         wishControlHostSessionID: String = UUID().uuidString,
          canClaim: @escaping @MainActor (WishMachineJob) -> WishMachineClaimEvidence?) {
         self.store = store
         self.archiveFileManager = archiveFileManager
-        self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let resolvedDirectory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("gmgn radio/WishMachine", isDirectory: true)
+        self.directory = resolvedDirectory
+        self.controlOwnerID = SHA256.hash(data: Data(resolvedDirectory.standardizedFileURL.path.utf8)).map { String(format: "%02x", $0) }.joined()
+        self.controlCall = wishControlCall ?? { try await store.wishControlRequest(method: $0, params: $1) }
+        self.controlSessionID = wishControlHostSessionID
         self.canClaim = canClaim
+        readinessTask = Task { [weak self] in
+            guard let self else { return }
+            try await self.loadAuthority()
+        }
+        store.onChange = { [weak self] in
+            Task { [weak self] in
+                guard let self else { return }
+                await WishMutationScope.$owner.withValue(nil) {
+                    try? await self.waitUntilReady()
+                    await self.synchronizeBackendSnapshot()
+                }
+            }
+        }
+    }
+
+    func waitUntilReady() async throws {
+        try await readinessTask?.value
+        guard readable, !isLoadingAuthority else { throw WishMachineError.unavailable }
+    }
+
+    private func loadAuthority() async throws {
+        defer { isLoadingAuthority = false }
         let file = self.directory.appendingPathComponent("wishes.json")
-        if FileManager.default.fileExists(atPath: file.path) {
-            do {
-                let archive = try Self.loadArchive(from: try Data(contentsOf: file))
+        do {
+                var open: [String: Any] = [:]
+                let legacyData = try await Task.detached {
+                    guard FileManager.default.fileExists(atPath: file.path) else { return Optional<Data>.none }
+                    return try Data(contentsOf: file)
+                }.value
+                if let legacyData {
+                    let archive = try Self.loadArchive(from: legacyData)
+                    open["legacyArchive"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(archive))
+                }
+                try applyControlReceipt(await controlRequest("wish_control_open", open))
+                let archive = Archive(authorizations: authorizations, jobs: workingJobs, events: events,
+                    imageRegistrations: imageRegistrations, delegations: delegations, webReferences: webReferences,
+                    pendingDrafts: pendingDrafts, unreadableJobs: unreadableJobs)
                 guard Set(archive.jobs.map(\.id)).count == archive.jobs.count,
                       Set(archive.authorizations.map(\.id)).count == archive.authorizations.count,
                       Set((archive.delegations ?? []).map(\.id)).count == (archive.delegations ?? []).count,
                       Set((archive.imageRegistrations ?? []).map(\.attachment.id)).count == (archive.imageRegistrations ?? []).count,
                       Set((archive.webReferences ?? []).map(\.attachmentID)).count == (archive.webReferences ?? []).count else { throw WishMachineError.unavailable }
-                jobs = archive.jobs; authorizations = archive.authorizations; events = archive.events
+                workingJobs = archive.jobs; authorizations = archive.authorizations; events = archive.events
                 imageRegistrations = archive.imageRegistrations ?? []
                 delegations = archive.delegations ?? []
                 webReferences = archive.webReferences ?? []
                 pendingDrafts = archive.pendingDrafts ?? []
                 unreadableJobs = archive.unreadableJobs ?? []
-                // An interrupted local submit is never automatically repeated. Its grant stays consumed.
-                for index in jobs.indices where jobs[index].stage == .submitting {
-                    jobs[index].stage = .submissionUncertain
-                    jobs[index].lastError = "提交结果未确认，可确认原提交；不会自动再次生成。"
-                    emit(index: index, kind: .stateChanged)
-                }
-                try persist()
-            } catch { readable = false; errorMessage = WishMachineError.unavailable.localizedDescription }
+                _ = try await controlCommand("recover",[:])
+        } catch {
+            readable = false; errorMessage = WishMachineError.unavailable.localizedDescription
+            throw error
         }
-        store.onChange = { [weak self] in self?.synchronizeBackendSnapshot() }
-        synchronizeBackendSnapshot()
     }
 
     /// 逐条降级地读 `wishes.json`（G6）。
     ///
     /// - 第一遍是**整份严格解码**：绝大多数档案一次成功，行为与改造前逐字相同。
-    /// - 只有整份解不出来时才走第二遍：`jobs` 逐条解码，坏的那一条进 `unreadableJobs`
+    /// - 只有整份解不出来时才走第二遍：`workingJobs` 逐条解码，坏的那一条进 `unreadableJobs`
     ///   （原始 JSON 原样留着，`persist()` 会把它写回去，**不丢数据**）；其余各段仍然
     ///   是"整段成立，否则整份读不出来" —— 授权/事件/委托的完整性是整个档案的前提。
     private static func loadArchive(from data: Data) throws -> Archive {
@@ -346,7 +419,7 @@ enum WishMachineError: LocalizedError {
             return try? decoder.decode(T.self, from: data)
         }
         var decoded: [WishMachineJob] = []
-        var unreadable: [WishMachineUnreadableJob] = []
+        var unreadable = optionalSection("unreadableJobs", [WishMachineUnreadableJob].self) ?? []
         for element in (root["jobs"] as? [Any]) ?? [] {
             let object = element as? [String: Any]
             let raw = (try? payload(element)).map { String(decoding: $0, as: UTF8.self) } ?? "null"
@@ -386,7 +459,7 @@ enum WishMachineError: LocalizedError {
     }
 
     /// 档案现在读得出来吗（读不出来时列表**仍然**显示世界那一半，并顶一条横幅）。
-    var isReadable: Bool { readable }
+    var isReadable: Bool { readable && !isLoadingAuthority }
 
     /// 「有几条 job 坏了、被跳过」那一句可见说明（没有坏的就是 nil）。
     ///
@@ -401,37 +474,25 @@ enum WishMachineError: LocalizedError {
 
     /// Host-only: call for an explicit user generation request, never for an autonomous wakeup.
     func authorize(attachments: [ResidentImageAttachment], worldID: String, residentScope: String,
-                   authorizationID: UUID, source: PropGenerationSource) throws {
-        guard readable else { throw WishMachineError.unavailable }
-        guard !worldID.isEmpty, !residentScope.isEmpty, !attachments.isEmpty, attachments.count <= 4,
-              attachments.allSatisfy({ $0.url.isFileURL }), Set(attachments.map(\.id)).count == attachments.count else { throw WishMachineError.unknownAttachment }
-        if let existing = authorizations.first(where: { $0.id == authorizationID }) {
-            guard existing.worldID == worldID, existing.residentScope == residentScope,
-                  existing.attachments == attachments, existing.source == source else { throw WishMachineError.conflictingCall }
-            return
+                   authorizationID: UUID, source: PropGenerationSource) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("authorize_images", ["worldID":worldID,"residentScope":residentScope,
+            "authorizationID":authorizationID.uuidString,"attachments":try Self.controlJSON(attachments),
+            "source":try Self.controlJSON(source)])
+
         }
-        authorizations.append(.init(id: authorizationID, attachments: attachments, worldID: worldID, residentScope: residentScope, source: source))
-        try persist()
     }
 
     /// Host-only: register image attachments scoped to one conversation/resident/world.
     /// Re-registering the same attachment in the same scope is idempotent.
-    func registerImages(_ attachments: [ResidentImageAttachment], worldID: String, residentScope: String, conversationID: String) throws {
-        guard readable else { throw WishMachineError.unavailable }
-        guard !worldID.isEmpty, !residentScope.isEmpty, !conversationID.isEmpty else { throw WishMachineError.wrongScope }
-        guard !attachments.isEmpty, attachments.allSatisfy({ $0.url.isFileURL }) else { throw WishMachineError.unknownAttachment }
-        var changed = false
-        for attachment in attachments {
-            if let existing = imageRegistrations.firstIndex(where: { $0.attachment.id == attachment.id }) {
-                guard imageRegistrations[existing].worldID == worldID, imageRegistrations[existing].residentScope == residentScope,
-                      imageRegistrations[existing].conversationID == conversationID,
-                      imageRegistrations[existing].attachment == attachment else { throw WishMachineError.wrongScope }
-                continue
-            }
-            imageRegistrations.append(.init(attachment: attachment, worldID: worldID, residentScope: residentScope, conversationID: conversationID))
-            changed = true
+    func registerImages(_ attachments: [ResidentImageAttachment], worldID: String, residentScope: String, conversationID: String) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("register_images", ["worldID":worldID,"residentScope":residentScope,
+            "conversationID":conversationID,"attachments":try Self.controlJSON(attachments)])
+
         }
-        if changed { try persist() }
     }
 
     func registeredImages(worldID: String, residentScope: String, conversationID: String, ids: [UUID]? = nil) -> [ResidentImageAttachment] {
@@ -443,10 +504,14 @@ enum WishMachineError: LocalizedError {
 
     /// Host-only: a later current user instruction reuses images registered in the same scope.
     func authorize(registeredImageIDs: [UUID], worldID: String, residentScope: String, conversationID: String,
-                   authorizationID: UUID, source: PropGenerationSource) throws {
-        let attachments = registeredImages(worldID: worldID, residentScope: residentScope, conversationID: conversationID, ids: registeredImageIDs)
-        guard !registeredImageIDs.isEmpty, attachments.count == registeredImageIDs.count else { throw WishMachineError.unknownAttachment }
-        try authorize(attachments: attachments, worldID: worldID, residentScope: residentScope, authorizationID: authorizationID, source: source)
+                   authorizationID: UUID, source: PropGenerationSource) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("authorize_registered", ["worldID":worldID,"residentScope":residentScope,
+            "conversationID":conversationID,"registeredImageIDs":registeredImageIDs.map(\.uuidString),
+            "authorizationID":authorizationID.uuidString,"source":try Self.controlJSON(source)])
+
+        }
     }
 
     /// Host-only: append one resident-discovered public reference image to the current human
@@ -456,49 +521,14 @@ enum WishMachineError: LocalizedError {
     @discardableResult
     func registerWebReference(_ attachment: ResidentImageAttachment, imageURL: URL, authorizationID: UUID,
                               worldID: String, residentScope: String,
-                              source: PropGenerationSource) throws -> ResidentWebReference {
-        guard readable else { throw WishMachineError.unavailable }
-        guard !worldID.isEmpty, !residentScope.isEmpty, attachment.url.isFileURL else { throw WishMachineError.wrongScope }
-        guard Self.isPublicReferenceURL(imageURL) else { throw WishMachineError.unknownAttachment }
-        guard !jobs.contains(where: { $0.authorizationID == authorizationID }) else { throw WishMachineError.consumedAuthorization }
-        let reference = ResidentWebReference(attachmentID: attachment.id, imageURL: imageURL, source: source)
-        // Validate every input against current state before mutating anything so a rejected
-        // call can never leave a partial grant in memory.
-        if let existing = webReferences.firstIndex(where: { $0.attachmentID == attachment.id }) {
-            guard webReferences[existing] == reference else { throw WishMachineError.conflictingCall }
+                              source: PropGenerationSource) async throws -> ResidentWebReference {
+        return try await withMutation {
+
+        return try await controlDecision("register_web_reference",["worldID":worldID,"residentScope":residentScope,
+            "authorizationID":authorizationID.uuidString,"attachment":try Self.controlJSON(attachment),
+            "imageURL":imageURL.absoluteString,"source":try Self.controlJSON(source)],as:ResidentWebReference.self)
+
         }
-        var candidateAuthorizations = authorizations
-        if let index = candidateAuthorizations.firstIndex(where: { $0.id == authorizationID }) {
-            guard candidateAuthorizations[index].worldID == worldID, candidateAuthorizations[index].residentScope == residentScope else {
-                throw WishMachineError.wrongScope
-            }
-            if let existingAttachment = candidateAuthorizations[index].attachments.first(where: { $0.id == attachment.id }) {
-                // The stable attachment id must describe the exact same image; a different
-                // URL or name is a conflict, never a silent replacement of the registered one.
-                guard existingAttachment == attachment else { throw WishMachineError.conflictingCall }
-            } else {
-                guard candidateAuthorizations[index].attachments.count < 4 else { throw WishMachineError.imageLimitReached }
-                candidateAuthorizations[index].attachments.append(attachment)
-            }
-        } else {
-            candidateAuthorizations.append(.init(id: authorizationID, attachments: [attachment], worldID: worldID,
-                residentScope: residentScope, source: source))
-        }
-        var candidateWebReferences = webReferences
-        if !candidateWebReferences.contains(where: { $0.attachmentID == attachment.id }) {
-            candidateWebReferences.append(reference)
-        }
-        let priorAuthorizations = authorizations, priorWebReferences = webReferences
-        authorizations = candidateAuthorizations
-        webReferences = candidateWebReferences
-        do { try persist() }
-        catch {
-            // A failed durable write must never leave the new in-memory grant visible.
-            authorizations = priorAuthorizations
-            webReferences = priorWebReferences
-            throw error
-        }
-        return reference
     }
 
     /// Read-only provenance lookup for the read-discovery projection.
@@ -509,21 +539,15 @@ enum WishMachineError: LocalizedError {
     /// Host-only: narrow destination grant beside the generation authorization.
     @discardableResult
     func authorizePlacement(authorizationID: UUID, worldID: String, residentScope: String,
-                            allowedSurfaceIDs: [String], explicitTarget: WishPlacementTarget? = nil) throws -> WishPlacementDelegation {
-        guard readable else { throw WishMachineError.unavailable }
-        guard authorizations.contains(where: { $0.id == authorizationID && $0.worldID == worldID && $0.residentScope == residentScope }) else { throw WishMachineError.unauthorized }
-        let surfaces = try Self.validatedSurfaceIDs(allowedSurfaceIDs, explicitTarget: explicitTarget)
-        if let existing = delegations.first(where: { $0.authorizationID == authorizationID }) {
-            guard existing.allowedSurfaceIDs == surfaces, existing.explicitTarget == explicitTarget else { throw WishMachineError.conflictingCall }
-            return existing
+                            allowedSurfaceIDs: [String], explicitTarget: WishPlacementTarget? = nil) async throws -> WishPlacementDelegation {
+        return try await withMutation {
+
+        var fields: [String: Any] = ["authorizationID":authorizationID.uuidString,"worldID":worldID,
+            "residentScope":residentScope,"allowedSurfaceIDs":allowedSurfaceIDs]
+        if let explicitTarget { fields["explicitTarget"] = try Self.controlJSON(explicitTarget) }
+        return try await controlDecision("delegation_authorize",fields,as:WishPlacementDelegation.self)
+
         }
-        let delegation = WishPlacementDelegation(id: UUID(), authorizationID: authorizationID,
-            requestID: "placement." + UUID().uuidString.lowercased(), worldID: worldID, residentScope: residentScope,
-            allowedSurfaceIDs: surfaces, explicitTarget: explicitTarget, objectID: nil,
-            state: .awaitingSubmission, lastError: nil)
-        delegations.append(delegation)
-        try persist()
-        return delegation
     }
 
     func placementDelegations(worldID: String, residentScope: String) -> [WishPlacementDelegation] {
@@ -540,36 +564,27 @@ enum WishMachineError: LocalizedError {
     /// before starting a delegated placement commit; it never depends on a live session lease.
     /// Surface-only grants bind the requested absolute target before any effect.
     func validatePlacementCommand(worldID: String, residentScope: String, objectID: String,
-                                  surfaceID: String, target: WishPlacementTarget?) throws -> WishPlacementDelegation {
-        return try resolvePlacementGrant(worldID: worldID, residentScope: residentScope, objectID: objectID,
+                                  surfaceID: String, target: WishPlacementTarget?) async throws -> WishPlacementDelegation {
+        return try await withMutation {
+
+        return try await resolvePlacementGrant(worldID: worldID, residentScope: residentScope, objectID: objectID,
             surfaceID: surfaceID, target: target)
+
+        }
     }
 
     /// Host marks durable placement complete after the world commit succeeded. Idempotent by the
     /// stable persisted requestID: a crash between the world commit and this record replays without error.
     @discardableResult
     func recordPlacementCompletion(worldID: String, residentScope: String, objectID: String, requestID: String,
-                                   surfaceID: String, target: WishPlacementTarget?) throws -> WishPlacementDelegation {
-        guard readable else { throw WishMachineError.unavailable }
-        guard let index = delegations.firstIndex(where: { $0.worldID == worldID && $0.residentScope == residentScope && $0.objectID == objectID && $0.requestID == requestID }) else { throw WishMachineError.unauthorized }
-        switch delegations[index].state {
-        case .placed: return delegations[index]
-        case .pending:
-            guard delegations[index].allowedSurfaceIDs.contains(surfaceID) else { throw WishMachineError.conflictingCall }
-            if let explicit = delegations[index].explicitTarget {
-                guard let target, explicit.canonicalEquals(target) else { throw WishMachineError.conflictingCall }
-            } else {
-                guard let target, let bound = delegations[index].boundTarget, bound.canonicalEquals(target) else { throw WishMachineError.conflictingCall }
-            }
-            delegations[index].state = .placed
-            delegations[index].lastError = nil
-            if let jobIndex = jobs.firstIndex(where: { $0.objectID == objectID && $0.worldID == worldID && $0.residentScope == residentScope }) {
-                emit(index: jobIndex, kind: .placed)
-            }
-            try persist()
-            return delegations[index]
-        case .revoked: throw WishMachineError.placementRevoked
-        case .awaitingSubmission, .failed: throw WishMachineError.unauthorized
+                                   surfaceID: String, target: WishPlacementTarget?) async throws -> WishPlacementDelegation {
+        return try await withMutation {
+
+        var fields: [String: Any] = ["worldID":worldID,"residentScope":residentScope,"objectID":objectID,
+            "requestID":requestID,"surfaceID":surfaceID]
+        if let target { fields["target"] = try Self.controlPlacementJSON(target) }
+        return try await controlDecision("delegation_complete",fields,as:WishPlacementDelegation.self)
+
         }
     }
 
@@ -578,107 +593,54 @@ enum WishMachineError: LocalizedError {
     /// Surface-only grants persist the selected absolute target before any effect (overwritable).
     @discardableResult
     func resolvePlacementGrant(worldID: String, residentScope: String, objectID: String,
-                               surfaceID: String, target: WishPlacementTarget?) throws -> WishPlacementDelegation {
-        guard readable else { throw WishMachineError.unavailable }
-        guard let index = delegations.firstIndex(where: { $0.worldID == worldID && $0.residentScope == residentScope && $0.objectID == objectID }) else { throw WishMachineError.unauthorized }
-        switch delegations[index].state {
-        case .pending: break
-        case .revoked: throw WishMachineError.placementRevoked
-        case .awaitingSubmission, .placed, .failed: throw WishMachineError.unauthorized
+                               surfaceID: String, target: WishPlacementTarget?) async throws -> WishPlacementDelegation {
+        return try await withMutation {
+
+        var fields: [String: Any] = ["worldID":worldID,"residentScope":residentScope,"objectID":objectID,"surfaceID":surfaceID]
+        if let target { fields["target"] = try Self.controlPlacementJSON(target) }
+        return try await controlDecision("delegation_resolve",fields,as:WishPlacementDelegation.self)
+
         }
-        guard jobs.contains(where: { $0.objectID == objectID && $0.worldID == worldID && $0.residentScope == residentScope && $0.stage == .claimed }) else { throw WishMachineError.unauthorized }
-        guard delegations[index].allowedSurfaceIDs.contains(surfaceID) else { throw WishMachineError.conflictingCall }
-        guard let target, target.isFinite, target.surfaceID == surfaceID else { throw WishMachineError.conflictingCall }
-        if let explicit = delegations[index].explicitTarget {
-            guard explicit.canonicalEquals(target) else { throw WishMachineError.conflictingCall }
-        } else if delegations[index].boundTarget != target {
-            delegations[index].boundTarget = target
-            try persist()
-        }
-        return delegations[index]
     }
 
     /// Host records that no legal spot exists; the item stays safely in inventory and only a
     /// fresh human placement instruction may retry.
-    func markPlacementFailed(worldID: String, residentScope: String, objectID: String, reason: String) throws {
-        guard readable else { throw WishMachineError.unavailable }
-        guard let index = delegations.firstIndex(where: { $0.worldID == worldID && $0.residentScope == residentScope && $0.objectID == objectID }) else { throw WishMachineError.unauthorized }
-        guard delegations[index].state == .pending else { return }
-        delegations[index].state = .failed
-        delegations[index].lastError = reason
-        try persist()
+    func markPlacementFailed(worldID: String, residentScope: String, objectID: String, reason: String) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("delegation_fail",["worldID":worldID,"residentScope":residentScope,
+            "objectID":objectID,"reason":reason])
+
+        }
     }
 
     func submit(requestID: String, authorizationID: UUID, attachmentID: UUID, name: String,
                 heightMeters: Double, sizeIntent: PropSizeIntent? = nil,
                 worldID: String, residentScope: String,
                 destination: WishPlacementDestination? = nil) async throws -> WishMachineJob {
-        guard readable else { throw WishMachineError.unavailable }
+        return try await withMutation {
+
         try Task.checkCancellation()
-        guard let authorization = authorizations.first(where: { $0.id == authorizationID }),
-              authorization.worldID == worldID, authorization.residentScope == residentScope else { throw WishMachineError.unauthorized }
-        guard let image = authorization.attachments.first(where: { $0.id == attachmentID }) else { throw WishMachineError.unknownAttachment }
-        if let existing = jobs.first(where: { $0.authorizationID == authorizationID }) {
-            guard existing.requestID == requestID else { throw WishMachineError.consumedAuthorization }
-            // 尺寸意图也要一致，但**老档案没有它**（升级前受理的任务）：
-            // 只要有一侧没说过意图，就按"没有意图"放过这次重放，不把合法重放判成冲突。
-            guard existing.attachmentID == attachmentID, existing.name == name,
-                  existing.heightMeters == heightMeters,
-                  existing.sizeIntent == sizeIntent || existing.sizeIntent == nil || sizeIntent == nil
-            else { throw WishMachineError.conflictingCall }
-            if let destination {
-                guard let grant = delegations.first(where: { $0.authorizationID == authorizationID }),
-                      grant.allowedSurfaceIDs == destination.surfaceIDs, grant.explicitTarget == destination.explicitTarget else { throw WishMachineError.conflictingCall }
-            }
-            return existing
-        }
+        var fields: [String: Any] = ["requestID":requestID,"authorizationID":authorizationID.uuidString,
+            "attachmentID":attachmentID.uuidString,"name":name,"heightMeters":heightMeters,
+            "worldID":worldID,"residentScope":residentScope]
+        if let sizeIntent {fields["sizeIntent"] = try Self.controlJSON(sizeIntent)}
         if let destination {
-            let surfaces = try Self.validatedSurfaceIDs(destination.surfaceIDs, explicitTarget: destination.explicitTarget)
-            if let existingGrant = delegations.first(where: { $0.authorizationID == authorizationID }) {
-                guard existingGrant.allowedSurfaceIDs == surfaces, existingGrant.explicitTarget == destination.explicitTarget else { throw WishMachineError.conflictingCall }
-            } else {
-                delegations.append(.init(id: UUID(), authorizationID: authorizationID,
-                    requestID: "placement." + UUID().uuidString.lowercased(), worldID: worldID, residentScope: residentScope,
-                    allowedSurfaceIDs: surfaces, explicitTarget: destination.explicitTarget, objectID: nil,
-                    state: .awaitingSubmission, lastError: nil))
-                try persist()
-            }
+            fields["destinationSurfaceIDs"] = destination.surfaceIDs
+            if let target = destination.explicitTarget {fields["destinationTarget"] = try Self.controlJSON(target)}
         }
-        guard !requestID.isEmpty, (1...100).contains(name.count), heightMeters.isFinite, (0.01...3).contains(heightMeters) else { throw PropGenerationError.invalidInput }
-        // 尺寸意图**存在时必须合法**，而且与请求高度不矛盾：轴是高度（或三轴的 `y`）时两者就是
-        // 同一件事。非法/矛盾一律拒绝（`invalidInput` 的文案会说明范围），不静默按"没有意图"处理。
-        if let sizeIntent {
-            guard sizeIntent.isValid else { throw PropGenerationError.invalidInput }
-            if let required = sizeIntent.requiredHeightMeters, required != heightMeters { throw PropGenerationError.invalidInput }
+        let directive = try await controlDecision("submit_prepare",fields,as:SubmissionDirective.self)
+        guard directive.action == "create" else {
+            guard directive.action == "none" else {throw WishMachineError.unavailable}
+            return directive.job
         }
-        let id = UUID()
-        jobs.append(.init(id: id, worldID: worldID, residentScope: residentScope, authorizationID: authorizationID,
-            attachmentID: attachmentID, requestID: requestID, name: name, heightMeters: heightMeters,
-            sizeIntent: sizeIntent,
-            objectID: "wish-prop-" + id.uuidString.lowercased(), jobID: id, stage: .submitting))
-        emit(index: jobs.count - 1, kind: .stateChanged)
-        try persist() // Owner, grant and stable core identity precede both core persistence and network submission.
-        // This awaits only local image adaptation and the Rust daemon's durable queue ACK.
-        // Remote submission, observation and download belong exclusively to that process.
-        let generationSource = webReferences.first { $0.attachmentID == attachmentID }?.source ?? authorization.source
-        let coreID = await store.create(imageURL: image.url, name: name, author: generationSource.author,
-            license: generationSource.license, heightMeters: heightMeters, sizeIntent: sizeIntent, id: id,
-            context: PropTaskContext(worldID: worldID, residentScope: residentScope))
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
-        if coreID == nil {
-            jobs[index].stage = .submissionUncertain
-            jobs[index].lastError = store.errorMessage ?? "后台受理结果未确认，请按原任务编号核实。"
-            emit(index: index, kind: .stateChanged)
-        } else {
-            reconcile(index: index)
-            if jobs[index].cancelRequested == true { await store.cancel(id: id); reconcile(index: index) }
+        return try await executeSubmission(directive)
+
         }
-        try persist()
-        return jobs[index]
     }
 
     func read(id: UUID, worldID: String, residentScope: String) throws -> WishMachineJob {
-        jobs[try index(id: id, worldID: worldID, residentScope: residentScope)]
+        workingJobs[try index(id: id, worldID: worldID, residentScope: residentScope)]
     }
 
     /// Only durable, scope-matched scene failures may influence presentation selection.
@@ -698,28 +660,13 @@ enum WishMachineError: LocalizedError {
     /// 旧行为是"已经有记录了就不再记"，于是修复前那句没有字段/数值的旧文案会永久留在盘上，
     /// 重新推导**仍然失败**时用户也读不到是哪一条判据、哪个数（新纪律要求具名）。
     /// 同一件产物永远只有一条 `failureSource == "renderer"` 的记录（幂等：同一句话不写第二遍）。
-    func recordOutputRenderFailure(id: UUID, worldID: String, residentScope: String, message: String) throws {
-        let job = jobs[try index(id: id, worldID: worldID, residentScope: residentScope)]
-        guard job.stage == .ready, let path = job.modelPath, FileManager.default.fileExists(atPath: path) else {
-            throw WishMachineError.notReady
+    func recordOutputRenderFailure(id: UUID, worldID: String, residentScope: String, message: String) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("renderer_failure",["wishID":id.uuidString,"worldID":worldID,
+            "residentScope":residentScope,"message":message])
+
         }
-        let text = "成品场景加载失败：" + message
-        if let index = events.firstIndex(where: { $0.wishID == id && $0.worldID == worldID
-            && $0.residentScope == residentScope && $0.kind == .failed && $0.failureSource == "renderer" }) {
-            guard events[index].message != text || events[index].stage != job.stage
-                || events[index].remoteState != job.remoteState else { return }
-            events[index].message = text
-            events[index].stage = job.stage
-            events[index].remoteState = job.remoteState
-            events[index].cancelRequested = job.cancelRequested
-            try persist()
-            return
-        }
-        events.append(.init(id: UUID(), wishID: id, worldID: worldID, residentScope: residentScope,
-            objectID: job.objectID, kind: .failed, computeMayContinue: job.computeMayContinue,
-            stage: job.stage, remoteState: job.remoteState,
-            message: text, cancelRequested: job.cancelRequested, failureSource: "renderer"))
-        try persist()
     }
 
     /// 现场推导**成功**了 ⇒ 那条陈旧结论必须消失：记录不是权威，推导才是。
@@ -728,30 +675,25 @@ enum WishMachineError: LocalizedError {
     /// 无条件清会把真失败也抹掉，那是另一种假话（新纪律）。
     /// 幂等：没有记录时一次写入都不发生，所以重复读取/重放不产生多余状态变更。
     @discardableResult
-    func clearOutputRenderFailure(id: UUID, worldID: String, residentScope: String) throws -> Bool {
-        guard readable else { return false }
-        let matches: (WishMachineEvent) -> Bool = {
-            $0.wishID == id && $0.worldID == worldID && $0.residentScope == residentScope
-                && $0.kind == .failed && $0.failureSource == "renderer"
+    func clearOutputRenderFailure(id: UUID, worldID: String, residentScope: String) async throws -> Bool {
+        return try await withMutation {
+
+        return try await controlDecision("renderer_clear",["wishID":id.uuidString,"worldID":worldID,
+            "residentScope":residentScope],as:Bool.self)
+
         }
-        guard events.contains(where: matches) else { return false }
-        // 落盘失败就把内存改回去：宁可留着那条旧结论，也不许把一条真事实**只在内存里**删掉。
-        let before = events
-        events.removeAll(where: matches)
-        do { try persist() } catch {
-            events = before
-            throw error
-        }
-        return true
     }
 
     func residentJobs(worldID: String, residentScope: String) -> [WishMachineJob] {
-        readable ? jobs.filter { $0.worldID == worldID && $0.residentScope == residentScope } : []
+        readable ? workingJobs.filter { $0.worldID == worldID && $0.residentScope == residentScope } : []
     }
 
     func attachmentChoices(authorizationID: UUID, worldID: String, residentScope: String) -> [(id: UUID, displayName: String)] {
         guard readable, let authorization = authorizations.first(where: { $0.id == authorizationID && $0.worldID == worldID && $0.residentScope == residentScope }) else { return [] }
         return authorization.attachments.map { (id: $0.id, displayName: $0.displayName) }
+    }
+    func isGenerationAuthorized(authorizationID:UUID,worldID:String,residentScope:String)->Bool {
+        readable && controlViews.availableAuthorizations.contains {$0.id == authorizationID && $0.worldID == worldID && $0.residentScope == residentScope}
     }
 
     // MARK: - 还没提交的委托（信息不足 ⇒ 问一句 ⇒ 续同一份）
@@ -763,43 +705,57 @@ enum WishMachineError: LocalizedError {
     @discardableResult
     func recordPendingDraft(id: UUID = UUID(), authorityID: UUID, requestID: String, attachmentID: UUID,
                             name: String, destination: WishPlacementDestination?, needs: [String],
-                            worldID: String, residentScope: String, now: Date = Date()) throws -> WishMachinePendingDraft {
-        guard readable else { throw WishMachineError.unavailable }
-        guard !requestID.isEmpty, !worldID.isEmpty, !residentScope.isEmpty else { throw WishMachineError.wrongScope }
-        pendingDrafts.removeAll { $0.isExpired(now: now) }
-        if let index = pendingDrafts.firstIndex(where: {
-            $0.id == id || ($0.authorityID == authorityID && $0.requestID == requestID)
-        }) {
-            pendingDrafts[index].needs = needs
-            pendingDrafts[index].attempt += 1
-            try persist()
-            return pendingDrafts[index]
+                            worldID: String, residentScope: String, now: Date = Date()) async throws -> WishMachinePendingDraft {
+        return try await withMutation {
+
+        var fields: [String: Any] = ["id":id.uuidString,"authorityID":authorityID.uuidString,"requestID":requestID,
+            "attachmentID":attachmentID.uuidString,"name":name,"needs":needs,"worldID":worldID,"residentScope":residentScope]
+        if let destination {
+            fields["destinationSurfaceIDs"] = destination.surfaceIDs
+            if let target = destination.explicitTarget {fields["destinationTarget"] = try Self.controlJSON(target)}
         }
-        let draft = WishMachinePendingDraft(id: id, authorityID: authorityID, requestID: requestID,
-            attachmentID: attachmentID, name: name, destinationSurfaceIDs: destination?.surfaceIDs,
-            destinationTarget: destination?.explicitTarget, worldID: worldID, residentScope: residentScope,
-            createdAt: now, needs: needs, attempt: 1)
-        pendingDrafts.append(draft)
-        try persist()
-        return draft
+        // The compatibility `now` argument is never sent to the production
+        // authority. Expiry and creation are decided by Rust's wall clock.
+        return try await controlDecision("draft_record",fields,as:WishMachinePendingDraft.self)
+
+        }
     }
 
     /// 本 scope 里还没过期的草稿。读不到记录时返回空（不是"猜一份"）。
-    func pendingDrafts(worldID: String, residentScope: String, now: Date = Date()) -> [WishMachinePendingDraft] {
-        guard readable else { return [] }
-        return pendingDrafts.filter {
-            $0.worldID == worldID && $0.residentScope == residentScope && !$0.isExpired(now: now)
+    func pendingDrafts(worldID: String, residentScope: String, now: Date = Date()) async throws -> [WishMachinePendingDraft] {
+        try await withMutation {
+            try await controlDecision("draft_list",["worldID":worldID,"residentScope":residentScope],as:[WishMachinePendingDraft].self)
+        }
+    }
+
+    func resolvePendingDrafts(pendingID: UUID?, attachmentID: UUID, name: String,
+                             worldID: String, residentScope: String) async throws -> WishMachineDraftResolution {
+        try await withMutation {
+            var fields: [String: Any] = ["attachmentID":attachmentID.uuidString,"name":name,
+                "worldID":worldID,"residentScope":residentScope]
+            if let pendingID {fields["pendingID"] = pendingID.uuidString}
+            let value = try await controlCommand("draft_resolve",fields)
+            guard let result = value as? [String: Any], let resolution = result["resolution"] as? String else {
+                throw WishMachineError.unavailable
+            }
+            switch resolution {
+            case "fresh": return .fresh
+            case "resume": return .resume(try Self.controlDecode(WishMachinePendingDraft.self,from:result["draft"]))
+            case "ambiguous": return .ambiguous(try Self.controlDecode([WishMachinePendingDraft].self,from:result["drafts"]))
+            default: throw WishMachineError.unavailable
+            }
         }
     }
 
     /// 提交成功之后把这一份草稿标成"已提交"并**留着**：同一个 `pending_id` 的再次调用
     /// 会被解析成同一个任务（幂等重放），而不是新建一件。崩在标记之前也没关系 ——
     /// 复核看的是"这份授权下有没有任务"，标记只是让**自动**续办不再重复命中它。
-    func markPendingDraftSubmitted(id: UUID, jobID: UUID, now: Date = Date()) throws {
-        guard readable else { throw WishMachineError.unavailable }
-        guard let index = pendingDrafts.firstIndex(where: { $0.id == id }) else { return }
-        pendingDrafts[index].submittedJobID = jobID
-        try persist()
+    func markPendingDraftSubmitted(id: UUID, jobID: UUID, now: Date = Date()) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("draft_submit",["id":id.uuidString,"jobID":jobID.uuidString])
+
+        }
     }
 
     func claimEvidence(id: UUID, worldID: String, residentScope: String) throws -> WishMachineClaimEvidence? {
@@ -814,64 +770,31 @@ enum WishMachineError: LocalizedError {
 
     /// Explicit confirmation only. A persisted core request is replayed with its original image and key.
     @discardableResult func retry(id: UUID, worldID: String, residentScope: String) async throws -> WishMachineJob {
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
-        guard let coreID = jobs[index].jobID else { throw WishMachineError.retryUnavailable }
-        // A reopened app may not have received its first subscription snapshot yet.
-        // Resolve the durable daemon identity before choosing retry versus local submission.
+        return try await withMutation {
+
         await store.refreshSnapshot()
-        // `.failed` **例外**：这一段是为了"确认守护进程已经认得这次提交"，而失败是已经
-        // 确认过的结局 —— 对它必须真的走到下面的重发/重试，否则「重试」会变成
-        // "点了没反应"（reconcile 只是把同一个失败读回来）。
-        if jobs[index].stage != .failed,
-           let record = store.jobs.first(where: { $0.id == coreID }), record.receipt != nil,
-           !(record.receipt?.state == .completed && record.localModelPath == nil) {
-            reconcile(index: index)
-            try persist()
-            return jobs[index]
-        }
-        // 「原提交结果未明」不是唯一该被确认的事：**`.failed` 也必须能重试**。
-        //
-        // 原判据只放行 `[.submissionUncertain, .submitting, .generated]`，于是"失败行上的
-        // 重试"今天根本不存在 —— 而失败恰恰是用户唯一有话可说的一种结局；对它只回一句
-        // "新生成需要用户重新发起"，等于把用户唯一的证据丢掉（真机两次"东西不见了"的
-        // 投诉都起因于此）。
-        //
-        // 为什么加 `.failed` **并没有放宽**这条 guard 的语义：它照旧只允许"复用**原身份**
-        // 重放原提交"——同一个 `jobs[index].jobID`（`coreID`）、同一张图（按 `attachmentID`
-        // 找回）、同一个幂等键（`id: coreID`）、同一个 `sizeIntent`（见下），既不新建任务、
-        // 也不多消费一次生成授权。也就是说它仍然是"重试那一次已经发生的提交"，不是
-        // "再生成一件新的"。
-        //
-        // 其余取值照旧拒绝：`.ready` / `.claimed` 已经有产物（重发会多出一件），
-        // `.cancelled` / `.interrupted` 是明确终止，都不在这次授权范围内。
-        guard Self.retryableStages.contains(jobs[index].stage) else { throw WishMachineError.retryUnavailable }
         try Task.checkCancellation()
-        if store.jobs.contains(where: { $0.id == coreID }) {
-            await store.retrySubmission(id: coreID)
-        } else {
-            // Reuse the stable UUID even if the local ACK was lost; the daemon owns deduplication.
-            let job = jobs[index]
-            guard let authorization = authorizations.first(where: { $0.id == job.authorizationID && $0.worldID == worldID && $0.residentScope == residentScope }),
-                  let image = authorization.attachments.first(where: { $0.id == job.attachmentID }) else { throw WishMachineError.unknownAttachment }
-            let generationSource = webReferences.first { $0.attachmentID == job.attachmentID }?.source ?? authorization.source
-            // 重放必须带上**原任务的**尺寸意图：换一次身份不等于换一个尺寸。
-            _ = await store.create(imageURL: image.url, name: job.name, author: generationSource.author,
-                license: generationSource.license, heightMeters: job.heightMeters, sizeIntent: job.sizeIntent, id: coreID,
-                context: PropTaskContext(worldID: worldID, residentScope: residentScope))
+        let fields: [String: Any] = ["wishID":id.uuidString,"worldID":worldID,"residentScope":residentScope]
+        let directive = try await controlDecision("retry_prepare",fields,as:SubmissionDirective.self)
+        switch directive.action {
+        case "none": return directive.job
+        case "create": return try await executeSubmission(directive)
+        case "retry":
+            guard let coreID = directive.job.jobID else {throw WishMachineError.unavailable}
+            await store.retrySubmission(id:coreID)
+            return try await controlDecision("submit_finish",fields,as:WishMachineJob.self)
+        default: throw WishMachineError.unavailable
         }
-        reconcile(index: index)
-        jobs[index].lastError = store.errorMessage
-        try persist()
-        return jobs[index]
+
+        }
     }
 
     @discardableResult func refresh(id: UUID, worldID: String, residentScope: String) async throws -> WishMachineJob {
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
-        guard let coreID = jobs[index].jobID, jobs[index].stage != .claimed else { return jobs[index] }
-        await store.refresh(id: coreID) // One local daemon snapshot; never a remote model poll.
-        reconcile(index: index)
-        try persist()
-        return jobs[index]
+        return try await withMutation {
+        await store.refreshSnapshot()
+        return try await controlDecision("observe",["wishID":id.uuidString,"worldID":worldID,
+            "residentScope":residentScope],as:WishMachineJob.self)
+        }
     }
 
     /// Bounded automatic confirmation of a network-class unknown submission.
@@ -908,47 +831,40 @@ enum WishMachineError: LocalizedError {
     /// deterministic in harnesses instead of depending on wall time.
     var now: () -> Date = { Date() }
 
-    private var networkConfirmationAttempts: [UUID: Int] = [:]
-    private var lastNetworkConfirmationAt: [UUID: Date] = [:]
-
     @discardableResult
     func confirmNetworkUncertainSubmissions() async -> Int {
+        do { return try await withMutation {
         guard readable, store.errorMessage == nil else { return 0 }
-        let date = now()
-        let pending = jobs.filter { job in
-            guard job.stage == .submissionUncertain,
-                  Self.isNetworkClassSubmissionError(job.lastError),
-                  (networkConfirmationAttempts[job.id] ?? 0) < Self.maximumNetworkConfirmationsPerJob
-            else { return false }
-            guard let last = lastNetworkConfirmationAt[job.id] else { return true }
-            // 连续未确认的等待**递增**（30 → 60 → …），带抖动、封顶；第一跳与既有 30 秒同值。
-            let policy = RetryBackoffSite.generationConfirmation.policy
-            let interval = policy.delay(
-                afterFailure: max(1, networkConfirmationAttempts[job.id] ?? 0),
-                jitterUnit: RetryJitter.uniform.unit()
-            )
-            return date.timeIntervalSince(last) >= interval
-        }
+        let pending = try await controlDecision("confirmation_prepare",[:],as:[SubmissionDirective].self)
         var confirmed = 0
-        for job in pending {
-            networkConfirmationAttempts[job.id, default: 0] += 1
-            lastNetworkConfirmationAt[job.id] = date
-            _ = try? await retry(id: job.id, worldID: job.worldID, residentScope: job.residentScope)
-            guard let index = jobs.firstIndex(where: { $0.id == job.id }) else { continue }
-            try? persist()
-            if jobs[index].stage != .submissionUncertain || jobs[index].lastError != job.lastError { confirmed += 1 }
+        for directive in pending {
+            let original = directive.job
+            let result: WishMachineJob
+            switch directive.action {
+            case "none": result = original
+            case "create": result = try await executeSubmission(directive)
+            case "retry":
+                guard let coreID = original.jobID else {throw WishMachineError.unavailable}
+                await store.retrySubmission(id:coreID)
+                result = try await controlDecision("submit_finish",["wishID":original.id.uuidString,
+                    "worldID":original.worldID,"residentScope":original.residentScope],as:WishMachineJob.self)
+            default: throw WishMachineError.unavailable
+            }
+            if result.stage != .submissionUncertain || result.lastError != original.lastError {confirmed += 1}
         }
         return confirmed
+        } } catch { return 0 }
     }
 
     func refreshPending(limit: Int = 2) async {
+        guard (try? await waitUntilReady()) != nil else { return }
         guard readable, limit > 0 else { return }
         await store.refreshSnapshot()
-        synchronizeBackendSnapshot()
+        await synchronizeBackendSnapshot()
         // 暂停的重新校验**不依赖后端**：它纯本地、幂等，唯一的判据是"有没有用户意图证据"。
         // 后端没配好时，遗留的非用户暂停同样必须自愈，而不是继续要求人工解除——那正是
         // 用户抱怨的多余一步。run 级用户停止与"奉命轮"规则仍然各自把住每一次自主领取。
-        discardPausesWithoutUserIntent()
+        await discardPausesWithoutUserIntent()
         // 网络类未知提交的自动确认必须等后端真的可达：它要复用原幂等身份去确认/重发，
         // 门槛之外只会制造无效请求。所以健康判定只留给这一条。
         let healthy = store.errorMessage == nil
@@ -957,17 +873,14 @@ enum WishMachineError: LocalizedError {
     }
 
     @discardableResult func cancel(id: UUID, worldID: String, residentScope: String) async throws -> WishMachineJob {
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
-        guard let coreID = jobs[index].jobID else { throw WishMachineError.notReady }
-        if [.claimed, .cancelled, .failed, .interrupted, .ready, .generated].contains(jobs[index].stage) { return jobs[index] }
-        jobs[index].cancelRequested = true
-        jobs[index].computeMayContinue = true
-        emit(index: index, kind: .stateChanged)
-        try persist()
+        return try await withMutation {
+        let fields: [String: Any] = ["wishID":id.uuidString,"worldID":worldID,"residentScope":residentScope]
+        let directive = try await controlDecision("cancel_prepare",fields,as:SubmissionDirective.self)
+        if directive.action == "none" {return directive.job}
+        guard directive.action == "cancel", let coreID = directive.job.jobID else {throw WishMachineError.unavailable}
         await store.cancel(id: coreID)
-        reconcile(index: index)
-        try persist()
-        return jobs[index]
+        return try await controlDecision("observe",fields,as:WishMachineJob.self)
+        }
     }
 
     /// 「这一件现在能不能领」——**唯一**一份判据。
@@ -980,7 +893,7 @@ enum WishMachineError: LocalizedError {
         guard let index = try? index(id: id, worldID: worldID, residentScope: residentScope) else {
             return .failure(.wrongScope)
         }
-        let job = jobs[index]
+        let job = workingJobs[index]
         if job.stage == .claimed { return .success(job) }
         guard job.stage == .ready, let path = job.modelPath, FileManager.default.fileExists(atPath: path) else { return .failure(.notReady) }
         guard let evidence = canClaim(job), evidence.worldID == worldID, evidence.activityID == "wish_machine.collect",
@@ -989,23 +902,37 @@ enum WishMachineError: LocalizedError {
         return .success(job)
     }
 
-    func claim(id: UUID, worldID: String, residentScope: String) throws -> WishMachineJob {
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
-        switch claimAvailability(id: id, worldID: worldID, residentScope: residentScope) {
-        case let .failure(error):
-            throw error
-        case let .success(job):
+    func claim(id: UUID, worldID: String, residentScope: String) async throws -> WishMachineJob {
+        return try await withMutation {
+
+        let job = try read(id:id,worldID:worldID,residentScope:residentScope)
             if job.stage == .claimed { return job }
-            jobs[index].stage = .claimed
-            emit(index: index, kind: .claimed)
-            try persist()
-            return jobs[index]
+            guard let evidence=canClaim(job) else {throw WishMachineError.notAtMachine}
+            var observation:[String:Any]=["worldID":evidence.worldID,"distanceMeters":evidence.distanceMeters,
+                "outputAvailable":evidence.outputAvailable]
+            observation["activityID"]=evidence.activityID;observation["phase"]=evidence.phase
+            observation["activityRequestID"]=evidence.activityRequestID;observation["activityGeneration"]=evidence.activityGeneration
+            observation["phaseGeneration"]=evidence.phaseGeneration;observation["activityHostSessionID"]=evidence.activityHostSessionID
+            observation["objectID"]=evidence.objectID
+            do {try applyControlReceipt(await controlRequest("wish_control_claim", [
+                "wishID": id.uuidString, "worldID": worldID, "residentScope": residentScope,"observation":observation]))}
+            catch PropTaskDaemonError.requestRejectedWith(let code) {
+                switch code {
+                case "wish_control_not_at_machine": throw WishMachineError.notAtMachine
+                case "wish_control_not_ready": throw WishMachineError.notReady
+                case "wish_control_wrong_scope": throw WishMachineError.wrongScope
+                case "wish_control_unauthorized": throw WishMachineError.unauthorized
+                default: throw WishMachineError.unavailable
+                }
+            }
+            notifyChange()
+            return try read(id: id, worldID: worldID, residentScope: residentScope)
         }
     }
 
     func readyOutputs(worldID: String) -> [WishMachineOutputDescriptor] {
         guard readable else { return [] }
-        return jobs.compactMap { job in
+        return workingJobs.compactMap { job in
             guard job.worldID == worldID, job.stage == .ready, let path = job.modelPath,
                   FileManager.default.fileExists(atPath: path) else { return nil }
             // `height_meters` 是**生成请求**的高度：托盘上这一件还没登记，所以必须带上
@@ -1019,105 +946,47 @@ enum WishMachineError: LocalizedError {
     }
     func pendingEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
         guard readable else { return [] }
-        return events.filter { !$0.acknowledged && $0.worldID == worldID && $0.residentScope == residentScope }
+        return controlViews.pendingEvents.filter {$0.worldID == worldID && $0.residentScope == residentScope}
     }
 
     /// Local fact outbox only. Rust owns delivery and separate world/UI/agent acknowledgements.
     /// Previously acknowledged legacy events must not be broadcast again during migration.
     func unpublishedEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
         guard readable else { return [] }
-        return events.filter {
-            !$0.acknowledged && $0.forwardedToDaemon != true && $0.worldID == worldID && $0.residentScope == residentScope
-        }
+        return controlViews.unpublishedEvents.filter {$0.worldID == worldID && $0.residentScope == residentScope}
     }
 
     /// Call only after publish_message returned its durable acknowledgement for this same event ID.
-    func markEventPublished(id: UUID) throws {
-        guard readable else { throw WishMachineError.unavailable }
-        guard let index = events.firstIndex(where: { $0.id == id }), events[index].forwardedToDaemon != true else { return }
-        let previous = events[index].forwardedToDaemon
-        events[index].forwardedToDaemon = true
-        do { try persist() } catch {
-            events[index].forwardedToDaemon = previous
-            throw error
+    func markEventPublished(id: UUID) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("event_published",["eventID":id.uuidString])
+
         }
     }
 
     func automaticContinuationEvents(worldID: String, residentScope: String) -> [WishMachineEvent] {
-        pendingEvents(worldID: worldID, residentScope: residentScope).filter { event in
-            guard let job = jobs.first(where: { $0.id == event.wishID }) else { return false }
-            if delegations.contains(where: { $0.authorizationID == job.authorizationID
-                && $0.worldID == worldID && $0.residentScope == residentScope && $0.state == .placed }) { return false }
-            if let grant = event.continuationResumeAuthorizationID,
-               job.continuationResumeAuthorizationIDs?.last != grant { return false }
-            return job.autoContinuationPaused != true
-        }
+        guard readable else {return []}
+        return controlViews.continuationEvents.filter {$0.worldID == worldID && $0.residentScope == residentScope}
     }
 
     /// A current human turn may renew only this wish's original follow-through.
     /// The host supplies claimed-item readback; provider state and world effects are untouched.
     @discardableResult
     func resumeContinuations(id: UUID, worldID: String, residentScope: String, authorizationID: UUID,
-                             placementAlreadyCompleted: Bool? = nil) throws -> WishMachineJob {
-        let index = try index(id: id, worldID: worldID, residentScope: residentScope)
-        let job = jobs[index]
-        guard job.cancelRequested != true,
-              ![.failed, .cancelled, .interrupted].contains(job.stage),
-              job.remoteState.map({ ![.failed, .cancelled, .interrupted, .cancelRequested].contains($0) }) ?? true,
-              outputRenderFailure(id: id, worldID: worldID, residentScope: residentScope) == nil else {
-            throw WishMachineError.continuationResumeUnavailable
-        }
-        let delegationIndex = delegations.firstIndex {
-            $0.authorizationID == job.authorizationID && $0.worldID == worldID && $0.residentScope == residentScope
-        }
-        if let delegationIndex {
-            if delegations[delegationIndex].state == .placed {
-                return try finishAlreadyPlacedContinuation(index: index, delegationIndex: delegationIndex)
-            }
-            guard delegations[delegationIndex].state != .failed else { throw WishMachineError.continuationResumeUnavailable }
-        }
-        if job.stage == .claimed {
-            guard let placementAlreadyCompleted else { throw WishMachineError.continuationResumeReadbackRequired }
-            if placementAlreadyCompleted {
-                return try finishAlreadyPlacedContinuation(index: index, delegationIndex: delegationIndex)
-            }
-            guard delegationIndex != nil else { throw WishMachineError.continuationResumeUnavailable }
-        }
-        let needsResume = job.autoContinuationPaused == true || delegationIndex.map { delegations[$0].state == .revoked } == true
-        guard needsResume else { return job }
-        guard !(job.continuationResumeAuthorizationIDs ?? []).contains(authorizationID) else {
-            throw WishMachineError.continuationResumeUnauthorized
-        }
-        let priorDelegations = delegations, priorEvents = events
-        jobs[index].autoContinuationPaused = false
-        jobs[index].autoContinuationStoppedByUser = nil
-        jobs[index].continuationResumeAuthorizationIDs = (job.continuationResumeAuthorizationIDs ?? []) + [authorizationID]
-        if let delegationIndex, delegations[delegationIndex].state == .revoked {
-            delegations[delegationIndex].state = delegations[delegationIndex].objectID == nil ? .awaitingSubmission : .pending
-        }
-        events.append(.init(id: UUID(), wishID: id, worldID: worldID, residentScope: residentScope,
-            objectID: job.objectID, kind: .stateChanged, computeMayContinue: job.computeMayContinue,
-            stage: job.stage, remoteState: job.remoteState, message: "原许愿任务的自动续办权限已恢复。",
-            cancelRequested: job.cancelRequested, autoContinuationPaused: false, continuationResumeAuthorizationID: authorizationID))
-        do { try persist() }
-        catch {
-            // A failed durable grant must remain paused even to direct in-process readers.
-            jobs[index] = job; delegations = priorDelegations; events = priorEvents
-            throw error
-        }
-        return jobs[index]
-    }
+                             placementAlreadyCompleted: Bool? = nil) async throws -> WishMachineJob {
+        return try await withMutation {
 
-    /// Only a durable placed delegation or current host readback can reach this
-    /// path. Clear the stale pause without granting work or replaying effects.
-    private func finishAlreadyPlacedContinuation(index: Int, delegationIndex: Int?) throws -> WishMachineJob {
-        let priorJob = jobs[index], priorDelegations = delegations
-        jobs[index].autoContinuationPaused = false
-        jobs[index].autoContinuationStoppedByUser = nil
-        if let delegationIndex { delegations[delegationIndex].state = .placed }
-        do { try persist() }
-        catch { jobs[index] = priorJob; delegations = priorDelegations; throw error }
-        return jobs[index]
+        _ = try index(id: id, worldID: worldID, residentScope: residentScope)
+        var params: [String: Any] = ["wishID": id.uuidString, "worldID": worldID,
+                                    "residentScope": residentScope, "authorizationID": authorizationID.uuidString]
+        if let placementAlreadyCompleted { params["placementAlreadyCompleted"] = placementAlreadyCompleted }
+        let previousRevision = controlRevision
+        try applyControlReceipt(await controlRequest("wish_control_resume", params))
+        if controlRevision != previousRevision { notifyChange() }
+        return try read(id: id, worldID: worldID, residentScope: residentScope)
+
+        }
     }
 
     /// Stop automatic follow-through for existing commissions only. Keep their facts and assets intact.
@@ -1127,22 +996,21 @@ enum WishMachineError: LocalizedError {
     /// unavailable, a world switch, an app quit — must not write this pause, because the
     /// only way back is a human action and the user never asked for one. The pause records
     /// its own user-intent provenance so a pause written by an older build (or by any other
-    /// path) can be re-validated and lifted by `discardPausesWithoutUserIntent()`.
-    func pauseContinuations(worldID: String, residentScope: String) throws {
-        let indices = jobs.indices.filter { jobs[$0].worldID == worldID && jobs[$0].residentScope == residentScope }
-        let delegationIndices = delegations.indices.filter { delegations[$0].worldID == worldID && delegations[$0].residentScope == residentScope && delegations[$0].state == .pending }
-        guard !indices.isEmpty || !delegationIndices.isEmpty else { return }
-        // Block in this process before touching disk; a failed save must not resume actions in memory.
-        for index in indices {
-            jobs[index].autoContinuationPaused = true
-            jobs[index].autoContinuationStoppedByUser = true
-        }
-        // Stop revokes incomplete placement delegations in the same durable record.
-        for index in delegationIndices { delegations[index].state = .revoked }
-        do { try persist() }
-        catch {
+    /// path) can be re-validated and lifted by `await discardPausesWithoutUserIntent()`.
+    func pauseContinuations(worldID: String, residentScope: String) async throws {
+        return try await withMutation {
+
+        guard readable else { throw WishMachineError.unavailable }
+        do {
+            try applyControlReceipt(await controlRequest("wish_control_pause", ["worldID": worldID, "residentScope": residentScope]))
+            notifyChange()
+        } catch {
+            // A lost durable receipt must not permit in-process follow-through.
+            readable = false
             errorMessage = WishMachineError.pauseNotPersisted.localizedDescription
             throw WishMachineError.pauseNotPersisted
+        }
+
         }
     }
 
@@ -1156,59 +1024,36 @@ enum WishMachineError: LocalizedError {
     ///
     /// Returns how many tasks were released. Called only while the backend is healthy.
     @discardableResult
-    func discardPausesWithoutUserIntent() -> Int {
+    func discardPausesWithoutUserIntent() async -> Int {
+        do { return try await withMutation {
         guard readable else { return 0 }
-        let indices = jobs.indices.filter {
-            jobs[$0].autoContinuationPaused == true && jobs[$0].autoContinuationStoppedByUser != true
-        }
-        guard !indices.isEmpty else { return 0 }
-        let priorJobs = jobs, priorEvents = events, priorDelegations = delegations
-        for index in indices {
-            jobs[index].autoContinuationPaused = false
-            jobs[index].autoContinuationStoppedByUser = nil
-            events.append(.init(id: UUID(), wishID: jobs[index].id, worldID: jobs[index].worldID,
-                residentScope: jobs[index].residentScope, objectID: jobs[index].objectID, kind: .stateChanged,
-                computeMayContinue: jobs[index].computeMayContinue, stage: jobs[index].stage,
-                remoteState: jobs[index].remoteState,
-                message: "自动续办已恢复：此前的停止不是一次人工操作，不需要手动解除。",
-                cancelRequested: jobs[index].cancelRequested, autoContinuationPaused: false))
-        }
-        // A placement revoked by that same non-user pause is reopened with it. Delegations
-        // revoked explicitly (`revokePlacementDelegations`) belong to tasks that are not
-        // released here, so they stay revoked.
-        for index in delegations.indices where delegations[index].state == .revoked
-            && indices.contains(where: {
-                jobs[$0].authorizationID == delegations[index].authorizationID
-                    && jobs[$0].worldID == delegations[index].worldID
-                    && jobs[$0].residentScope == delegations[index].residentScope
-            }) {
-            delegations[index].state = delegations[index].objectID == nil ? .awaitingSubmission : .pending
-        }
-        do { try persist() }
-        catch {
-            jobs = priorJobs; events = priorEvents; delegations = priorDelegations
-            return 0
-        }
-        return indices.count
+        let count = workingJobs.filter { $0.autoContinuationPaused == true && $0.autoContinuationStoppedByUser != true }.count
+        guard count > 0 else { return 0 }
+        do {
+            try applyControlReceipt(await controlRequest("wish_control_discard_unproven_pauses", [:]))
+            notifyChange()
+            return count
+        } catch { return 0 }
+        } } catch { return 0 }
     }
+
     /// Stop revokes incomplete delegations durably; revocation never revives on restart or world switch.
-    func revokePlacementDelegations(worldID: String, residentScope: String) throws {
-        var changed = false
-        for index in delegations.indices where delegations[index].worldID == worldID && delegations[index].residentScope == residentScope
-            && delegations[index].state == .pending {
-            delegations[index].state = .revoked; changed = true
+    func revokePlacementDelegations(worldID: String, residentScope: String) async throws {
+        return try await withMutation {
+
+        _ = try await controlCommand("delegation_revoke",["worldID":worldID,"residentScope":residentScope])
+
         }
-        guard changed else { return }
-        try persist()
     }
-    func acknowledgeEvent(id: UUID) throws {
+    func acknowledgeEvent(id: UUID) async throws {
+        return try await withMutation {
+
         guard readable else { throw WishMachineError.unavailable }
-        guard let index = events.firstIndex(where: { $0.id == id }) else { return }
-        guard !events[index].acknowledged else { return }
-        events[index].acknowledged = true
-        do { try persist() } catch {
-            events[index].acknowledged = false
-            throw error
+        guard let event = events.first(where: { $0.id == id }), !event.acknowledged else { return }
+        try applyControlReceipt(await controlRequest("wish_control_event_ack", [
+            "eventID": id.uuidString, "worldID": event.worldID, "residentScope": event.residentScope]))
+        notifyChange()
+
         }
     }
 
@@ -1218,135 +1063,142 @@ enum WishMachineError: LocalizedError {
             && $0.residentScope == residentScope && $0.acknowledged }
     }
 
-    func acknowledgeEvent(id: UUID, worldID: String, residentScope: String) throws {
+    func acknowledgeEvent(id: UUID, worldID: String, residentScope: String) async throws {
+        return try await withMutation {
+
         guard readable else { throw WishMachineError.unavailable }
         guard events.contains(where: { $0.id == id && $0.worldID == worldID
             && $0.residentScope == residentScope }) else { throw WishMachineError.wrongScope }
-        try acknowledgeEvent(id: id)
+        try await acknowledgeEvent(id: id)
+
+        }
     }
 
     /// Durable backend subscription updates drive the same world/UI/agent facts as a manual read.
-    private func synchronizeBackendSnapshot() {
-        guard readable else { return }
-        let previousJobs = jobs, previousEvents = events
-        for index in jobs.indices { reconcile(index: index) }
-        guard jobs != previousJobs || events != previousEvents else { return }
-        do { try persist() } catch { errorMessage = error.localizedDescription }
+    private func synchronizeBackendSnapshot() async {
+        do {
+            try await withMutation {
+                _ = try await controlCommand("observe_all",[:])
+            }
+        } catch { errorMessage = error.localizedDescription }
     }
 
-    private func reconcile(index: Int) {
-        guard jobs[index].stage != .claimed,
-              let record = store.jobs.first(where: { $0.id == jobs[index].jobID }) else { return }
-        jobs[index].daemonAccepted = true
-        jobs[index].lastError = record.lastError
-        if record.cancelRequested == true { jobs[index].cancelRequested = true }
-        jobs[index].remoteState = record.receipt?.state
-        jobs[index].computeMayContinue = record.receipt?.computeMayContinue
-            ?? (jobs[index].cancelRequested == true && record.backendStage != "cancelled")
-        switch record.backendStage {
-        case "cancelled":
-            jobs[index].stage = .cancelled
-            emit(index: index, kind: .cancelled)
-            return
-        case "interrupted":
-            jobs[index].stage = .interrupted
-            emit(index: index, kind: .interrupted)
-            return
-        case "failed" where record.receipt?.state != .completed:
-            jobs[index].stage = .failed
-            emit(index: index, kind: .failed)
-            return
-        case let stage? where ["queued", "submitting", "awaiting_configuration", "cancel_requested"].contains(stage) && record.receipt == nil:
-            jobs[index].stage = .submitting
-            if record.backendStage == "awaiting_configuration", jobs[index].lastError == nil {
-                jobs[index].lastError = "后台等待服务配置。"
-            }
-            emit(index: index, kind: .stateChanged)
-            return
-        default: break
-        }
-        guard let receipt = record.receipt else {
-            jobs[index].stage = .submissionUncertain
-            emit(index: index, kind: .stateChanged)
-            return
-        }
-        bindPlacementIfAccepted(index: index)
-        switch receipt.state {
-        case .completed:
-            if ![.ready, .claimed].contains(jobs[index].stage) { jobs[index].stage = .generated }
-            emit(index: index, kind: .generationCompleted)
-            if record.backendStage == "ready", let path = record.localModelPath,
-               FileManager.default.fileExists(atPath: path) {
-                jobs[index].modelPath = path
-                jobs[index].stage = .ready
-                jobs[index].lastError = nil
-                emit(index: index, kind: .outputReady)
-            }
-        case .failed: jobs[index].stage = .failed; emit(index: index, kind: .failed)
-        case .cancelled: jobs[index].stage = .cancelled; emit(index: index, kind: .cancelled)
-        case .interrupted: jobs[index].stage = .interrupted; emit(index: index, kind: .interrupted)
-        default: jobs[index].stage = .generating
-        }
-        emit(index: index, kind: .stateChanged)
-    }
-    /// Object identity binds to a destination grant only after the remote submission is accepted.
-    private func bindPlacementIfAccepted(index: Int) {
-        for delegationIndex in delegations.indices where delegations[delegationIndex].authorizationID == jobs[index].authorizationID
-            && delegations[delegationIndex].objectID == nil {
-            guard delegations[delegationIndex].worldID == jobs[index].worldID,
-                  delegations[delegationIndex].residentScope == jobs[index].residentScope else { continue }
-            delegations[delegationIndex].objectID = jobs[index].objectID
-            if jobs[index].autoContinuationPaused == true || delegations[delegationIndex].state == .revoked {
-                delegations[delegationIndex].state = .revoked
-            } else { delegations[delegationIndex].state = .pending }
-        }
-    }
-    private func emit(index: Int, kind: WishMachineEvent.Kind) {
-        let job = jobs[index]
-        guard !events.contains(where: { event in
-            guard event.wishID == job.id && event.kind == kind && event.failureSource == nil else { return false }
-            if kind != .stateChanged { return true }
-            return event.stage == job.stage && event.remoteState == job.remoteState
-                && event.message == job.lastError && event.cancelRequested == job.cancelRequested
-        }) else { return }
-        events.append(.init(id: UUID(), wishID: job.id, worldID: job.worldID, residentScope: job.residentScope,
-            objectID: job.objectID, kind: kind, computeMayContinue: job.computeMayContinue,
-            stage: job.stage, remoteState: job.remoteState, message: job.lastError, cancelRequested: job.cancelRequested))
-    }
     private func index(id: UUID, worldID: String, residentScope: String) throws -> Int {
-        guard readable else { throw WishMachineError.unavailable }
-        guard let index = jobs.firstIndex(where: { $0.id == id }), jobs[index].worldID == worldID,
-              jobs[index].residentScope == residentScope else { throw WishMachineError.wrongScope }
+        guard readable, !isLoadingAuthority else { throw WishMachineError.unavailable }
+        guard let index = workingJobs.firstIndex(where: { $0.id == id }), workingJobs[index].worldID == worldID,
+              workingJobs[index].residentScope == residentScope else { throw WishMachineError.wrongScope }
         return index
     }
-    private func persist() throws {
-        guard readable else { throw WishMachineError.unavailable }
-        let temporary = directory.appendingPathComponent(".wishes-" + UUID().uuidString + ".tmp")
-        defer { try? archiveFileManager.removeItem(at: temporary) }
-        do {
-            try archiveFileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let file = directory.appendingPathComponent("wishes.json")
-            try JSONEncoder().encode(Archive(authorizations: authorizations, jobs: jobs, events: events,
-                imageRegistrations: imageRegistrations, delegations: delegations, webReferences: webReferences,
-                pendingDrafts: pendingDrafts,
-                unreadableJobs: unreadableJobs.isEmpty ? nil : unreadableJobs))
-                .write(to: temporary, options: .withoutOverwriting)
-            try archiveFileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            // Preparation may fail without changing the old archive. Rename is the sole
-            // commit point; nothing that can report a failure follows a successful replace.
-            guard Darwin.rename(temporary.path, file.path) == 0 else { throw WishMachineError.unavailable }
-            onChange?()
-        } catch { readable = false; errorMessage = WishMachineError.unavailable.localizedDescription; throw WishMachineError.unavailable }
+
+    private static func controlJSON<T: Encodable>(_ value: T) throws -> Any {
+        do {return try JSONSerialization.jsonObject(with:JSONEncoder().encode(value))}
+        catch {throw PropGenerationError.invalidInput}
     }
-    private static func validatedSurfaceIDs(_ surfaceIDs: [String], explicitTarget: WishPlacementTarget?) throws -> [String] {
-        guard !surfaceIDs.isEmpty, surfaceIDs.count <= 8,
-              surfaceIDs.allSatisfy({ !$0.isEmpty && $0.count <= 256 }), Set(surfaceIDs).count == surfaceIDs.count else { throw PropGenerationError.invalidInput }
-        if let target = explicitTarget {
-            guard surfaceIDs.contains(target.surfaceID), target.isFinite else { throw PropGenerationError.invalidInput }
+    private static func controlPlacementJSON(_ value: WishPlacementTarget) throws -> Any {
+        do {return try controlJSON(value)}
+        catch {throw WishMachineError.conflictingCall}
+    }
+    private static func controlDecode<T: Decodable>(_ type: T.Type, from value: Any?) throws -> T {
+        guard let value else {throw WishMachineError.unavailable}
+        return try JSONDecoder().decode(type,from:JSONSerialization.data(withJSONObject:value,options:.fragmentsAllowed))
+    }
+    private func controlDecision<T: Decodable>(_ command: String, _ fields: [String: Any], as type: T.Type) async throws -> T {
+        try Self.controlDecode(type,from:try await controlCommand(command,fields))
+    }
+    private struct SubmissionDirective: Decodable {
+        let job: WishMachineJob
+        let action: String
+        let imageURL: URL?
+        let source: PropGenerationSource?
+    }
+    private struct ControlViews: Decodable {
+        var pendingEvents: [WishMachineEvent] = []
+        var unpublishedEvents: [WishMachineEvent] = []
+        var continuationEvents: [WishMachineEvent] = []
+        var availableAuthorizations: [Authorization] = []
+    }
+    private var controlViews = ControlViews()
+    private func executeSubmission(_ directive: SubmissionDirective) async throws -> WishMachineJob {
+        let job = directive.job
+        guard let coreID = job.jobID, let imageURL = directive.imageURL, let source = directive.source else {
+            throw WishMachineError.unavailable
         }
-        return surfaceIDs
+        _ = await store.create(imageURL:imageURL,name:job.name,author:source.author,license:source.license,
+            heightMeters:job.heightMeters,sizeIntent:job.sizeIntent,id:coreID,
+            context:PropTaskContext(worldID:job.worldID,residentScope:job.residentScope))
+        var fields: [String: Any] = ["wishID":job.id.uuidString,"worldID":job.worldID,"residentScope":job.residentScope]
+        if let error = store.errorMessage {fields["nativePreparationError"] = error}
+        return try await controlDecision("submit_finish",fields,as:WishMachineJob.self)
+    }
+    private func controlCommand(_ command: String, _ fields: [String: Any]) async throws -> Any {
+        guard readable else {throw WishMachineError.unavailable}
+        var fields = fields; fields["command"] = command
+        do {
+            let previousRevision = controlRevision
+            let receipt = try await controlRequest("wish_control_command",fields)
+            try applyControlReceipt(receipt)
+            if controlRevision != previousRevision {notifyChange()}
+            guard let result = receipt["result"] else {throw WishMachineError.unavailable}
+            return result
+        } catch PropTaskDaemonError.requestRejectedWith(let code) {
+            switch code {
+            case "wish_control_wrong_scope": throw WishMachineError.wrongScope
+            case "wish_control_unauthorized": throw WishMachineError.unauthorized
+            case "wish_control_conflicting_call": throw WishMachineError.conflictingCall
+            case "wish_control_placement_revoked": throw WishMachineError.placementRevoked
+            case "wish_control_invalid_request": throw PropGenerationError.invalidInput
+            case "wish_control_unknown_attachment": throw WishMachineError.unknownAttachment
+            case "wish_control_consumed_authorization": throw WishMachineError.consumedAuthorization
+            case "wish_control_image_limit": throw WishMachineError.imageLimitReached
+            case "wish_control_retry_unavailable": throw WishMachineError.retryUnavailable
+            case "wish_control_not_ready": throw WishMachineError.notReady
+            default:
+                readable = false; errorMessage = WishMachineError.unavailable.localizedDescription
+                throw WishMachineError.unavailable
+            }
+        } catch {
+            readable = false; errorMessage = WishMachineError.unavailable.localizedDescription
+            throw WishMachineError.unavailable
+        }
     }
 
+    private func controlRequest(_ method: String, _ fields: [String: Any]) async throws -> [String: Any] {
+        var params = fields
+        params["ownerID"] = controlOwnerID; params["hostSessionID"] = controlSessionID
+        params["expectedRevision"] = controlRevision
+        let data = try JSONSerialization.data(withJSONObject: params)
+        let response = try await controlCall(method, data)
+        guard let receipt = try JSONSerialization.jsonObject(with: response) as? [String: Any] else {
+            throw WishMachineError.unavailable
+        }
+        return receipt
+    }
+
+    private func applyControlReceipt(_ receipt: [String: Any]) throws {
+        guard let revision = receipt["revision"] as? Int, revision >= 0,
+              let value = receipt["archive"] else { throw WishMachineError.unavailable }
+        let archive = try Self.loadArchive(from: JSONSerialization.data(withJSONObject: value))
+        let views = try Self.controlDecode(ControlViews.self,from:receipt["views"])
+        controlRevision = revision
+        committedArchive = archive
+        installArchive(archive)
+        controlViews = views
+    }
+
+    private func installArchive(_ archive: Archive) {
+        // Observer-created tasks must queue as new requests, not inherit this mutation's lease.
+        WishMutationScope.$owner.withValue(nil) {
+        workingJobs = archive.jobs; authorizations = archive.authorizations; events = archive.events
+        imageRegistrations = archive.imageRegistrations ?? []; delegations = archive.delegations ?? []
+        webReferences = archive.webReferences ?? []; pendingDrafts = archive.pendingDrafts ?? []
+        unreadableJobs = archive.unreadableJobs ?? []
+        jobs = archive.jobs
+        }
+    }
+
+    private func notifyChange() {
+        WishMutationScope.$owner.withValue(nil) { onChange?() }
+    }
     /// Only public HTTPS on the standard port; credentials, other schemes and
     /// alternate ports are rejected before any download is attempted.
     private static func isPublicReferenceURL(_ url: URL) -> Bool {

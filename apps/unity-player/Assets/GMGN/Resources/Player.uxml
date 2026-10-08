@@ -1,66 +1,10 @@
 <ui:UXML xmlns:ui="UnityEngine.UIElements">
-  <ui:Style src="Player.uss" />
-  <ui:VisualElement class="shell" picking-mode="Ignore">
-    <ui:VisualElement class="header" picking-mode="Ignore">
-      <ui:Label name="status" text="正在连接音乐与角色…" class="status muted" picking-mode="Ignore" />
-      <ui:Button name="mode" text="播放器" tooltip="当前为音乐播放器；空间尚未迁移" class="mode" enabled="false" />
-    </ui:VisualElement>
-    <ui:VisualElement class="body" picking-mode="Ignore">
-      <ui:VisualElement class="lyrics" picking-mode="Ignore">
-        <ui:Label name="lyric" class="lyric" picking-mode="Ignore" />
-        <ui:Label name="translation" class="translation" picking-mode="Ignore" />
-      </ui:VisualElement>
-      <ui:VisualElement name="chatPanel" class="chat-column card hidden">
-        <ui:VisualElement class="chat-header row">
-          <ui:Label name="chatTitle" text="与角色聊天" class="subtitle" />
-          <ui:Button name="compactHistory" class="icon-button compact-only" />
-          <ui:Button name="closeChat" tooltip="收起聊天" class="icon-button" />
+    <ui:VisualElement class="shell">
+        <ui:VisualElement class="body">
+            <ui:VisualElement class="lyrics">
+                <ui:Label name="lyric" class="lyric" />
+                <ui:Label name="translation" class="translation" />
+            </ui:VisualElement>
         </ui:VisualElement>
-        <ui:Label name="emptyChat" text="可以聊音乐，也可以说说今天的事。" class="empty-chat muted" />
-        <ui:ScrollView name="messages" mode="Vertical" class="messages" />
-        <ui:VisualElement class="chat-composer">
-        <ui:TextField name="draft" multiline="true" class="draft" />
-        <ui:VisualElement class="composer-footer row">
-          <ui:VisualElement class="composer-spacer" />
-          <ui:Button name="chatVoice" class="icon-button" />
-          <ui:Button name="cancel" tooltip="停止回复" class="icon-button hidden" />
-          <ui:Button name="send" tooltip="发送消息" class="icon-button primary" />
-        </ui:VisualElement>
-        </ui:VisualElement>
-        <ui:Label name="chatVoiceStatus" class="hint muted chat-voice-status" />
-      </ui:VisualElement>
-      <ui:VisualElement class="player card">
-        <ui:VisualElement class="toolbar row">
-          <ui:Button name="toggleLyrics" tooltip="隐藏歌词" class="icon-button lyrics-toggle selected" />
-          <ui:Button name="chooseMusic" tooltip="打开本地音乐" class="icon-button" />
-          <ui:Button name="previous" tooltip="上一首尚未接入" class="icon-button" enabled="false" />
-          <ui:Button name="play" tooltip="播放" class="icon-button" />
-          <ui:Button name="next" tooltip="下一首" class="icon-button" />
-          <ui:VisualElement class="separator" />
-          <ui:Button name="chatToggle" tooltip="与角色聊天" class="icon-button" />
-          <ui:Button name="inbox" tooltip="通知尚未迁移" class="icon-button" enabled="false" />
-          <ui:Button name="props" tooltip="物件与摆放尚未迁移" class="icon-button" enabled="false" />
-          <ui:Button name="screen" tooltip="空间播放器尚未迁移" class="icon-button" enabled="false" />
-          <ui:VisualElement class="toolbar-spacer" />
-          <ui:Slider name="volume" tooltip="音量" low-value="0" high-value="1" value="0.8" class="volume" />
-          <ui:Button name="settings" text="设置" tooltip="打开外部统一设置" class="settings-button" enabled="false" />
-          <ui:Button name="fullscreen" tooltip="切换全屏" class="icon-button" />
-          <ui:Button name="compactWindow" class="icon-button" />
-          <ui:Button name="restoreWindow" class="icon-button restore-window" />
-        </ui:VisualElement>
-      </ui:VisualElement>
     </ui:VisualElement>
-    <ui:VisualElement class="livecam-controls">
-      <ui:Button name="livecamSpace" class="icon-button" />
-      <ui:Button name="livecamPlayer" class="icon-button" />
-      <ui:Button name="livecamChat" class="icon-button" />
-      <ui:Button name="livecamInbox" class="icon-button" />
-      <ui:Button name="livecamSettings" class="icon-button" />
-    </ui:VisualElement>
-    <ui:VisualElement name="livecamPlayerMenu" class="livecam-player-menu card hidden">
-      <ui:Button name="livecamPrevious" class="icon-button" />
-      <ui:Button name="livecamPlay" class="icon-button" />
-      <ui:Button name="livecamNext" class="icon-button" />
-    </ui:VisualElement>
-  </ui:VisualElement>
 </ui:UXML>

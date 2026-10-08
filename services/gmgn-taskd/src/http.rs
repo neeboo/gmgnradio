@@ -46,6 +46,8 @@ pub(crate) struct HttpService {
     token: Arc<str>,
     voices: VoiceMap,
     streams: Arc<Semaphore>,
+    #[cfg(test)]
+    test_tts_factory: Option<voice::TestTtsFactory>,
 }
 struct StreamGuard {
     task: AbortHandle,
@@ -134,12 +136,27 @@ fn client_id(request: &HttpRequest<Incoming>) -> Result<String> {
     Ok(id.to_string())
 }
 impl HttpService {
+    #[cfg(test)]
+    fn with_test_tts_factory(service: Service, token: String, factory: voice::TestTtsFactory) -> Self {
+        let mut http = Self::new(service, token);
+        http.test_tts_factory = Some(factory);
+        http
+    }
+    fn voice_connection(&self) -> voice::Connection {
+        #[cfg(test)]
+        if let Some(factory) = &self.test_tts_factory {
+            return voice::Connection::with_test_tts_factory(self.service.speech_delivery.clone(), factory.clone());
+        }
+        voice::Connection::with_delivery(self.service.speech_delivery.clone())
+    }
     pub(crate) fn new(service: Service, token: String) -> Self {
         Self {
             service,
             token: token.into(),
             voices: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Semaphore::new(64)),
+            #[cfg(test)]
+            test_tts_factory: None,
         }
     }
     async fn voice_reply(&self, request: Request, client: Option<String>) -> Result<Value> {
@@ -151,7 +168,7 @@ impl HttpService {
                 .get(&client)
                 .map(|entry| entry.connection.clone())
                 .ok_or("voice_session_not_found")?,
-            None => Arc::new(AsyncMutex::new(voice::Connection::default())),
+            None => Arc::new(AsyncMutex::new(self.voice_connection())),
         };
         let (writer, mut receiver) = daemon::response_queue(false);
         let operation = async {
@@ -190,7 +207,7 @@ impl HttpService {
             }
             let entry = VoiceEntry {
                 generation: uuid::Uuid::new_v4(),
-                connection: Arc::new(AsyncMutex::new(voice::Connection::default())),
+                connection: Arc::new(AsyncMutex::new(self.voice_connection())),
             };
             map.insert(client.clone(), entry.clone());
             Some((client, entry))
@@ -273,7 +290,17 @@ impl HttpService {
                 .iter()
                 .count()
                 == 1;
-        if !authorized {
+        let dsh_grant = if !authorized && request.method() == Method::POST
+            && request.uri().path() == "/rpc"
+            && request.headers().get_all(header::AUTHORIZATION).iter().count() == 1 {
+            match request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer ")) {
+                Some(token) if self.service.accepts_dsh_grant(token).await => Some((token.to_owned(), false)),
+                Some(token) if self.service.accepts_claude_grant(token).await => Some((token.to_owned(), true)),
+                _ => None,
+            }
+        } else { None };
+        if !authorized && dsh_grant.is_none() {
             return Ok(reject(StatusCode::UNAUTHORIZED, "http_unauthorized"));
         }
         if request.method() == Method::GET && request.uri().path() == "/health" {
@@ -391,6 +418,21 @@ impl HttpService {
             }
             Err(_) => return Ok(reject(StatusCode::REQUEST_TIMEOUT, "client_timeout")),
         };
+        if let Some((token, claude)) = dsh_grant {
+            let flat: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => return Ok(reject(StatusCode::BAD_REQUEST, "invalid_request")),
+            };
+            let result = if claude {
+                self.service.claude_host_call(&token, &flat).await
+            } else {
+                self.service.dsh_host_call(&token, &flat).await
+            };
+            return Ok(match result {
+                Ok(value) => response(StatusCode::OK, value),
+                Err(code) => reject(StatusCode::BAD_REQUEST, code),
+            });
+        }
         let envelope: Request = match serde_json::from_slice(&bytes) {
             Ok(request) => request,
             Err(_) => return Ok(reject(StatusCode::BAD_REQUEST, "invalid_request")),
@@ -501,6 +543,9 @@ mod tests {
         }
     }
     async fn server() -> Server {
+        server_with_tts(None).await
+    }
+    async fn server_with_tts(factory: Option<voice::TestTtsFactory>) -> Server {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -508,7 +553,10 @@ mod tests {
         crate::files::directory(&root).unwrap();
         let service = Service::new(Database::open(root.clone(), None).unwrap()).unwrap();
         let token = uuid::Uuid::new_v4().to_string();
-        let http = HttpService::new(service, token.clone());
+        let http = match factory {
+            Some(factory) => HttpService::with_test_tts_factory(service, token.clone(), factory),
+            None => HttpService::new(service, token.clone()),
+        };
         let serving = http.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -542,6 +590,261 @@ mod tests {
             .post(format!("{}{path}", server.base))
             .bearer_auth(&server.token)
             .json(&json!({"id":"test","method":method,"params":params}))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires explicitly compiled GMGN_TEST_SWIFT_CONSUMER; mock PCM only"]
+    async fn speech_delivery_http_actual_swift_pcm_fifo_stop_and_generation() {
+        // The test provider is a real loopback HTTP response, not invented SSE.
+        // Its PCM bytes pass through Connection/run_tts/DeliveryEmitter unchanged.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider_url = format!("http://{}/pcm", listener.local_addr().unwrap());
+        let provider = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service_fn(|request| async move {
+                        assert_eq!(request.uri().path(), "/pcm");
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(&[0, 0, 1, 0]))))
+                    })).await;
+                });
+            }
+        });
+        struct ProviderGuard(tokio::task::JoinHandle<()>);
+        impl Drop for ProviderGuard { fn drop(&mut self) { self.0.abort(); } }
+        let _provider = ProviderGuard(provider);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let factory: voice::TestTtsFactory = Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (sender, receiver) = mpsc::channel(2);
+            let url = provider_url.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(5)).build().unwrap();
+                let result = async {
+                    let mut response = client.get(url).send().await.map_err(|_| "voice_transport_error")?
+                        .error_for_status().map_err(|_| "voice_provider_error")?;
+                    let mut total = 0usize;
+                    while let Some(bytes) = response.chunk().await.map_err(|_| "voice_transport_error")? {
+                        total += bytes.len();
+                        if total > 8192 { return Err("voice_protocol_error"); }
+                        for chunk in bytes.chunks(4096) {
+                            sender.send(Ok(chunk.to_vec())).await.map_err(|_| "voice_session_not_found")?;
+                        }
+                    }
+                    if total != 4 { return Err("voice_protocol_error"); }
+                    Ok::<(), &'static str>(())
+                }.await;
+                if let Err(error) = result { let _ = sender.send(Err(error)).await; }
+                // Only successful HTTP EOF closes the source without an error.
+            });
+            receiver
+        });
+        let server = server_with_tts(Some(factory)).await;
+        let descriptor = server.root.join("speech-private.endpoint.json");
+        std::fs::write(&descriptor, serde_json::to_vec(&json!({"version":2,
+            "address":server.base.strip_prefix("http://").unwrap(),"token":server.token})).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&descriptor, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let binary = std::env::var_os("GMGN_TEST_SWIFT_CONSUMER").expect("compile private Swift consumer first");
+        let child = tokio::process::Command::new(binary).arg(&descriptor)
+            .kill_on_drop(true).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await
+            .expect("Swift private consumer timeout").unwrap();
+        assert!(output.status.success(), "stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PASS actual private Rust HTTP/SSE/SQLite"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // Independent durable readback, not a Swift-local outcome assertion.
+        let db = rusqlite::Connection::open(server.root.join("tasks.sqlite3")).unwrap();
+        let payload: String = db.query_row("SELECT payload FROM speech_delivery_lanes WHERE scope='swift-http'", [], |row| row.get(0)).unwrap();
+        let lane: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(lane["states"][0]["status"], "delivered");
+        assert_eq!(lane["states"][0]["playedFrames"], 2);
+        assert_eq!(lane["states"][2]["status"], "delivered");
+        assert_eq!(lane["states"][2]["playedFrames"], 2);
+        assert_eq!(lane["states"][1]["status"], "stopped");
+    }
+    async fn dsh_phase(server: &Server, params: &Value, phase: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response: Value = post(server, "/rpc", "agent_dsh_read", params.clone())
+                    .send().await.unwrap().json().await.unwrap();
+                let result = &response["result"];
+                if result["state"] == phase || result["pendingTools"].as_array()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool["phase"] == phase)) {
+                    return result.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    const MOCK_CLAUDE_MCP: &str = r#"#!/usr/bin/python3
+import json,sys,subprocess,os,signal
+# Failed assertions in the parent test still leave only a bounded fixture lifetime.
+signal.alarm(20)
+# This fixture consumes exactly the native whole-stdin/EOF protocol.
+prompt=json.loads(sys.stdin.read())
+argv=sys.argv[1:]
+assert argv[argv.index('--tools')+1]==''
+assert '--bare' in argv and '--strict-mcp-config' in argv
+assert '--no-session-persistence' in argv and '--resume' not in argv
+assert argv[argv.index('--permission-mode')+1]=='dontAsk'
+config=json.load(open(argv[argv.index('--mcp-config')+1]))
+native=config['mcpServers']['gmgn-resident-tools']
+grant=json.load(open(native['args'][native['args'].index('--grant')+1]))
+fd=os.open(prompt['auditPath'],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+with os.fdopen(fd,'w') as f: json.dump({'secret':grant['secret'],'round':grant['round']},f)
+adapter=subprocess.Popen([native['command']]+native['args'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+def request(id,method,params):
+ adapter.stdin.write(json.dumps({'jsonrpc':'2.0','id':id,'method':method,'params':params})+'\n');adapter.stdin.flush()
+ line=adapter.stdout.readline()
+ assert line, 'native adapter must reply'
+ reply=json.loads(line)
+ assert reply.get('id')==id and 'error' not in reply
+ return reply['result']
+try:
+ initialized=request(1,'initialize',{'protocolVersion':'2024-11-05','capabilities':{},'clientInfo':{'name':'private-fixture','version':'1'}})
+ assert 'tools' in initialized['capabilities']
+ adapter.stdin.write(json.dumps({'jsonrpc':'2.0','method':'notifications/initialized','params':{}})+'\n');adapter.stdin.flush()
+ catalog=request(2,'tools/list',{})
+ assert [t['name'] for t in catalog['tools']]==['gmgn_inspect_world']
+ result=request(3,'tools/call',{'name':'gmgn_inspect_world','arguments':{}})
+ assert result['isError'] is False
+ assert result['content'][0]['type']=='text'
+ assert json.loads(result['content'][0]['text'])=={'observed':True}
+ assert result['content'][1]['type']=='image' and result['content'][1]['mimeType']=='image/png'
+finally:
+ adapter.stdin.close()
+ adapter.wait(timeout=5)
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'done','session_id':'must-not-be-resumed'}),flush=True)
+"#;
+
+    #[cfg(unix)]
+    async fn claude_native_fixture(server: &Server) -> Value {
+        use std::os::unix::fs::PermissionsExt;
+        let adapter = std::env::var_os("GMGN_TEST_MCP_ADAPTER")
+            .map(PathBuf::from)
+            .expect("set GMGN_TEST_MCP_ADAPTER to the separately built native gmgn-mcpd");
+        assert!(adapter.is_absolute() && adapter.is_file());
+        let executable = server.root.join("private-mock-claude");
+        crate::files::publish(&executable, MOCK_CLAUDE_MCP.as_bytes()).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        server.http.service.db.call(|store| {
+            crate::agent_scheduler::request(&mut store.connection,"agent_loop_configure",&json!({"worldID":"w","residentScope":"s","hostSessionID":"h","hourlyLimit":6,"minimumWakeIntervalSeconds":1}))?;
+            store.connection.execute("INSERT INTO agent_loop_events(world,scope,event,payload,state,run,session) VALUES('w','s','event','{}','claimed','run','h')",[]).map_err(|_|"storage_unavailable")?;
+            Ok(())
+        }).await.unwrap();
+        json!({"worldID":"w","residentScope":"s","hostSessionID":"h","runID":"run","eventID":"event","executable":executable,"adapterExecutable":adapter,"hostEndpoint":format!("{}/rpc",server.base),"environment":{"ANTHROPIC_API_KEY":"fixture-explicit-never-real"},"input":serde_json::to_string(&json!({"auditPath":server.root.join("native-audit.json")})).unwrap(),"durableUserText":"inspect world","tools":[{"name":"inspect_world","description":"world","effect":"read","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}]})
+    }
+    #[cfg(unix)]
+    async fn claude_phase(server: &Server, params: &Value, phase: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10),async {
+            loop {
+                let response:Value=post(server,"/rpc","agent_claude_read",params.clone()).send().await.unwrap().json().await.unwrap();
+                assert!(response.get("error").is_none(),"Claude read must retain the trusted binding");
+                let result=&response["result"];
+                if result["state"]==phase || result["pendingTools"].as_array().is_some_and(|tools|tools.iter().any(|tool|tool["phase"]==phase)){return result.clone();}
+                assert!(!["failed","unknown"].iter().any(|state|result["state"]==*state),"native fixture failed before requested phase");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap()
+    }
+    #[cfg(unix)]
+    fn claude_fixture_token(server: &Server) -> String {
+        let audit:Value=serde_json::from_slice(&crate::files::read(&server.root.join("native-audit.json"),65536).unwrap()).unwrap();
+        audit["secret"].as_str().unwrap().to_owned()
+    }
+    #[cfg(unix)]
+    async fn assert_claude_grant_cannot_control(server: &Server, token: &str, params: &Value) {
+        let client=reqwest::Client::new();let flat=json!({"v":1,"callId":"attempt-main","name":"gmgn_inspect_world","arguments":{}});
+        assert_eq!(client.post(format!("{}/rpc",server.base)).bearer_auth(&server.token).json(&flat).send().await.unwrap().status(),StatusCode::BAD_REQUEST);
+        for method in ["agent_claude_read","agent_claude_cancel","agent_tool_begin","snapshot"] {
+            assert_eq!(client.post(format!("{}/rpc",server.base)).bearer_auth(token).json(&json!({"id":"forbidden-control","method":method,"params":params})).send().await.unwrap().status(),StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(client.get(format!("{}/health",server.base)).bearer_auth(token).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires explicitly built GMGN_TEST_MCP_ADAPTER; no real Claude or credentials"]
+    async fn claude_native_mcp_http_read_requires_authorization_and_bound_receipt() {
+        let server=server().await;let params=claude_native_fixture(&server).await;
+        let started:Value=post(&server,"/rpc","agent_claude_start",params.clone()).send().await.unwrap().json().await.unwrap();assert_eq!(started["result"]["started"],true);
+        let read=claude_phase(&server,&params,"authorize").await;let token=claude_fixture_token(&server);assert_claude_grant_cannot_control(&server,&token,&params).await;
+        let count=server.http.service.db.call(|store|store.connection.query_row("SELECT count(*) FROM agent_tool_calls",[],|r|r.get::<_,i64>(0)).map_err(|_|"storage_unavailable")).await.unwrap();assert_eq!(count,0,"even read must wait for host authorization");
+        for field in ["worldID","residentScope","hostSessionID","runID","eventID"] {let mut stale=params.clone();stale[field]=json!("stale");let rejected:Value=post(&server,"/rpc","agent_claude_read",stale).send().await.unwrap().json().await.unwrap();assert_eq!(rejected["error"]["code"],"agent_claude_stale_session");}
+        let mut approval=read["pendingTools"][0].clone();approval["decision"]=json!("approved");approval["operationID"]=json!("trusted-http-read-operation");
+        let approved:Value=post(&server,"/rpc","agent_claude_authorize",approval).send().await.unwrap().json().await.unwrap();assert!(approved.get("error").is_none());
+        let read=claude_phase(&server,&params,"execute").await;let mut receipt=read["pendingTools"][0].clone();receipt["status"]=json!("completed");receipt["output"]=json!({"observed":true});receipt["images"]=json!([{"mediaType":"image/png","base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII="}]);
+        let mut stale=receipt.clone();stale["round"]=json!("old-round");let rejected:Value=post(&server,"/rpc","agent_claude_tool_receipt",stale).send().await.unwrap().json().await.unwrap();assert_eq!(rejected["error"]["code"],"agent_claude_receipt_conflict");
+        let completed:Value=post(&server,"/rpc","agent_claude_tool_receipt",receipt).send().await.unwrap().json().await.unwrap();assert!(completed.get("error").is_none());
+        let done=claude_phase(&server,&params,"completed").await;assert_eq!(done["text"],"done");assert!(done.get("sessionID").is_none());
+        let record=server.http.service.db.call(|store|store.connection.query_row("SELECT world,scope,run,session,effect,state FROM agent_tool_calls WHERE operation='trusted-http-read-operation'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).map_err(|_|"storage_unavailable")).await.unwrap();assert_eq!(record,("w".into(),"s".into(),"run".into(),"h".into(),"read".into(),"finished".into()));
+        assert_eq!(reqwest::Client::new().post(format!("{}/rpc",server.base)).bearer_auth(token).json(&json!({"v":1,"callId":"late","name":"gmgn_inspect_world","arguments":{}})).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires explicitly built GMGN_TEST_MCP_ADAPTER; no real Claude or credentials"]
+    async fn claude_native_mcp_http_cancel_revokes_grant_before_any_read_dispatch() {
+        let server=server().await;let params=claude_native_fixture(&server).await;
+        let started:Value=post(&server,"/rpc","agent_claude_start",params.clone()).send().await.unwrap().json().await.unwrap();assert_eq!(started["result"]["started"],true);claude_phase(&server,&params,"authorize").await;let token=claude_fixture_token(&server);
+        let cancelled:Value=post(&server,"/rpc","agent_claude_cancel",params.clone()).send().await.unwrap().json().await.unwrap();assert_eq!(cancelled["result"]["cancelRequested"],true);claude_phase(&server,&params,"cancelled").await;
+        assert_eq!(reqwest::Client::new().post(format!("{}/rpc",server.base)).bearer_auth(token).json(&json!({"v":1,"callId":"late","name":"gmgn_inspect_world","arguments":{}})).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
+        let count=server.http.service.db.call(|store|store.connection.query_row("SELECT count(*) FROM agent_tool_calls",[],|r|r.get::<_,i64>(0)).map_err(|_|"storage_unavailable")).await.unwrap();assert_eq!(count,0);
+    }
+
+    #[tokio::test]
+    async fn dsh_flat_grant_is_scoped_revocable_and_not_main_auth() {
+        let server = server().await;
+        let params = crate::agent_dsh::tests::fixture(
+            server.http.service.db.clone(), server.root.clone(), false,
+        ).await;
+        let started: Value = post(&server, "/rpc", "agent_dsh_start", params.clone())
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(started["result"]["started"], true);
+        dsh_phase(&server, &params, "running").await;
+        let token = params["grantToken"].as_str().unwrap().to_owned();
+        let flat = json!({"v":1,"callId":"http-call","name":"gmgn_move","arguments":{"target":"chair"}});
+        let client = reqwest::Client::new();
+        assert_eq!(client.post(format!("{}/rpc", server.base)).bearer_auth("unknown")
+            .json(&flat).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(client.post(format!("{}/rpc", server.base)).bearer_auth(&server.token)
+            .json(&flat).send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(client.post(format!("{}/rpc", server.base)).bearer_auth(&token)
+            .json(&json!({"id":"escape","method":"snapshot","params":{}}))
+            .send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+        let url = format!("{}/rpc", server.base);
+        let call_token = token.clone();
+        let call_flat = flat.clone();
+        let pending = tokio::spawn(async move {
+            reqwest::Client::new().post(url).bearer_auth(call_token).json(&call_flat)
+                .send().await.unwrap().json::<Value>().await.unwrap()
+        });
+        let read = dsh_phase(&server, &params, "authorize").await;
+        let mut approval = read["pendingTools"][0].clone();
+        approval["decision"] = json!("approved");
+        approval["operationID"] = json!("http-operation");
+        let approved: Value = post(&server, "/rpc", "agent_dsh_authorize", approval)
+            .send().await.unwrap().json().await.unwrap();
+        assert!(approved.get("error").is_none());
+        let read = dsh_phase(&server, &params, "execute").await;
+        let mut receipt = read["pendingTools"][0].clone();
+        receipt["status"] = json!("completed");
+        receipt["output"] = json!({"moved":true});
+        let completed: Value = post(&server, "/rpc", "agent_dsh_tool_receipt", receipt)
+            .send().await.unwrap().json().await.unwrap();
+        assert!(completed.get("error").is_none());
+        assert_eq!(pending.await.unwrap()["data"]["moved"], true);
+        std::fs::write(server.root.join("finish"), b"ready").unwrap();
+        dsh_phase(&server, &params, "completed").await;
+        assert_eq!(client.post(format!("{}/rpc", server.base)).bearer_auth(&token)
+            .json(&flat).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
     async fn data(response: &mut reqwest::Response, buffer: &mut Vec<u8>) -> Value {
         tokio::time::timeout(Duration::from_secs(5), async {

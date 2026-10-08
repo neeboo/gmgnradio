@@ -62,7 +62,7 @@ final class ResidentLoopTools {
 
     var allowsSilentCompletion: Bool { loop.allowsSilentCompletion(runID: runID) }
 
-    func handle(name: String, argumentsJSON: Data) -> (data: Data, isError: Bool) {
+    func handle(name: String, argumentsJSON: Data) async -> (data: Data, isError: Bool) {
         guard loop.isCurrent(runID: runID) else { return failure("stale_resident_run", "本轮居民思考已结束或被停止") }
         guard Self.names.contains(name) else { return failure("tool_not_allowed", "未开放这个居民工具") }
         guard let arguments = (try? JSONSerialization.jsonObject(with: argumentsJSON)) as? [String: Any] else {
@@ -122,7 +122,7 @@ final class ResidentLoopTools {
                     advanceWhen: try planText("advance_when"),
                     adjustReason: try planText("adjust_reason"),
                     source: nil)
-                try loop.updateIntent(summary: summary, status: status, wakeAfterSeconds: delay,
+                try await loop.updateIntent(summary: summary, status: status, wakeAfterSeconds: delay,
                     runID: runID, resumePausedIntent: resumePausedIntent, plan: plan)
             } catch ControlFlow.invalidPlanField(let key) {
                 return failure("invalid_arguments", "\(key) 需为 500 字符以内的字符串")

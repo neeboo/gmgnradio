@@ -14,6 +14,7 @@ defer { try? FileManager.default.removeItem(at: work) }
 let harness = #"""
 import Foundation
 import Darwin
+import CryptoKit
 
 @MainActor var checks = 0
 @MainActor var failures = 0
@@ -86,6 +87,27 @@ final class TaskdProcess {
     }
     deinit { stop() }
 }
+// Scheduler transport executes on the client's detached worker. It consumes the
+// same private daemon envelope; no Swift scheduler policy or synthetic claim.
+func fixtureSchedulerCall(socketPath: String, method: String, params: Data) throws -> Data {
+    let requestID = UUID().uuidString
+    let tree = try JSONSerialization.jsonObject(with: params)
+    let body = try JSONSerialization.data(withJSONObject: ["id": requestID, "method": method, "params": tree])
+    let request = try fixtureRequest(socketPath: socketPath, path: "rpc", body: body)
+    let result = HTTPFixtureResult(), signal = DispatchSemaphore(value: 0)
+    let transport = TaskdHTTPTransport(streaming: false, receive: { result.set($0) }, completion: { error in
+        if let error { result.set(error) }; signal.signal()
+    })
+    transport.start(request)
+    guard signal.wait(timeout: .now() + 10) == .success else { transport.cancel(); throw FakeError.message("scheduler RPC timeout") }
+    if let error = result.failure { throw error }
+    guard let data = result.response,
+          let envelope = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          envelope["id"] as? String == requestID else { throw ResidentStateError.invalidResponse }
+    if let error = envelope["error"] as? [String: Any], let code = error["code"] as? String { throw ResidentStateError.daemon(code) }
+    guard let value = envelope["result"] else { throw ResidentStateError.invalidResponse }
+    return try JSONSerialization.data(withJSONObject: value)
+}
 @MainActor class TaskdTransport: ResidentStateTransport, @unchecked Sendable {
     struct Request: Encodable { let id: String; let method: String; let params: [String: ResidentStateJSON] }
     private struct Envelope: Decodable {
@@ -119,11 +141,14 @@ final class TaskdProcess {
     let inner: TaskdTransport
     var fail = false
     private(set) var calls: [(method: String, params: [String: ResidentStateJSON])] = []
+    private(set) var successfulDrains = 0
     init(inner: TaskdTransport) { self.inner = inner }
     func call(method: String, params: [String: ResidentStateJSON]) async throws -> [String: ResidentStateJSON] {
         calls.append((method, params))
         if fail { throw FakeError.message("transport down") }
-        return try await inner.call(method: method, params: params)
+        let result = try await inner.call(method: method, params: params)
+        if method == "resident_intent_drain", result["drained"] == .bool(true) { successfulDrains += 1 }
+        return result
     }
 }
 
@@ -151,13 +176,15 @@ final class TaskdProcess {
     let heldMethod: String
     private var parked: [(CheckedContinuation<[String: ResidentStateJSON], Error>, [String: ResidentStateJSON])] = []
     private(set) var parkedCount = 0
+    private(set) var calls: [String] = []
     init(inner: TaskdTransport, heldMethod: String) { self.inner = inner; self.heldMethod = heldMethod }
     func call(method: String, params: [String: ResidentStateJSON]) async throws -> [String: ResidentStateJSON] {
-        try await withCheckedThrowingContinuation { outer in
+        calls.append(method)
+        return try await withCheckedThrowingContinuation { outer in
             Task { @MainActor in
                 do {
                     let response = try await self.inner.call(method: method, params: params)
-                    if method == self.heldMethod {
+                    if method == self.heldMethod && response["drained"] != .bool(false) {
                         self.parked.append((outer, response))
                         self.parkedCount += 1
                     } else {
@@ -216,13 +243,38 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
     defer { daemon.stop() }
     func transport() -> TaskdTransport { TaskdTransport(socketPath: daemon.socketPath) }
     func rawClient() -> ResidentStateClient { ResidentStateClient(transport: transport()) }
+    func bindScheduler(_ loop: ResidentAgentLoop, _ scope: ResidentStateScope) {
+        let socketPath = daemon.socketPath
+        loop.bindRustScheduler(RustResidentSchedulerClient(worldID: scope.worldID, residentScope: scope.residentScope,
+            call: { method, params in try fixtureSchedulerCall(socketPath: socketPath, method: method, params: params) }),
+            availability: { true })
+    }
+    func setAuthorityPlan(_ scope: ResidentStateScope, _ intent: ResidentAgentLoop.Intent, paused: Bool = false) async throws {
+        let path = daemon.socketPath
+        let scheduler = RustResidentSchedulerClient(worldID: scope.worldID, residentScope: scope.residentScope,
+            call: { method, params in try fixtureSchedulerCall(socketPath: path, method: method, params: params) })
+        let messageID = UUID().uuidString, text = intent.summary
+        let hash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let refs: [String: Any] = [messageID: ["submissionID": messageID, "inputSHA256": hash, "imageReferences": [String]()]]
+        let now = Date()
+        guard let ticket = try await scheduler.claimHuman(eventID: "fixture.human.\(UUID().uuidString)", messageIDs: [messageID], inputRefs: refs,
+            configuration: ["hourlyLimit": 6, "minimumWakeIntervalSeconds": 1, "backgroundEnabled": false, "userStopped": false, "available": true],
+            nowMillis: Int64(now.timeIntervalSince1970 * 1000)) else { throw FakeError.message("real human claim was refused") }
+        let authority = RustResidentIntentClient(client: rawClient())
+        _ = try await authority.update(scope: scope, runID: ticket.runID, hostSessionID: ticket.hostSessionID,
+            summary: intent.summary, status: intent.status, wakeAfterSeconds: intent.wakeAt.map { max(1, $0.timeIntervalSince(now)) },
+            resumePausedIntent: true, plan: .init(goal: intent.goal, currentStep: intent.currentStep, nextSteps: intent.nextSteps,
+                advanceWhen: intent.advanceWhen, adjustReason: intent.adjustReason, source: intent.source), now: now)
+        try await scheduler.finish(ticket, outcome: "completed", invocationStarted: true)
+        if paused { _ = try await authority.pause(scope: scope, action: "userStop") }
+    }
 
     // ---- 1. 循环端到端：回合结束提交计划与事实；重启 daemon 后恢复为上下文。
     do {
         let s = ResidentStateScope(worldID: "w1", residentScope: "r1")
         var loopRef: ResidentAgentLoop!
         let loop = ResidentAgentLoop(run: { input in
-            try loopRef.updateIntent(summary: "去点唱机听歌", status: .active, wakeAfterSeconds: nil,
+            try await loopRef.updateIntent(summary: "去点唱机听歌", status: .active, wakeAfterSeconds: nil,
                 runID: input.runID,
                 plan: ResidentAgentLoop.IntentPlanRevision(
                     goal: "用点唱机放用户想听的歌", currentStep: "列出歌单并准备曲目",
@@ -230,23 +282,26 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
                     advanceWhen: "music.listen 完成或失败事件", adjustReason: "按用户委托",
                     source: .userDelegated))
             return "好的"
-        }, onFailure: { _ in })
+        }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         loopRef = loop
         let store = ResidentMemoryStore(client: rawClient())
         loop.bindMemory(store: store, scope: s)
+        bindScheduler(loop, s)
         loop.receiveEvent(event("evt-turn1", "activity_completed", "music.listen 已完成"))
         loop.receiveUserMessage("去点唱机听歌")
-        await waitUntil { !loopRef.snapshot.isRunning }
+        await waitUntil { !loopRef.snapshot.isRunning && loopRef.snapshot.pendingUserMessages.isEmpty }
         await waitUntil { (try? await rawClient().stateRead(scope: s, domain: .resident, key: "plan")) != nil }
+        await waitUntil { (try? await rawClient().eventRead(scope: s, after: 0, limit: 500))?.events.contains(where: { $0.id == "evt-turn1" }) == true }
         check(loop.snapshot.intent?.currentStep == "列出歌单并准备曲目", "plan fields recorded on the live loop")
         check(store.persistenceError == nil, "first save has no error")
 
         // 重启 daemon：新循环从统一状态恢复计划/暂停/事实，作为下一轮上下文。
         daemon.stop(); try daemon.start()
         var restoredRuns = 0
-        let restored = ResidentAgentLoop(run: { _ in restoredRuns += 1; return "" }, onFailure: { _ in })
+        let restored = ResidentAgentLoop(run: { _ in restoredRuns += 1; return "" }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         let store2 = ResidentMemoryStore(client: rawClient())
         restored.bindMemory(store: store2, scope: s)
+        bindScheduler(restored, s)
         await restored.restoreMemory()
         check(restored.snapshot.intent?.goal == "用点唱机放用户想听的歌"
             && restored.snapshot.intent?.currentStep == "列出歌单并准备曲目"
@@ -268,15 +323,12 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
     do {
         let s = ResidentStateScope(worldID: "w1b", residentScope: "r")
         let wakeAtDate = Date().addingTimeInterval(120)
-        let seed = try ResidentMemoryStore.stateValue(ResidentMemoryStore.PlanValue(
-            intent: ResidentAgentLoop.Intent(summary: "等待计划", status: .waitingEvent,
+        try await setAuthorityPlan(s, ResidentAgentLoop.Intent(summary: "等待计划", status: .waitingEvent,
                 wakeAt: wakeAtDate, goal: nil, currentStep: nil, nextSteps: nil,
-                advanceWhen: nil, lastOutcome: nil, adjustReason: nil, source: nil),
-            intentPausedByUser: false, groundedEvents: [event("evt-wake-\(UUID().uuidString)")]))
-        _ = try await rawClient().stateCommit(scope: s, domain: .resident, key: "plan",
-            expectedRevision: 0, requestID: "wake-seed-\(UUID().uuidString)", value: seed)
-        let restoredWake = ResidentAgentLoop(run: { _ in "" }, onFailure: { _ in })
+                advanceWhen: nil, lastOutcome: nil, adjustReason: nil, source: nil))
+        let restoredWake = ResidentAgentLoop(run: { _ in "" }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         restoredWake.bindMemory(store: ResidentMemoryStore(client: rawClient()), scope: s)
+        bindScheduler(restoredWake, s)
         await restoredWake.restoreMemory()
         if let wake = restoredWake.snapshot.intent?.wakeAt {
             check(abs(wake.timeIntervalSince(wakeAtDate)) < 2, "wakeAt Date survives the iso8601 round trip")
@@ -291,20 +343,22 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         let store = ResidentMemoryStore(client: rawClient())
         var loopRef: ResidentAgentLoop!
         let loop = ResidentAgentLoop(run: { input in
-            try loopRef.updateIntent(summary: "旧世界安排", status: .active, wakeAfterSeconds: nil,
+            try await loopRef.updateIntent(summary: "旧世界安排", status: .active, wakeAfterSeconds: nil,
                 runID: input.runID,
                 plan: ResidentAgentLoop.IntentPlanRevision(currentStep: "旧步骤", adjustReason: nil, source: .userDelegated))
             return ""
-        }, onFailure: { _ in })
+        }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         loopRef = loop
         loop.bindMemory(store: store, scope: sA)
+        bindScheduler(loop, sA)
         loop.receiveEvent(event("evt-A", "world.changed", "旧世界事实"))
         loop.receiveUserMessage("安排")
-        await waitUntil { !loopRef.snapshot.isRunning }
+        await waitUntil { !loopRef.snapshot.isRunning && loopRef.snapshot.pendingUserMessages.isEmpty }
         await waitUntil { (try? await rawClient().stateRead(scope: sA, domain: .resident, key: "plan")) != nil }
         check(loop.snapshot.intent?.summary == "旧世界安排", "scope A plan recorded")
         // 切到还没有任何记录的 scope B（空闲切换）。
         loop.bindMemory(store: store, scope: sB)
+        bindScheduler(loop, sB)
         check(loop.snapshot.intent == nil && loop.snapshot.recentEvents.isEmpty,
             "binding a new scope never inherits the old scope's plan or facts")
         await loop.restoreMemory()
@@ -313,6 +367,7 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
             "nil restore on the new scope leaves no inherited plan")
         // 切回 A：恢复 A 自己的计划。
         loop.bindMemory(store: store, scope: sA)
+        bindScheduler(loop, sA)
         await loop.restoreMemory()
         check(loop.snapshot.intent?.summary == "旧世界安排", "switching back restores scope A's own plan")
         loop.stop()
@@ -322,34 +377,35 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
     do {
         let s = ResidentStateScope(worldID: "w3", residentScope: "r")
         // 先直接落一个 P1 记录（revision 1）。
-        let seed = try ResidentMemoryStore.stateValue(ResidentMemoryStore.PlanValue(
-            intent: makeIntent("P1 计划", "P1-step"), intentPausedByUser: false,
-            groundedEvents: [event("evt-p1")]))
-        _ = try await rawClient().stateCommit(scope: s, domain: .resident, key: "plan",
-            expectedRevision: 0, requestID: "seed-p1", value: seed)
+        try await setAuthorityPlan(s, makeIntent("P1 计划", "P1-step"))
+        let authority = RustResidentIntentClient(client: rawClient())
+        try await authority.enqueue(scope: s, events: [event("evt-p1")])
+        while try await authority.drain(scope: s) { }
         // (a) 无竞争的普通 restore 会应用快照（正例）。
-        let plainLoop = ResidentAgentLoop(run: { _ in "" }, onFailure: { _ in })
+        let plainLoop = ResidentAgentLoop(run: { _ in "" }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         plainLoop.bindMemory(store: ResidentMemoryStore(client: rawClient()), scope: s)
+        bindScheduler(plainLoop, s)
         await plainLoop.restoreMemory()
         check(plainLoop.snapshot.intent?.summary == "P1 计划" && plainLoop.snapshot.intent?.currentStep == "P1-step",
             "an uncontended restore applies the durable snapshot")
-        plainLoop.stop()
+        plainLoop.invalidate()
         // (b) restore 在 await（state_read 应答挂起）期间，用户消息到达并完整执行：
         //     旧 P1 快照不得把内存里的 P2 新计划覆盖掉。
-        let gate = HoldTransport(inner: transport(), heldMethod: "state_read")
+        let gate = HoldTransport(inner: transport(), heldMethod: "resident_intent_restore")
         var raceRef: ResidentAgentLoop!
         let raceLoop = ResidentAgentLoop(run: { input in
-            try raceRef.updateIntent(summary: "P2 计划", status: .active, wakeAfterSeconds: nil,
+            try await raceRef.updateIntent(summary: "P2 计划", status: .active, wakeAfterSeconds: nil,
                 runID: input.runID,
                 plan: ResidentAgentLoop.IntentPlanRevision(currentStep: "P2-step", source: .userDelegated))
             return ""
-        }, onFailure: { _ in })
+        }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         raceRef = raceLoop
         raceLoop.bindMemory(store: ResidentMemoryStore(client: ResidentStateClient(transport: gate)), scope: s)
+        bindScheduler(raceLoop, s)
         let raceRestore = Task { await raceLoop.restoreMemory() }
         try? await Task.sleep(for: .milliseconds(150))   // restore 停在挂起的 state_read（读到的还是 P1）
         raceLoop.receiveUserMessage("改主意了")
-        await waitUntil { !raceRef.snapshot.isRunning }
+        await waitUntil { !raceRef.snapshot.isRunning && raceRef.snapshot.pendingUserMessages.isEmpty }
         gate.releaseAll()
         await raceRestore.value
         check(raceLoop.snapshot.intent?.summary == "P2 计划" && raceLoop.snapshot.intent?.currentStep == "P2-step",
@@ -363,6 +419,10 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         let s = ResidentStateScope(worldID: "w4", residentScope: "r")
         let gate = SwitchableTransport(inner: transport())
         let store = ResidentMemoryStore(client: ResidentStateClient(transport: gate))
+        // Original C plan/pause now comes from real human-claimed typed commands.
+        // Subsequent observation saves cannot authorize A/B/C replacement.
+        try await setAuthorityPlan(s, makeIntent("意图C", "step-C"), paused: true)
+        let beforeFacts = try await rawClient().stateRead(scope: s, domain: .resident, key: "plan")!.revision
         let ids = (0..<26).map { "union-\($0)-\(UUID().uuidString.prefix(6))" }
         // 同一同步回合里连续三次保存：A 带 e0..e23，B 带 e1..e24，C 带 e2..e25。
         store.save(scope: s, intent: makeIntent("意图A", "step-A"),
@@ -371,28 +431,28 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
             intentPausedByUser: false, groundedEvents: (1..<25).map { event(ids[$0]) })
         store.save(scope: s, intent: makeIntent("意图C", "step-C"),
             intentPausedByUser: true, groundedEvents: (2..<26).map { event(ids[$0]) })
-        await waitUntil { gate.calls.filter { $0.method == "state_commit" }.count >= 1 }
+        await waitUntil { gate.successfulDrains >= 1 }
         try? await Task.sleep(for: .milliseconds(150))
-        let commitCalls = gate.calls.filter { $0.method == "state_commit" }.count
+        let commitCalls = gate.successfulDrains
         check(commitCalls == 1, "same-turn saves coalesce into a single commit; observed \(commitCalls)")
         let reader = rawClient()
         let page = try await reader.eventRead(scope: s, after: 0, limit: 500)
         let durable = Set(page.events.map(\.id))
         check(durable.isSuperset(of: Set(ids)), "not-yet-durable facts from earlier saves are never trimmed by the 24-recent window")
         let record = try await reader.stateRead(scope: s, domain: .resident, key: "plan")
-        check(record?.revision == 1, "coalesced commit revision is 1")
+        check(record?.revision == beforeFacts + 1, "coalesced facts advance the actual authority revision once")
         // 状态取最新：C 的意图与暂停标记。
         let snapshot = try await store.restore(scope: s)
         check(snapshot?.intent?.summary == "意图C" && snapshot?.intentPausedByUser == true
             && snapshot?.intent?.currentStep == "step-C",
-            "merged state keeps the newest intent and pause marker")
+            "facts preserve the latest human-authorized intent and pause marker")
     }
 
     // ---- 5. A 的提交在途时，B/C 的同/跨作用域保存不丢（revision 按 scope 隔离）。
     do {
         let sX = ResidentStateScope(worldID: "w5", residentScope: "x")
         let sY = ResidentStateScope(worldID: "w5", residentScope: "y")
-        let gate = HoldTransport(inner: transport(), heldMethod: "state_commit")
+        let gate = HoldTransport(inner: transport(), heldMethod: "resident_intent_drain")
         let store = ResidentMemoryStore(client: ResidentStateClient(transport: gate))
         let x1 = "x1-\(UUID().uuidString)"; let x2 = "x2-\(UUID().uuidString)"
         let x3 = "x3-\(UUID().uuidString)"; let x4 = "x4-\(UUID().uuidString)"
@@ -433,16 +493,16 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         store.save(scope: s, intent: makeIntent("要保存的安排", "step"), intentPausedByUser: false,
             groundedEvents: [event("evt-fail-\(UUID().uuidString)")])
         await waitUntil { store.persistenceError != nil }
-        let afterFirst = gate.calls.filter { $0.method == "state_commit" }.count
+        let afterFirst = gate.calls.filter { $0.method == "resident_intent_enqueue" }.count
         check(afterFirst == 1, "a failed save attempts exactly one commit; observed \(afterFirst)")
         check(reported.contains { $0.contains("保存") }, "failure is visibly surfaced")
         try? await Task.sleep(for: .milliseconds(400))
-        let afterIdle = gate.calls.filter { $0.method == "state_commit" }.count
+        let afterIdle = gate.calls.filter { $0.method == "resident_intent_enqueue" }.count
         check(afterIdle == afterFirst, "no background retry spins while the daemon is down")
         // 第二次显式 save：带最新内存状态再试一次（仍失败，仍只一次）。
         store.save(scope: s, intent: makeIntent("要保存的安排", "step"), intentPausedByUser: false,
             groundedEvents: [event("evt-fail-\(UUID().uuidString)")])
-        await waitUntil { gate.calls.filter { $0.method == "state_commit" }.count == 2 }
+        await waitUntil { gate.calls.filter { $0.method == "resident_intent_enqueue" }.count == 2 }
         check(store.persistenceError != nil, "second explicit save retries once and keeps the visible failure")
         gate.fail = false
         store.save(scope: s, intent: makeIntent("要保存的安排", "step"), intentPausedByUser: false,
@@ -456,7 +516,7 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
     //         不推进 revision、不重复挂事件；内容变更才换新 ID 提交。
     do {
         let s = ResidentStateScope(worldID: "w7", residentScope: "r")
-        let drop = DropOnceTransport(inner: transport(), dropMethod: "state_commit")
+        let drop = DropOnceTransport(inner: transport(), dropMethod: "resident_intent_drain")
         drop.dropNext = true
         let store = ResidentMemoryStore(client: ResidentStateClient(transport: drop))
         let evt = event("evt-lost-\(UUID().uuidString)", "activity_completed", "完成")
@@ -475,6 +535,7 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         let events = try await rawClient().eventRead(scope: s, after: 0, limit: 500)
         check(events.events.filter { $0.id == evt.id }.count == 1, "the replayed commit does not append the event twice")
         // 内容变更 → 新 requestID → 正常提交推进 revision。
+        try await setAuthorityPlan(s, makeIntent("内容D", "d1"))
         store.save(scope: s, intent: makeIntent("内容D", "d1"), intentPausedByUser: false,
             groundedEvents: [evt])
         await waitUntil { (try? await rawClient().stateRead(scope: s, domain: .resident, key: "plan"))?.revision == 2 }
@@ -484,24 +545,31 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
     // ---- 8. CAS 冲突可见：不读新 revision 自动覆盖；显式 restore 后才重试。
     do {
         let s = ResidentStateScope(worldID: "w8", residentScope: "r")
-        // 独立写入者先落一个合法 plan 记录（revision 1）。
-        let other = try ResidentMemoryStore.stateValue(ResidentMemoryStore.PlanValue(
-            intent: makeIntent("他人计划", "other-step"), intentPausedByUser: false, groundedEvents: []))
-        _ = try await rawClient().stateCommit(scope: s, domain: .resident, key: "plan",
-            expectedRevision: 0, requestID: "other-1", value: other)
-        let gate = SwitchableTransport(inner: transport())
+        // Real typed human command establishes the plan. A private SQLite
+        // independent-writer race changes only its revision after enqueue;
+        // production HTTP writers are deliberately unable to overwrite it.
+        try await setAuthorityPlan(s, makeIntent("他人计划", "other-step"))
+        let gate = HoldTransport(inner: transport(), heldMethod: "resident_intent_enqueue")
         let store = ResidentMemoryStore(client: ResidentStateClient(transport: gate))
         store.save(scope: s, intent: makeIntent("我的计划", "my-step"), intentPausedByUser: false,
             groundedEvents: [event("evt-mine-\(UUID().uuidString)")])
+        await waitUntil { gate.parkedCount == 1 }
+        let independentWriter = Process()
+        independentWriter.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        independentWriter.arguments = [daemon.root + "/tasks.sqlite3",
+            "UPDATE resident_states SET revision=revision+1 WHERE world_id='w8' AND resident_scope='r' AND domain='resident' AND key='plan';"]
+        try independentWriter.run(); independentWriter.waitUntilExit()
+        guard independentWriter.terminationStatus == 0 else { throw FakeError.message("private independent writer failed") }
+        gate.releaseNext()
         await waitUntil { store.persistenceError != nil }
         check(store.persistenceError?.contains("revision_conflict") == true
             || store.persistenceError?.contains("冲突") == true,
             "a stale CAS is reported visibly as a conflict")
         let still = try await rawClient().stateRead(scope: s, domain: .resident, key: "plan")
-        check(still?.revision == 1 && still?.value["intent"]?.objectValue?["summary"]?.stringValue == "他人计划",
+        check(still?.revision == 2 && still?.value["intent"]?.objectValue?["summary"]?.stringValue == "他人计划",
             "the conflict never silently overwrites the other writer's record")
         try? await Task.sleep(for: .milliseconds(300))
-        check(gate.calls.filter { $0.method == "state_commit" }.count == 1,
+        check(gate.calls.filter { $0 == "resident_intent_drain" }.count == 1,
             "a CAS conflict stops the drain without automatic retries")
         // 显式 restore 刷新乐观 revision（返回他人记录，不自动覆盖）。
         let snapshot = try await store.restore(scope: s)
@@ -509,7 +577,10 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         // 下次显式 save 在正确 revision 上提交自己的最新状态。
         store.save(scope: s, intent: makeIntent("我的计划", "my-step"), intentPausedByUser: false,
             groundedEvents: [event("evt-mine2-\(UUID().uuidString)")])
-        await waitUntil { (try? await rawClient().stateRead(scope: s, domain: .resident, key: "plan"))?.revision == 2 }
+        await waitUntil { gate.parkedCount == 1 }
+        gate.releaseNext()
+        await waitUntil { (try? await rawClient().stateRead(scope: s, domain: .resident, key: "plan"))?.revision == 3 }
+        await waitUntil { store.persistenceError == nil }
         check(store.persistenceError == nil, "an explicit save after restore commits and clears the error")
     }
 
@@ -518,14 +589,15 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         let s = ResidentStateScope(worldID: "w9", residentScope: "r")
         var loopRef: ResidentAgentLoop!
         let loop = ResidentAgentLoop(run: { input in
-            try loopRef.updateIntent(summary: "整理书架", status: .active, wakeAfterSeconds: nil, runID: input.runID)
+            try await loopRef.updateIntent(summary: "整理书架", status: .active, wakeAfterSeconds: nil, runID: input.runID)
             return "好的"
-        }, onFailure: { _ in })
+        }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         loopRef = loop
         let store = ResidentMemoryStore(client: rawClient())
         loop.bindMemory(store: store, scope: s)
+        bindScheduler(loop, s)
         loop.receiveUserMessage("整理书架")
-        await waitUntil { !loopRef.snapshot.isRunning }
+        await waitUntil { !loopRef.snapshot.isRunning && loopRef.snapshot.pendingUserMessages.isEmpty }
         loop.stop()
         // 等 stop 的暂停标记真正落库（值里 intentPausedByUser == true）。
         await waitUntil {
@@ -534,9 +606,10 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         }
         daemon.stop(); try daemon.start()
         var runs = 0
-        let restored = ResidentAgentLoop(run: { _ in runs += 1; return "你好" }, onFailure: { _ in })
+        let restored = ResidentAgentLoop(run: { _ in runs += 1; return "你好" }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         let restoredStore = ResidentMemoryStore(client: rawClient())
         restored.bindMemory(store: restoredStore, scope: s)
+        bindScheduler(restored, s)
         await restored.restoreMemory()
         check(restored.snapshot.intentPausedByUser, "the pause marker survives a restart")
         restored.setBackgroundEnabled(true)
@@ -545,8 +618,9 @@ func makeIntent(_ summary: String, _ step: String, _ pausedWake: Bool = false) -
         check(restored.snapshot.isRunning == false && runs == 0,
             "a paused resident never starts old actions after a restart")
         var greetingRuns = 0
-        let greeting = ResidentAgentLoop(run: { _ in greetingRuns += 1; return "你好" }, onFailure: { _ in })
+        let greeting = ResidentAgentLoop(run: { _ in greetingRuns += 1; return "你好" }, onFailure: { error in print("FIXTURE LOOP FAILURE: \(error)") })
         greeting.bindMemory(store: ResidentMemoryStore(client: rawClient()), scope: s)
+        bindScheduler(greeting, s)
         await greeting.restoreMemory()
         greeting.receiveUserMessage("你好")
         await waitUntil { greetingRuns == 1 && !greeting.snapshot.isRunning }
@@ -581,6 +655,8 @@ let binary = work.appendingPathComponent("test")
 let compile = Process()
 compile.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
 compile.arguments = ["-j1", "-parse-as-library",
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/RustResidentIntentClient.swift").path,
+    root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Presence/RustResidentSchedulerClient.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentSteeringDelivery.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentAgentLoop.swift").path,
     root.appendingPathComponent("apps/macos/Sources/GMGNRadio/Agent/ResidentMemoryStore.swift").path,
@@ -590,6 +666,7 @@ compile.arguments = ["-j1", "-parse-as-library",
 try compile.run()
 compile.waitUntilExit()
 guard compile.terminationStatus == 0 else { exit(compile.terminationStatus) }
+if ProcessInfo.processInfo.environment["GMGN_FIXTURE_COMPILE_ONLY"] == "1" { print("PASS: resident memory consumer compiled (not run)"); exit(0) }
 let test = Process()
 test.executableURL = binary
 try test.run()

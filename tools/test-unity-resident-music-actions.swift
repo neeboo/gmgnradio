@@ -2,7 +2,10 @@ import Foundation
 
 // Protocol/context test doubles; the adapter under test is production source.
 typealias DJAgentRadioState = Int
-typealias DJAgentCurrentTrackSnapshot = Int
+struct DJAgentCurrentTrackSnapshot {
+    let id="42", isPlaying=true, playbackState="playing"
+    let programID:String?=nil, slotIndex:Int?=nil
+}
 typealias DJAgentMusicTrack = Int
 typealias DJAgentMusicPlaylistsPage = Int
 typealias DJAgentMusicPlaylistPage = Int
@@ -14,7 +17,7 @@ typealias SpatialWeather = Int
 typealias SpatialCameraCommandDirection = Int
 @MainActor protocol DJAgentRadioActions: AnyObject {
     func snapshot(takeoverEnabled: Bool) -> Int
-    func currentTrackSnapshot() -> Int?
+    func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot?
     func playProgramTrack(trackID: String?, slotIndex: Int?) async throws
     func playNextTrack() async throws
     func playPreviousTrack() async throws
@@ -35,16 +38,20 @@ typealias SpatialCameraCommandDirection = Int
 @MainActor final class UnityWorldSessionComposition {
     enum CompositionError: Error { case sessionClosed }
     var accepted = false, gates = 0
-    func performJukebox(_ action: @escaping @MainActor () async throws -> Void) async throws {
+    var operationKinds: [String] = []
+    func performJukebox(operation: Data, _ action: @escaping @MainActor () async throws -> Data) async throws {
+        let value = try JSONSerialization.jsonObject(with: operation) as! [String: Any]
+        operationKinds.append(value["kind"] as! String)
         gates += 1
         guard accepted else { throw CompositionError.sessionClosed }
-        try await action()
+        let facts = try JSONSerialization.jsonObject(with: await action()) as! [String: Any]
+        precondition(facts["hasSnapshot"] as? Bool == true && facts["isPlaying"] as? Bool == true)
     }
 }
 @MainActor final class Player: DJAgentRadioActions {
     var plays = 0, pauses = 0
     func snapshot(takeoverEnabled: Bool) -> Int { 42 }
-    func currentTrackSnapshot() -> Int? { 42 }
+    func currentTrackSnapshot() -> DJAgentCurrentTrackSnapshot? { .init() }
     func playProgramTrack(trackID: String?, slotIndex: Int?) async throws { plays += 1 }
     func playNextTrack() async throws { plays += 1 }
     func playPreviousTrack() async throws { plays += 1 }
@@ -74,12 +81,13 @@ typealias SpatialCameraCommandDirection = Int
         try await actions.pauseMusic(); precondition(player.pauses == 1 && world.gates == 1)
         let prepared = try await actions.prepareMusicTrack(playlistID: "p", trackID: "t")
         precondition(prepared == 42)
-        precondition(world.gates == 1 && actions.currentTrackSnapshot() == 42)
+        precondition(world.gates == 1 && actions.currentTrackSnapshot()?.id == "42")
         world.accepted = true
         try await actions.playProgramTrack(trackID: "t", slotIndex: nil)
         try await actions.playNextTrack(); try await actions.playPreviousTrack()
         try await actions.resumeMusic(); try await actions.activatePreparedProgram()
         precondition(player.plays == 5 && world.gates == 6)
+        precondition(world.operationKinds == ["resume_music", "play_program_track", "next_track", "previous_track", "resume_music", "activate_prepared_program"])
         print("Unity resident music gate delegation regression passed")
     }
 }

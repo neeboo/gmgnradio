@@ -23,55 +23,6 @@ enum PreparedMusicPlayback: Equatable, Sendable {
     case appleMusic(trackID: String)
 }
 
-enum ProgramDiscoveryQuery {
-    static func make(from instruction: String?) -> String? {
-        guard let instruction else {
-            return nil
-        }
-        let normalized = instruction
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else {
-            return nil
-        }
-        let lowercased = normalized.lowercased()
-        if lowercased.contains("city pop")
-            || lowercased.contains("citypop")
-            || normalized.contains("城市流行")
-            || normalized.contains("シティ・ポップ")
-        {
-            return "City Pop"
-        }
-
-        var query = normalized
-        let commandWords = [
-            "请给我",
-            "给我",
-            "帮我",
-            "重新",
-            "生成一个",
-            "生成一份",
-            "生成",
-            "做一个",
-            "做一份",
-            "做",
-            "编排",
-            "排一个",
-            "排一份",
-            "歌单",
-            "节目单",
-            "的",
-        ]
-        for word in commandWords {
-            query = query.replacingOccurrences(of: word, with: " ")
-        }
-        query = query
-            .trimmingCharacters(
-                in: .whitespacesAndNewlines
-                    .union(.punctuationCharacters)
-            )
-        return query.isEmpty ? normalized : query
-    }
-}
 
 @MainActor
 final class MusicRuntime {
@@ -84,7 +35,7 @@ final class MusicRuntime {
     private let appleMusic: AppleMusicSource
     private let cache: any MusicAssetCaching
     private let libraryIndex: any MusicLibraryIndexing
-    private let candidatePoolBuilder: CandidatePoolBuilder
+    private let programClient: RustMusicProgramClient
 
     init(
         netease: NeteaseMusicSource,
@@ -92,18 +43,20 @@ final class MusicRuntime {
         appleMusic: AppleMusicSource,
         cache: any MusicAssetCaching,
         libraryIndex: any MusicLibraryIndexing = InMemoryMusicLibraryIndex(),
-        candidatePoolBuilder: CandidatePoolBuilder = CandidatePoolBuilder()
+        programClient: RustMusicProgramClient? = nil
     ) {
         self.netease = netease
         self.qqMusic = qqMusic
         self.appleMusic = appleMusic
         self.cache = cache
         self.libraryIndex = libraryIndex
-        self.candidatePoolBuilder = candidatePoolBuilder
+        self.programClient = programClient ?? RustMusicProgramClient()
     }
 
-    static func live() -> MusicRuntime {
-        let sessions = LocalMusicProviderSessionStore()
+    static func live(cache: any MusicAssetCaching) -> MusicRuntime {
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/ai.gmgn.radio")
+        let sessions = RustMusicProviderSessionStore(authority: RustMusicAccountClient(applicationSupportBase: root),
+            legacyDirectory: root.appendingPathComponent("secrets/music-sessions"))
         return MusicRuntime(
             netease: NeteaseMusicSource(
                 sessions: sessions,
@@ -114,7 +67,7 @@ final class MusicRuntime {
                 client: QQMusicProviderClient()
             ),
             appleMusic: AppleMusicSource(),
-            cache: StreamingMusicCache()
+            cache: cache
         )
     }
 
@@ -276,6 +229,9 @@ final class MusicRuntime {
         return nil
     }
 
+    func dailyProgramBrief(instruction: String?) async throws -> ProgramBrief {
+        try await programClient.dailyBrief(instruction: instruction)
+    }
     func makeProgramPlan(
         brief: ProgramBrief,
         agent: any DJTrackRankingAgent
@@ -295,9 +251,8 @@ final class MusicRuntime {
             }
         }
 
-        let discoveryText = ProgramDiscoveryQuery.make(
-            from: brief.immediateUserInstruction
-        )
+        let discovery = try await programClient.discover(brief: brief)
+        let discoveryText = discovery.discoveryQuery
         logger.info(
             "后台找歌开始：query=\(discoveryText ?? brief.moodTags.joined(separator: " "), privacy: .public)"
         )
@@ -308,10 +263,7 @@ final class MusicRuntime {
                     moodTags: discoveryText == nil
                         ? brief.moodTags
                         : [],
-                    targetEnergy: brief.energyArc.isEmpty
-                        ? nil
-                        : brief.energyArc.reduce(0, +)
-                            / Double(brief.energyArc.count),
+                    targetEnergy: discovery.targetEnergy,
                     limit: 30
                 )
         ) {
@@ -325,21 +277,15 @@ final class MusicRuntime {
                 seenAt: Date()
             )
         }
-        let libraryCandidates = await programCandidates(for: brief)
-        var seenCandidateIDs = Set<String>()
-        let candidates = (discoveryCandidates + libraryCandidates)
-            .filter { candidate in
-                candidate.isPlayable
-                    && seenCandidateIDs.insert(candidate.id).inserted
-            }
-            .prefix(30)
+        let libraryCandidates = try await programCandidates(for: brief)
         logger.info(
-            "后台编排候选：discovery=\(discoveryCandidates.count)，library=\(libraryCandidates.count)，merged=\(candidates.count)"
+            "后台编排候选事实：discovery=\(discoveryCandidates.count)，library=\(libraryCandidates.count)"
         )
 
-        return try await AgentProgramPlanner(agent: agent).makePlan(
+        return try await AgentProgramPlanner(agent: agent, client: programClient).makePlan(
             brief: brief,
-            candidates: Array(candidates)
+            discoveryCandidates: discoveryCandidates,
+            libraryCandidates: libraryCandidates
         )
     }
 
@@ -402,9 +348,8 @@ final class MusicRuntime {
 
     func recordPlaybackCompleted(_ candidate: MusicCandidate) async {
         await libraryIndex.record(
-            .played(
+            .completed(
                 trackID: candidate.id,
-                completed: true,
                 at: Date()
             )
         )
@@ -412,22 +357,9 @@ final class MusicRuntime {
 
     private func programCandidates(
         for brief: ProgramBrief
-    ) async -> [MusicCandidate] {
+    ) async throws -> [MusicCandidate] {
         let knowledge = await libraryIndex.snapshot()
-        return candidatePoolBuilder.build(
-            from: knowledge,
-            request: CandidatePoolRequest(
-                moodTags: brief.moodTags,
-                targetEnergy: brief.energyArc.isEmpty
-                    ? nil
-                    : brief.energyArc.reduce(0, +)
-                        / Double(brief.energyArc.count),
-                excludedTrackIDs:
-                    brief.blockedTrackIDs
-                        .union(brief.recentlySkippedTrackIDs),
-                limit: 30
-            )
-        ).candidates
+        return try await programClient.candidates(brief: brief, knowledge: knowledge).candidates
     }
 }
 

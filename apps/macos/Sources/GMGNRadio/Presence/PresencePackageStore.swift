@@ -24,13 +24,16 @@ struct PresencePackageStore: Sendable {
 
     let rootURL: URL
     let builtInVRMs: [BuiltInVRMResource]
+    let selectionAuthority: RustPresenceSelectionClient
 
     init(
         rootURL: URL,
-        builtInVRMs: [BuiltInVRMResource]? = nil
+        builtInVRMs: [BuiltInVRMResource]? = nil,
+        selectionAuthority: RustPresenceSelectionClient? = nil
     ) {
         self.rootURL = rootURL.standardizedFileURL
         self.builtInVRMs = builtInVRMs ?? Self.bundledVRMs()
+        self.selectionAuthority = selectionAuthority ?? .forCatalogRoot(rootURL.deletingLastPathComponent())
     }
 
     static func liveStore(fileManager: FileManager = .default) throws -> PresencePackageStore {
@@ -189,39 +192,12 @@ struct PresencePackageStore: Sendable {
         )
     }
 
-    func activate(id: String, fileManager: FileManager = .default) throws {
-        try ensureRootExists(fileManager: fileManager)
-        guard try (
-            id == Self.builtInOrbID
-                || builtInVRMs.contains(where: { $0.id == id })
-                || installedPackageExists(id: id, fileManager: fileManager)
-        ) else {
-            throw PresencePackageError.packageNotFound
-        }
-        let data = try JSONEncoder().encode(Selection(activeID: id))
-        try data.write(to: selectionURL, options: .atomic)
+    func activateAsync(id: String) async throws { _ = try await selectionAuthority.event("select_avatar", id: id) }
+
+    func removeAsync(id: String) async throws {
+        try await selectionAuthority.remove(kind: "avatars", id: id, root: rootURL)
     }
 
-    func remove(id: String, fileManager: FileManager = .default) throws {
-        guard
-            id != Self.builtInOrbID,
-            !builtInVRMs.contains(where: { $0.id == id })
-        else {
-            throw PresencePackageError.cannotRemoveBuiltIn
-        }
-        let packageURL = rootURL.appending(path: id, directoryHint: .isDirectory)
-        guard fileManager.fileExists(atPath: packageURL.path) else {
-            throw PresencePackageError.packageNotFound
-        }
-        try fileManager.removeItem(at: packageURL)
-        if try readActiveID(fileManager: fileManager) == id {
-            try activate(id: Self.builtInOrbID, fileManager: fileManager)
-        }
-    }
-
-    private var selectionURL: URL {
-        rootURL.appending(path: ".selection.json")
-    }
 
     private func builtInOrbPackage(activeID: String) -> PresencePackage {
         PresencePackage(
@@ -286,24 +262,9 @@ struct PresencePackageStore: Sendable {
     }
 
     private func readActiveID(fileManager: FileManager) throws -> String {
-        guard fileManager.fileExists(atPath: selectionURL.path) else {
-            return defaultActiveID
-        }
-        let data = try Data(contentsOf: selectionURL)
-        let selected = try? JSONDecoder().decode(
-            Selection.self,
-            from: data
-        ).activeID
-        guard let selected else { return defaultActiveID }
-        if selected == "builtin.vrm.arisu-maid" {
-            return defaultActiveID
-        }
-        return selected
+        selectionAuthority.confirmed?.avatarID ?? Self.builtInOrbID
     }
 
-    private var defaultActiveID: String {
-        builtInVRMs.first?.id ?? Self.builtInOrbID
-    }
 
     private static func bundledVRMs(bundle: Bundle = .main) -> [BuiltInVRMResource] {
         []
@@ -695,10 +656,6 @@ struct PresencePackageStore: Sendable {
         let entry = String(modelURL.standardizedFileURL.path.dropFirst(rootPath.count))
         return (searchRoot, entry)
     }
-}
-
-private struct Selection: Codable {
-    let activeID: String
 }
 
 private extension PresenceEngine {

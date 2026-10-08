@@ -17,8 +17,7 @@ final class UnityInboxBridge {
 
     convenience init(root: URL, worldID: String? = nil, residentScope: String? = nil) {
         let taskRoot = root.appendingPathComponent("gmgn radio/TaskService", isDirectory: true)
-        let client = ResidentStateClient(transport: ResidentTaskDaemonStateTransport(client:
-            PropTaskDaemonClient(root: taskRoot, allowsLaunching: false)))
+        let client = RustInboxClient(root: taskRoot)
         let world = worldID ?? ProcessInfo.processInfo.environment["GMGN_UNITY_WORLD_ID"]
         let resident = residentScope ?? ProcessInfo.processInfo.environment["GMGN_UNITY_RESIDENT_SCOPE"]
         let scope = world.flatMap { world in resident.map { ResidentStateScope(worldID: world, residentScope: $0) } }
@@ -51,30 +50,10 @@ final class UnityInboxBridge {
         guard !pending else { return false }
         pending = true
         defer { pending = false }
-        let taskKey = "agent-message:" + id.uuidString
-        var durable = try await storage.restore(scope: scope) ?? []
-        if let existing = durable.first(where: { $0.taskKey == taskKey }) {
-            guard existing.title == title, existing.detail == detail else {
-                throw InboxFailure(code: "request_id_conflict", message: "同一消息标识已有不同内容。")
-            }
-        } else {
-            let now = Date()
-            let entry = ResidentSystemInboxEntry(taskKey: taskKey, lastEventID: id.uuidString,
-                kind: "agent_message", title: title, status: "pending", detail: detail,
-                terminal: false, isRead: false, readAt: nil, deliveredAt: now, updatedAt: now)
-            durable.append(entry)
-            try Task.checkCancellation()
-            guard !closed else { throw CancellationError() }
-            try await storage.persist(scope: scope, entries: durable, messages: [
-                ResidentStateFact(id: id.uuidString, kind: "system_inbox", payload: [
-                    "taskKey": .string(taskKey), "eventID": .string(id.uuidString)])])
-            durable = try await storage.restore(scope: scope) ?? []
-            guard durable.contains(where: { $0.taskKey == taskKey && $0.lastEventID == id.uuidString && $0.title == title && $0.detail == detail && $0.kind == "agent_message" && !$0.isRead }) else {
-                throw InboxFailure(code: "readback_not_confirmed", message: "通知保存尚未确认。")
-            }
-        }
+        let result = try await storage.post(scope: scope, id: id, title: title, detail: detail)
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
+        let durable = result.entries
         entries = durable; loaded = true; generation &+= 1
         response = ["version": 1, "status": "completed", "operation": "inbox.post"]
         return true
@@ -86,43 +65,10 @@ final class UnityInboxBridge {
         guard !closed, !pending, let scope else { return false }
         pending = true
         defer { pending = false }
-        var durable = try await storage.restore(scope: scope) ?? []
-        var proposed = durable
-        for delivery in deliveries {
-            if let index = proposed.firstIndex(where: { $0.taskKey == delivery.taskID }) {
-                let old = proposed[index]
-                guard old.lastEventID != delivery.eventID else { continue }
-                guard old.title != delivery.title || old.status != delivery.status || old.detail != delivery.detail || old.kind != delivery.kind || old.terminal != delivery.terminal else { continue }
-                proposed[index].lastEventID = delivery.eventID
-                proposed[index].kind = delivery.kind; proposed[index].title = delivery.title
-                proposed[index].status = delivery.status; proposed[index].detail = delivery.detail
-                proposed[index].terminal = delivery.terminal; proposed[index].isRead = false
-                proposed[index].readAt = nil; proposed[index].updatedAt = Date()
-            } else {
-                let now = Date()
-                proposed.append(.init(taskKey: delivery.taskID, lastEventID: delivery.eventID,
-                    kind: delivery.kind, title: delivery.title, status: delivery.status,
-                    detail: delivery.detail, terminal: delivery.terminal, isRead: false,
-                    readAt: nil, deliveredAt: now, updatedAt: now))
-            }
-        }
+        let durable: [ResidentSystemInboxEntry]
+        if deliveries.isEmpty { durable = try await storage.restore(scope: scope) ?? [] }
+        else { durable = try await storage.deliver(scope: scope, deliveries: deliveries).entries }
         try Task.checkCancellation()
-        guard !closed else { return false }
-        if proposed != durable {
-            try await storage.persist(scope: scope, entries: proposed)
-            durable = try await storage.restore(scope: scope) ?? []
-            guard proposed.allSatisfy({ expected in durable.contains { actual in
-                var normalized = expected
-                normalized.deliveredAt = actual.deliveredAt; normalized.updatedAt = actual.updatedAt
-                normalized.readAt = actual.readAt
-                let readTimeMatches = expected.readAt == nil ? actual.readAt == nil : actual.readAt.map { abs($0.timeIntervalSince(expected.readAt!)) < 0.000001 } == true
-                return normalized == actual && readTimeMatches &&
-                    abs(expected.deliveredAt.timeIntervalSince(actual.deliveredAt)) < 0.000001 &&
-                    abs(expected.updatedAt.timeIntervalSince(actual.updatedAt)) < 0.000001
-            } }) else {
-                throw InboxFailure(code: "readback_not_confirmed", message: "通知保存尚未确认。")
-            }
-        }
         guard !closed else { return false }
         entries = durable; loaded = true; generation &+= 1
         response = ["version": 1, "status": "completed", "operation": "inbox.deliver"]
@@ -182,19 +128,13 @@ final class UnityInboxBridge {
                     guard entries[index].lastEventID == expectedEvent else {
                         throw InboxFailure(code: "notification_changed", message: "这条通知已有新内容，请刷新后查看。")
                     }
-                    var proposed = entries
-                    if !proposed[index].isRead {
-                        proposed[index].isRead = true; proposed[index].readAt = Date()
-                        try Task.checkCancellation()
-                        guard !closed else { throw CancellationError() }
-                        try await storage.persist(scope: scope, entries: proposed)
-                    }
+                    let snapshot = try await storage.markRead(scope: scope, taskKey: taskKey, expectedEventID: expectedEvent)
                     try Task.checkCancellation()
-                    let durable = try await storage.restore(scope: scope) ?? []
-                    try Task.checkCancellation()
+                    guard !closed else { throw CancellationError() }
+                    let durable = snapshot.entries
                     guard let actual = durable.first(where: { $0.taskKey == taskKey }),
                           actual.lastEventID == expectedEvent, actual.isRead else {
-                        throw InboxFailure(code: "readback_not_confirmed", message: "已读状态尚未确认，未读提示已保留，请刷新后重试。")
+                        throw InboxFailure(code: "readback_not_confirmed", message: "已读状态尚未确认，请刷新后重试。")
                     }
                     // Concurrently delivered entries come from the readback,
                     // never from the optimistic proposed list.

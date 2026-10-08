@@ -93,6 +93,8 @@ final class OrbWindowController: NSWindowController, NSWindowDelegate {
             name: .orbAppearanceDidChange,
             object: defaults
         )
+        NotificationCenter.default.addObserver(self, selector: #selector(appearanceDidChange),
+            name: Notification.Name("gmgnProductSettingsConfirmed"), object: RustProductSettingsClient.shared)
         startInteractionTracking(panel: panel)
     }
 

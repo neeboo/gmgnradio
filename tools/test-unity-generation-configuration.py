@@ -1,64 +1,71 @@
 #!/usr/bin/env python3
-"""Real configuration persistence + production consumer, synthetic credentials only."""
+"""Production client/consumer over private taskd HTTP; no provider/UI/audio."""
+import argparse
+import json
+import os
 from pathlib import Path
+import signal
+import sqlite3
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
-configuration = (root/'apps/macos/Sources/GMGNRadio/Presence/PropGenerationConfiguration.swift').read_text()
-bridge = (root/'apps/macos/UnityHost/UnityGenerationConfigurationBridge.swift').read_text()
-stub = r'''
-import Foundation
-enum PropGenerationError: Error { case invalidEndpoint, missingToken }
-struct PropGenerationClient {
-    let endpoint: URL
-    init(endpoint: URL, token: String) throws {
-        guard ["http","https"].contains(endpoint.scheme), endpoint.host != nil else { throw PropGenerationError.invalidEndpoint }
-        guard !token.isEmpty else { throw PropGenerationError.missingToken }; self.endpoint = endpoint
-    }
-    func health() async throws -> Bool { true }
-}
-@MainActor final class PropGenerationStore {
-    var errorMessage: String?
-    var calls = 0
-    var endpoint: URL?
-    func configure(endpoint: URL, token: String) throws { calls += 1; self.endpoint = endpoint }
-    func clearConfiguration() { endpoint = nil }
-}
-'''
-harness = r'''
-@main struct Tests {
-    @MainActor static func main() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let legacyURL = dir.appendingPathComponent("old/secrets.json")
-        let currentURL = dir.appendingPathComponent("new/secrets.json")
-        let old = PropGenerationConfigurationStore(fileURL:legacyURL)
-        try old.save(try PropGenerationConfiguration(endpoint:URL(string:"http://127.0.0.1:8191")!,token:"synthetic-test-token"))
-        let store = PropGenerationStore()
-        let b = UnityGenerationConfigurationBridge(store:store,fileURL:currentURL,readableLegacyFileURL:legacyURL)
-        assert(store.calls == 1 && store.endpoint != nil)
-        assert(!FileManager.default.fileExists(atPath:currentURL.path))
-        assert(b.snapshot["token"] == nil)
-        assert(b.settingsCommand(["op":"generation.save","endpoint":"http://127.0.0.1:8192"]))
-        assert(store.calls == 1 && b.snapshot["hasError"] as? Bool == true)
-        assert(b.settingsCommand(["op":"generation.save","endpoint":"http://127.0.0.1:8191"]))
-        assert(store.calls == 2 && FileManager.default.fileExists(atPath:currentURL.path))
-        let saved = try PropGenerationConfigurationStore(fileURL:currentURL).load()!
-        let original = try old.load(); assert(saved == original)
-        assert(b.settingsCommand(["op":"generation.save","endpoint":"http://127.0.0.1:8192","token":"synthetic-new-token"]))
-        assert(store.calls == 3 && store.endpoint!.port == 8192)
-        b.close(); assert(!b.settingsCommand(["op":"generation.load"]))
-        try Data("bad-json".utf8).write(to:currentURL)
-        let failed = UnityGenerationConfigurationBridge(store:store,fileURL:currentURL,readableLegacyFileURL:legacyURL)
-        assert(failed.snapshot["configured"] as? Bool == false && store.endpoint == nil)
-        let corrupt = try Data(contentsOf:currentURL); assert(corrupt == Data("bad-json".utf8))
-        print("PASS: generation consumer load/save, no implicit credential copy, endpoint/key binding, corrupt current rejects legacy, close")
-    }
-}
-'''
-with tempfile.TemporaryDirectory(prefix='gmgn-generation-config-test-') as tmp:
-    source = Path(tmp)/'Tests.swift'
-    source.write_text(stub+configuration+bridge+harness)
-    binary = Path(tmp)/'test'
-    subprocess.run(['swiftc','-parse-as-library',str(source),'-o',str(binary)],check=True)
-    subprocess.run([str(binary)],check=True)
+import time
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--run', action='store_true')
+    parser.add_argument('--daemon', type=Path)
+    args=parser.parse_args()
+    if args.run and (args.daemon is None or not args.daemon.is_absolute()): parser.error('explicit absolute --daemon required')
+    repo=Path(__file__).resolve().parents[1]
+    source=repo/'apps/macos/Sources/GMGNRadio/Presence'
+    with tempfile.TemporaryDirectory(prefix='gmgn-generation-authority-') as directory:
+        parent=Path(directory).resolve(); binary=parent/'consumer'; children=[]
+        subprocess.run(['swiftc','-j1','-swift-version','6','-parse-as-library',
+            str(source/'TaskdHTTPTransport.swift'),str(repo/'tools/fixtures/PrivateAttachmentAuthority.swift'),
+            str(source/'PropGenerationClient.swift'),str(source/'PropGenerationConfiguration.swift'),
+            str(source/'RustGenerationConfigurationClient.swift'),
+            str(repo/'apps/macos/UnityHost/UnityGenerationConfigurationBridge.swift'),
+            str(repo/'tools/test-rust-generation-configuration-client.swift'),'-o',str(binary)],check=True)
+        if not args.run:
+            print('PASS actual generation authority client/Unity consumer compile; runtime not run'); return
+        with (parent/'daemon.log').open('w') as log:
+            def start(root):
+                endpoint=root/'taskd.endpoint.json'; endpoint.unlink(missing_ok=True)
+                child=subprocess.Popen([str(args.daemon),'--root',str(root),'--endpoint-file',str(endpoint),'--concurrency','1'],stdout=log,stderr=log,start_new_session=True)
+                children.append(child); print(f'PRIVATE PID/PGID={child.pid}',flush=True)
+                for _ in range(1000):
+                    assert child.poll() is None
+                    if endpoint.exists(): return child,endpoint
+                    time.sleep(.02)
+                raise AssertionError('private daemon readiness')
+            def stop(child):
+                if child.poll() is None:
+                    os.killpg(child.pid,signal.SIGTERM)
+                    try: child.wait(timeout=5)
+                    except subprocess.TimeoutExpired: os.killpg(child.pid,signal.SIGKILL);child.wait(timeout=5)
+                for check in (lambda:os.kill(child.pid,0),lambda:os.killpg(child.pid,0)):
+                    try: check();raise AssertionError('private child survived')
+                    except ProcessLookupError: pass
+                print(f'REAPED PID/PGID={child.pid} exit={child.returncode}',flush=True)
+            try:
+                for mode in ('seed','corrupt'):
+                    case=parent/mode;case.mkdir(mode=0o700); root=case/'TaskService';root.mkdir(mode=0o700)
+                    child,endpoint=start(root)
+                    subprocess.run([str(binary),str(endpoint),str(root),mode],check=True)
+                    with sqlite3.connect(root/'tasks.sqlite3') as db:
+                        state=db.execute('SELECT revision,endpoint,secret_ref,imported FROM generation_configuration').fetchone()
+                        requests=db.execute('SELECT request,digest,response FROM generation_configuration_requests').fetchall()
+                        assert state[3]==1 and state[1]=='http://127.0.0.1:8192'
+                        assert all('synthetic-' not in str(row) for row in requests)
+                    stop(child);child,endpoint=start(root)
+                    subprocess.run([str(binary),str(endpoint),str(root),'reopen'],check=True)
+                    with sqlite3.connect(root/'tasks.sqlite3') as db:
+                        assert db.execute('SELECT revision,endpoint,secret_ref,imported FROM generation_configuration').fetchone()==state
+                        assert db.execute('SELECT count(*) FROM generation_configuration_requests').fetchone()[0]==len(requests)
+                    stop(child)
+                    print(f'PASS {mode} SQLite metadata/private-secret/restart',flush=True)
+            finally:
+                for child in children:
+                    if child.poll() is None: stop(child)
+        print('PASS all owned children reaped; private root removed on exit')
+if __name__=='__main__': main()

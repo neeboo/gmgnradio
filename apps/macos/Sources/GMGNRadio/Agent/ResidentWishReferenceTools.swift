@@ -35,18 +35,7 @@ final class ResidentWishReferenceTools {
         let sourcePageURL: String
     }
 
-    private struct Registration: Sendable {
-        let imageURL: URL
-        let displayName: String
-        let attachmentID: UUID
-    }
 
-    /// One shared same-URL download. The token lets a finishing caller clear only the
-    /// flight it awaited, so a later call that already started a replacement keeps its own.
-    private struct Flight {
-        let token: UUID
-        let task: Task<Registration, Error>
-    }
 
     private enum ReferenceError: LocalizedError {
         case stale, invalidImage, unauthorized, callConflict
@@ -172,13 +161,7 @@ final class ResidentWishReferenceTools {
     private let fetcher: Fetcher
     private let directory: URL
     private let fileManager: FileManager
-    private var calls: [String: Registration] = [:]
-    private var registeredByURL: [URL: Registration] = [:]
-    private var inFlight: [URL: Flight] = [:]
-    /// 已知连不上时的冷却：连着撞墙没有意义（真机 2026-10-01 20:49–20:50 一个回合里
-    /// 撞了 3 次、每次 10 秒），但冷却**必须自愈**：到点自动失效，一旦成功立刻清掉。
-    /// 这不是放宽判据 —— 它只决定"要不要再发一次请求"，判据一条都没动。
-    private var cooldown: (fact: WishReferenceDiagnosis.Fact, until: Date)?
+    private let referenceClient: RustWishReferenceClient
     static let cooldownInterval: TimeInterval = 30
     /// 上一次送上屏的那句话。状态**变化**才再上屏一次，避免每个失败都刷一条。
     private var lastReportedScreen: String?
@@ -186,7 +169,8 @@ final class ResidentWishReferenceTools {
 
     init(coordinator: WishMachineCoordinator, authorizationID: UUID?, worldID: String, residentScope: String,
          isCurrent: @escaping @MainActor () -> Bool, fetcher: Fetcher = .live,
-         directory: URL? = nil, fileManager: FileManager = .default, now: @escaping () -> Date = Date.init) {
+         directory: URL? = nil, fileManager: FileManager = .default, now: @escaping () -> Date = Date.init,
+         referenceClient: RustWishReferenceClient? = nil) {
         self.coordinator = coordinator
         self.authorizationID = authorizationID
         self.worldID = worldID
@@ -197,6 +181,7 @@ final class ResidentWishReferenceTools {
             .appendingPathComponent("gmgn radio/ResidentWishReferences", isDirectory: true)
         self.fileManager = fileManager
         self.now = now
+        self.referenceClient = referenceClient ?? RustWishReferenceClient()
     }
 
     var tools: [ResidentWorldToolSession.AdditionalTool] {
@@ -260,195 +245,139 @@ final class ResidentWishReferenceTools {
 
     // MARK: Search
 
+    private func authority(callID: String) throws -> ResidentWorldToolSession.RustDispatchAuthority {
+        guard let claim = ResidentWorldToolSession.rustDispatchAuthority,
+              claim.callID == callID, claim.worldID == worldID, claim.residentScope == residentScope else {
+            throw RustWishReferenceClient.ClientError.missingClaim
+        }
+        return claim
+    }
+
     private func search(callID: String, data: Data) async -> RealtimeDJToolResult {
         guard !Task.isCancelled, isCurrent() else {
             return failure(callID, "stale_wish_reference_session", "本轮空间操作已停止。")
         }
-        guard let arguments = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              Self.validateSearch(arguments), let query = (arguments["query"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              let url = Self.searchURL(query: query) else {
-            return failure(callID, "invalid_arguments", "参考图搜索参数不符合当前契约。")
-        }
-        // 冷却期内不再撞墙，但回执必须说清"这一次没有发起搜索"，而不是假装搜过。
-        if let cooling = coolingDownSearchFact() {
-            WishReferenceLog.cooldownSkipped(code: cooling.code, reason: cooling.reason)
-            return failure(callID, cooling.code, cooling.message)
-        }
-        let response: Fetcher.Response
         do {
-            response = try await fetcher.fetchPublicData(url, Self.maximumResponseBytes)
+            let claim = try authority(callID: callID)
+            guard let arguments = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return failure(callID, "invalid_arguments", "参考图搜索参数不符合当前契约。")
+            }
+            let result = try await referenceClient.request("wish_reference_search", authority: claim, fields: arguments)
+            try Task.checkCancellation()
+            guard isCurrent() else { throw ReferenceError.stale }
+            return renderAuthorityResult(callID, result, operation: .search)
         } catch {
-            return report(callID, .search, WishReferenceDiagnosis.transportFailure(.search, error: error))
+            return authorityFailure(callID, error: error, operation: .search)
         }
-        guard !Task.isCancelled, isCurrent() else {
-            return failure(callID, "stale_wish_reference_session", "会话已停止，搜索结果未采用。")
-        }
-        guard Self.isJSONMIMEType(response.mimeType) else {
-            return report(callID, .search, WishReferenceDiagnosis.searchNotJSON(mimeType: response.mimeType))
-        }
-        guard let results = Self.parseSearchResults(response.data) else {
-            // 服务端自报的结构化错误把它的 code/info 逐字带出来；判据不变（仍是失败）。
-            let fact = Self.searchAPIErrorFact(response.data) ?? WishReferenceDiagnosis.searchUnparseable()
-            return report(callID, .search, fact)
-        }
-        // 服务真的答了：清掉冷却，屏上那条"不可用"撤掉。
-        markReachable()
-        let payload: [String: Any] = [
-            "ok": true, "query": query, "total": results.count,
-            "results": results.map { result -> [String: Any] in
-                ["title": result.title, "image_url": result.imageURL,
-                 "source_page_url": result.sourcePageURL, "source": "wikimedia_commons",
-                 "license_verified": false]
-            },
-            "license_notice": "图片来自公开网页，版权与许可未核验；仅供本机个人测试，不得声称已核验授权。",
-            // 结果为空 ≠ 失败：这是服务如实返回了空列表，`ok` 仍然是 true，没有失败码。
-            "message": results.isEmpty
-                ? WishReferenceDiagnosis.emptyResultsMessage
-                : "请选择其中一张真实直链，再用 register_wish_reference_image 登记。",
-        ]
-        if results.isEmpty {
-            WishReferenceLog.emptyResults(query: query)
-            // 空结果也上屏，但走**普通信息**这一档：它绝不是失败。
-            WishReferenceAvailabilityNotice.postInfo(WishReferenceDiagnosis.emptyResultsScreenText)
-        }
-        return success(callID, payload)
     }
-
-    // MARK: Register
 
     private func register(callID: String, data: Data) async -> RealtimeDJToolResult {
         guard !Task.isCancelled, isCurrent() else {
             return failure(callID, "stale_wish_reference_session", "本轮空间操作已停止。")
         }
-        guard let arguments = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              Self.validateRegister(arguments), let rawURL = arguments["image_url"] as? String,
-              let imageURL = Self.publicImageURL(rawURL),
-              let displayName = arguments["display_name"] as? String else {
-            return failure(callID, "invalid_arguments", "参考图登记参数不符合当前契约。")
-        }
-        guard let authorizationID else {
-            return failure(callID, ReferenceError.unauthorized.code, ReferenceError.unauthorized.localizedDescription)
-        }
-        if let existing = calls[callID] {
-            guard existing.imageURL == imageURL, existing.displayName == displayName else {
-                return failure(callID, ReferenceError.callConflict.code, ReferenceError.callConflict.localizedDescription)
-            }
-            return registrationPayload(callID, existing)
-        }
-        if let existing = registeredByURL[imageURL] {
-            calls[callID] = existing
-            return registrationPayload(callID, existing)
-        }
-        let flight: Flight
-        if let running = inFlight[imageURL] {
-            flight = running
-        } else {
-            let created = Flight(token: UUID(), task: Task { @MainActor [self] in
-                try await downloadAndRegister(imageURL: imageURL, displayName: displayName, authorizationID: authorizationID)
-            })
-            inFlight[imageURL] = created
-            flight = created
-        }
-        let task = flight.task
         do {
-            // Cancelling this call must cancel the shared download it awaits. The flight
-            // is unstructured, so without this propagation it would finish and persist a
-            // registration after the turn was already stopped.
-            let registration = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
+            let claim = try authority(callID: callID)
+            guard let authorizationID,
+                  var arguments = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw ReferenceError.unauthorized
             }
-            // A late completion must not become a durable call mapping once this turn was
-            // cancelled or its world/scope changed.
-            try Task.checkCancellation()
-            guard isCurrent() else { throw ReferenceError.stale }
-            if inFlight[imageURL]?.token == flight.token { inFlight[imageURL] = nil }
-            calls[callID] = registration
-            registeredByURL[imageURL] = registration
-            markReachable()
-            return registrationPayload(callID, registration)
+            arguments["authorizationID"] = authorizationID.uuidString
+            var result = try await referenceClient.request("wish_reference_prepare", authority: claim, fields: arguments)
+            // Rust owns the durable URL flight. Another call observes it without
+            // creating a second native download or a second attachment.
+            let deadline = Date().addingTimeInterval(20)
+            while result["action"] as? String == "wait" {
+                try Task.checkCancellation()
+                guard isCurrent(), Date() < deadline else { throw ReferenceError.stale }
+                try await Task.sleep(for: .milliseconds(100))
+                result = try await referenceClient.request("wish_reference_prepare", authority: claim, fields: arguments)
+            }
+            if result["action"] as? String == "download" {
+                guard let rawURL = result["image_url"] as? String, let imageURL = URL(string: rawURL),
+                      let displayName = result["display_name"] as? String,
+                      let rawID = result["attachment_id"] as? String, let attachmentID = UUID(uuidString: rawID),
+                      let token = result["token"] as? String else { throw RustWishReferenceClient.ClientError.invalidProtocol }
+                arguments["token"] = token
+                do {
+                    try await downloadLeaf(imageURL: imageURL, displayName: displayName,
+                        attachmentID: attachmentID, authorizationID: authorizationID)
+                    arguments["success"] = true
+                } catch {
+                    let fact = WishReferenceDiagnosis.transportFailure(.registration, error: error)
+                    arguments["success"] = false
+                    arguments["code"] = error is ReferenceError || error is WishMachineError ? Self.code(for: error) : fact.code
+                    arguments["reason"] = WishReferenceDiagnosis.preservedReason(error)
+                    arguments["isConnectivity"] = fact.isConnectivity
+                }
+                try Task.checkCancellation()
+                guard isCurrent() else { throw ReferenceError.stale }
+                result = try await referenceClient.request("wish_reference_complete", authority: claim, fields: arguments)
+            }
+            return renderAuthorityResult(callID, result, operation: .registration)
         } catch {
-            // Only clear the flight this call awaited; a replacement started meanwhile stays.
-            if inFlight[imageURL]?.token == flight.token { inFlight[imageURL] = nil }
-            // 领域错误（授权、冲突、额度…）保持它们自己的名字；其余都是传输失败，
-            // 必须走具名诊断 —— `error.localizedDescription` 会把
-            // `transportFailure("curl-exit-28")` 压成 `error 17`，真机上就是这么丢掉原因的。
-            if error is ReferenceError || error is WishMachineError {
-                return failure(callID, Self.code(for: error), error.localizedDescription)
-            }
-            return report(callID, .registration, WishReferenceDiagnosis.transportFailure(.registration, error: error))
+            return authorityFailure(callID, error: error, operation: .registration)
         }
     }
 
-    // MARK: Named failure reporting: receipt + log + screen
+    private func authorityFailure(_ callID: String, error: Error,
+                                  operation: WishReferenceDiagnosis.Operation) -> RealtimeDJToolResult {
+        let fact = WishReferenceDiagnosis.transportFailure(operation, error: error)
+        let code: String
+        if let authorityError = error as? WorldAuthorityError, case let .daemon(remote) = authorityError { code = remote }
+        else if let transportError = error as? TaskdHTTPError, case let .rejected(remote) = transportError { code = remote }
+        else if error is ReferenceError || error is WishMachineError { code = Self.code(for: error) }
+        else { code = fact.code }
+        return renderAuthorityResult(callID, ["ok": false, "code": code, "reason": fact.reason,
+            "message": fact.message, "screen": fact.screen, "isConnectivity": fact.isConnectivity], operation: operation)
+    }
 
-    /// 失败的**唯一出口**：回执、日志、屏上读的是同一份具名事实。
-    ///
-    /// 真机缺陷形态正是"只写回执"：`tool/result` 里有一句 `reference_search_failed`，
-    /// app 系统日志里一行都没有，用户听到的只有一句「找图失败」。
-    @discardableResult
-    private func report(_ callID: String, _ operation: WishReferenceDiagnosis.Operation,
-                        _ fact: WishReferenceDiagnosis.Fact) -> RealtimeDJToolResult {
+    /// Native only presents the Rust result; it does not change retry/cooldown state.
+    private func renderAuthorityResult(_ callID: String, _ payload: [String: Any],
+                                       operation: WishReferenceDiagnosis.Operation) -> RealtimeDJToolResult {
+        if payload["ok"] as? Bool == true {
+            if lastReportedScreen != nil {
+                lastReportedScreen = nil
+                WishReferenceAvailabilityNotice.postRecovered()
+            }
+            if operation == .search, payload["total"] as? Int == 0 {
+                WishReferenceAvailabilityNotice.postInfo(WishReferenceDiagnosis.emptyResultsScreenText)
+            }
+            return success(callID, payload)
+        }
+        let fact = WishReferenceDiagnosis.Fact(code: payload["code"] as? String ?? "reference_registration_failed",
+            reason: payload["reason"] as? String ?? "authority-failure",
+            message: payload["message"] as? String ?? "参考图服务失败。",
+            screen: payload["screen"] as? String ?? "参考图服务失败。",
+            isConnectivity: payload["isConnectivity"] as? Bool ?? false)
         WishReferenceLog.failure(fact, operation: operation.rawValue)
-        if fact.isConnectivity { cooldown = (fact, now().addingTimeInterval(Self.cooldownInterval)) }
         if lastReportedScreen != fact.screen {
             lastReportedScreen = fact.screen
-            WishReferenceLog.availabilityChanged(fact.screen, isFailure: true)
             WishReferenceAvailabilityNotice.postFailure(fact.screen)
         }
-        return failure(callID, fact.code, fact.message)
+        return .init(callID: callID, resultJSON: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8), isError: true)
     }
 
-    /// 冷却期内不再重复撞墙，但**必须说清这一次没有发起搜索**。
-    private func coolingDownSearchFact() -> WishReferenceDiagnosis.Fact? {
-        guard let cooldown, cooldown.until > now() else { return nil }
-        let remaining = max(1, Int(cooldown.until.timeIntervalSince(now()).rounded(.up)))
-        return WishReferenceDiagnosis.searchCoolingDown(fact: cooldown.fact, secondsRemaining: remaining)
-    }
-
-    /// 服务真的答了：冷却清掉，屏上那条"不可用"撤掉，日志留一行恢复。
-    private func markReachable() {
-        cooldown = nil
-        guard lastReportedScreen != nil else { return }
-        lastReportedScreen = nil
-        WishReferenceLog.availabilityChanged(nil, isFailure: false)
-        WishReferenceAvailabilityNotice.postRecovered()
-    }
-
-    /// 搜索响应里服务端自报的结构化错误。只读它，绝不把错误当空结果。
-    static func searchAPIErrorFact(_ data: Data) -> WishReferenceDiagnosis.Fact? {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let error = root["error"] as? [String: Any] else { return nil }
-        return WishReferenceDiagnosis.searchAPIError(code: error["code"] as? String,
-            info: error["info"] as? String)
-    }
-
-    private func downloadAndRegister(imageURL: URL, displayName: String, authorizationID: UUID) async throws -> Registration {
+    /// Platform security/download normalization and file I/O remain native leaves.
+    /// Attachment identity and download permission came from Rust, and the existing
+    /// wish-control authority records the actual attachment before completion.
+    private func downloadLeaf(imageURL: URL, displayName: String, attachmentID: UUID,
+                              authorizationID: UUID) async throws {
         var pendingFile: URL?
         do {
             try Task.checkCancellation()
             let data = try await fetcher.download(imageURL)
             try Task.checkCancellation()
-            guard !data.isEmpty, data.count <= Self.maximumImageBytes, Self.isPNG(data) else {
-                throw ReferenceError.invalidImage
-            }
+            guard !data.isEmpty, data.count <= Self.maximumImageBytes, Self.isPNG(data) else { throw ReferenceError.invalidImage }
             guard isCurrent() else { throw ReferenceError.stale }
-            let attachmentID = UUID()
             let destination = directory.appendingPathComponent(attachmentID.uuidString + ".png")
-            // Mark this call's own unique destination before writing so a failed write,
-            // chmod or later cancellation can only ever clean up this call's file.
             pendingFile = destination
             try writePrivate(data, to: destination)
             try Task.checkCancellation()
             guard isCurrent() else { throw ReferenceError.stale }
-            let attachment = ResidentImageAttachment(id: attachmentID, url: destination,
-                displayName: String(displayName.prefix(Self.maximumDisplayNameLength)))
-            _ = try coordinator.registerWebReference(attachment, imageURL: imageURL, authorizationID: authorizationID,
-                worldID: worldID, residentScope: residentScope, source: Self.webSource)
-            pendingFile = nil // Registered: the file is retained for the asynchronous wish.
-            return Registration(imageURL: imageURL, displayName: attachment.displayName, attachmentID: attachmentID)
+            let attachment = ResidentImageAttachment(id: attachmentID, url: destination, displayName: displayName)
+            _ = try await coordinator.registerWebReference(attachment, imageURL: imageURL,
+                authorizationID: authorizationID, worldID: worldID, residentScope: residentScope, source: Self.webSource)
+            pendingFile = nil
         } catch {
             if let pendingFile { try? fileManager.removeItem(at: pendingFile) }
             throw error
@@ -482,14 +411,10 @@ final class ResidentWishReferenceTools {
         return "reference_registration_failed"
     }
 
-    private func registrationPayload(_ callID: String, _ registration: Registration) -> RealtimeDJToolResult {
-        success(callID, [
-            "ok": true, "attachment_id": registration.attachmentID.uuidString,
-            "display_name": registration.displayName,
-            "source_image_url": registration.imageURL.absoluteString,
-            "source_kind": "public_web_reference", "license_verified": false,
-            "message": "已登记为本轮参考图，来源和许可没有核实。用户明确要做的时候，再提交生成。",
-        ])
+    static func searchAPIErrorFact(_ data: Data) -> WishReferenceDiagnosis.Fact? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = root["error"] as? [String: Any] else { return nil }
+        return WishReferenceDiagnosis.searchAPIError(code: error["code"] as? String, info: error["info"] as? String)
     }
 
     private func success(_ callID: String, _ payload: [String: Any]) -> RealtimeDJToolResult {

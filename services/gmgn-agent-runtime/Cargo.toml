@@ -1,0 +1,24 @@
+[package]
+name = "gmgn-agent-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gmgn-protocol = { path = "../gmgn-protocol" }
+rutis = { git = "https://github.com/arcships/rutis", rev = "330ff51b65c0178ab205abb377f6d9dbcd7225fd" }
+rutis-agent = { git = "https://github.com/arcships/rutis", rev = "330ff51b65c0178ab205abb377f6d9dbcd7225fd", default-features = false }
+aimux-core = "0.3.0"
+aimux-providers = { version = "=0.3.0", default-features = false }
+url = "2"
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time", "process", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

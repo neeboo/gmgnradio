@@ -13,12 +13,7 @@ case "$identifier" in ai.gmgn.unity-sample*) ;; *) echo 'Refusing non-sample bun
 plugins="$app/Contents/Plugins"
 [[ ! -L "$app/Contents" && ! -L "$plugins" ]] || { echo 'Refusing symlinked plugin destination' >&2; exit 2; }
 [[ -f "$products/UnityMediaHost.dylib" ]] || { echo 'Build UnityMediaHost first' >&2; exit 1; }
-settings_binary="$repo_root/tools/gpui-scenekit-probe/target/release/gmgn-unity-settings"
-cargo +1.95.0 build --release --manifest-path "$repo_root/apps/gpui-app/Cargo.toml" --bin gmgn-unity-settings --locked --offline --target-dir "$repo_root/tools/gpui-scenekit-probe/target"
-[[ -x "$settings_binary" ]] || { echo 'Build the gmgn-unity-settings Release binary first' >&2; exit 1; }
-settings_app="$app/Contents/Helpers/GMGN Unity Settings.app"
-[[ ! -e "$settings_app" && ! -e "$app/Contents/MacOS/gmgn-unity-settings" ]] || { echo 'Settings already packaged; use a fresh App build' >&2; exit 2; }
-[[ ! -L "$app/Contents/Helpers" ]] || { echo 'Refusing symlinked settings destination' >&2; exit 2; }
+[[ ! -L "$app/Contents/Helpers" ]] || { echo 'Refusing symlinked helper destination' >&2; exit 2; }
 taskd_binary="$repo_root/target/release/gmgn-taskd"
 [[ ! -e "$app/Contents/Helpers/gmgn-taskd" ]] || { echo 'Task service already packaged; use a fresh App build' >&2; exit 2; }
 # Reuse the product Rust service. UnityProductSettings supplies its isolated
@@ -53,7 +48,7 @@ if ! otool -l "$plugins/UnityMediaHost.dylib" | rg 'path @loader_path ' >/dev/nu
   install_name_tool -add_rpath '@loader_path' "$plugins/UnityMediaHost.dylib"
 fi
 codesign --force --sign - "$plugins/UnityMediaHost.dylib"
-mkdir -p "$settings_app/Contents/MacOS"
+mkdir -p "$app/Contents/Helpers"
 # Reuse the product's pinned, already downloaded public-link helper. Missing
 # assets fail packaging; this Unity path never installs or downloads helpers.
 screen_helper_cache="${GMGN_SCREEN_LINK_HELPER_CACHE_DIR:-$repo_root/tmp/screen-link-helper-cache}"
@@ -69,12 +64,6 @@ python3 "$repo_root/tools/bundle-screen-link-helper.py" --destination "$app/Cont
 python3 "$repo_root/tools/bundle-screen-link-helper.py" --destination "$app/Contents/Helpers" --verify-only --include deno
 cp "$taskd_binary" "$app/Contents/Helpers/gmgn-taskd"
 codesign --force --sign - "$app/Contents/Helpers/gmgn-taskd"
-cp "$repo_root/tools/unity-settings-info.plist" "$settings_app/Contents/Info.plist"
-cp "$settings_binary" "$settings_app/Contents/MacOS/gmgn-unity-settings"
-mkdir -p "$settings_app/Contents/Resources"
-cp "$repo_root/apps/macos/Resources/AppIcon.icns" "$settings_app/Contents/Resources/AppIcon.icns"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleIconFile string AppIcon.icns' "$settings_app/Contents/Info.plist"
-codesign --force --sign - "$settings_app"
 # Match the signed GPUI product layout: hashes/licenses are sealed resources,
 # not unsigned nested code in Contents/Helpers. Keep the runtime lookup path.
 mkdir -p "$app/Contents/Resources"
@@ -89,7 +78,7 @@ for motion in gmgn.motion.device.jukebox-low-button-pmx.vmd gmgn.motion.device.j
   cp "$repo_root/apps/macos/Resources/MMDMotions/$motion" "$app/Contents/Resources/MMDMotions/"
 done
 # Use the product's final icon for every newly packaged Unity player.
-# Microphone access belongs to the MAIN executable, not the nested settings App.
+# Microphone access belongs to the MAIN executable.
 microphone_usage="$(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$repo_root/apps/macos/Resources/Info.plist")"
 [[ -n "${microphone_usage//[[:space:]]/}" ]] || { echo 'Product microphone usage description is empty' >&2; exit 1; }
 if ! /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription $microphone_usage" "$app/Contents/Info.plist" 2>/dev/null; then
@@ -105,9 +94,7 @@ for framework in LiveKitWebRTC.framework RustLiveKitUniFFI.framework; do
   codesign --verify --deep --strict "$plugins/$framework"
 done
 codesign --verify --strict "$plugins/UnityMediaHost.dylib"
-codesign --verify --deep --strict "$settings_app"
 codesign --verify --strict "$app/Contents/Helpers/gmgn-taskd"
 codesign --verify --deep --strict "$app"
 cmp -s "$repo_root/apps/macos/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
-cmp -s "$repo_root/apps/macos/Resources/AppIcon.icns" "$settings_app/Contents/Resources/AppIcon.icns"
 printf 'Packaged independent Unity host: %s\n' "$app"

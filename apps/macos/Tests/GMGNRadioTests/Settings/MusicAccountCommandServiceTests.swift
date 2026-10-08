@@ -54,86 +54,71 @@ func musicProviderStoreReportsCorruptLocalSessions() async throws {
     #expect(FileManager.default.fileExists(atPath: file.path))
 }
 
-@Test
+@Test @MainActor
 func musicProviderLocalWriteFailureDoesNotReportSuccessfulLogin() async throws {
-    let blocked = FileManager.default.temporaryDirectory
-        .appendingPathComponent("gmgn-blocked-sessions-\(UUID())")
-    try Data().write(to: blocked)
-    defer { try? FileManager.default.removeItem(at: blocked) }
-    let store = LocalMusicProviderSessionStore(directoryURL: blocked)
-    let service = MusicAccountCommandService(
-        sessions: store,
-        neteaseClient: MusicAccountClientStub(),
-        qqMusicClient: MusicAccountClientStub()
-    )
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let blocked=fixture.root.appendingPathComponent("secrets/music-account-v1")
+    try FileManager.default.createDirectory(at:blocked.deletingLastPathComponent(),withIntermediateDirectories:true)
+    try Data().write(to:blocked)
+    let service=fixture.service
     await #expect(throws: (any Error).self) {
         try await service.connect(providerID: .netease, cookie: "MUSIC_U=test-session")
     }
     #expect(await service.status(providerID: .netease) == .unavailable)
 }
 
-@Test
+@Test @MainActor
 func musicAccountServiceValidatesBeforeSavingAProviderSession() async throws {
-    let store = InMemoryMusicProviderSessionStore()
-    let service = MusicAccountCommandService(
-        sessions: store,
-        neteaseClient: MusicAccountClientStub(),
-        qqMusicClient: MusicAccountClientStub()
-    )
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let store=fixture.sessions,service=fixture.service
 
     try await service.connect(
         providerID: .netease,
         cookie: "MUSIC_U=user-session"
     )
 
-    let saved = await store.session(for: .netease)
+    let saved = try await store.session(for: .netease)
     #expect(saved?.credential == .cookieHeader("MUSIC_U=user-session"))
+    #expect(await service.status(providerID:.netease)==.connected)
+    try await fixture.assertNoSQLCredential("MUSIC_U=user-session")
 }
 
-@Test
-func musicAccountServiceDoesNotSaveARejectedProviderSession() async {
-    let store = InMemoryMusicProviderSessionStore()
-    let service = MusicAccountCommandService(
-        sessions: store,
-        neteaseClient: MusicAccountClientStub(error: .rejected),
-        qqMusicClient: MusicAccountClientStub()
-    )
+@Test @MainActor
+func musicAccountServiceDoesNotSaveARejectedProviderSession() async throws {
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let store=fixture.sessions,service=fixture.service
 
-    await #expect(throws: MusicAccountTestError.self) {
+    await #expect(throws: (any Error).self) {
         try await service.connect(
             providerID: .netease,
             cookie: "MUSIC_U=expired"
         )
     }
-    #expect(await store.session(for: .netease) == nil)
+    #expect(try await store.session(for: .netease) == nil)
 }
 
-@Test
+@Test @MainActor
 func musicAccountServiceCanDisconnectAProvider() async throws {
-    let store = InMemoryMusicProviderSessionStore()
-    await store.save(
-        providerSession("uin=o1; qm_keyst=key"),
-        for: .qqMusic
-    )
-    let service = MusicAccountCommandService(
-        sessions: store,
-        neteaseClient: MusicAccountClientStub(),
-        qqMusicClient: MusicAccountClientStub()
-    )
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let store=fixture.sessions,service=fixture.service
+    try await service.connect(providerID:.qqMusic,cookie:"uin=o1; qm_keyst=key")
+    #expect(try await store.session(for:.qqMusic) != nil)
 
     try await service.disconnect(providerID: .qqMusic)
 
-    #expect(await store.session(for: .qqMusic) == nil)
+    #expect(try await store.session(for: .qqMusic) == nil)
+    #expect(try await fixture.authority.account(.qqMusic).disabled)
 }
 
-@Test
+@Test @MainActor
 func musicAccountServiceAcceptsQQMusicWechatLoginCookies() async throws {
-    let store = InMemoryMusicProviderSessionStore()
-    let service = MusicAccountCommandService(
-        sessions: store,
-        neteaseClient: MusicAccountClientStub(),
-        qqMusicClient: MusicAccountClientStub()
-    )
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let store=fixture.sessions,service=fixture.service
 
     try await service.connect(
         providerID: .qqMusic,
@@ -141,7 +126,7 @@ func musicAccountServiceAcceptsQQMusicWechatLoginCookies() async throws {
     )
 
     #expect(
-        await store.session(for: .qqMusic)?.credential
+        try await store.session(for: .qqMusic)?.credential
             == .cookieHeader("wxuin=12345; wxskey=playback-key")
     )
 }
@@ -153,14 +138,14 @@ private enum MusicAccountTestError: Error {
 @MainActor
 @Test
 func musicAccountLoginValidatesOffMainWithoutFetchingTheLibrary() async throws {
-    let client = LoginOnlyMusicClient()
-    let store = InMemoryMusicProviderSessionStore()
-    let service = MusicAccountCommandService(sessions: store, neteaseClient: client, qqMusicClient: client)
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let store=fixture.sessions,service=fixture.service
     try await service.connect(providerID: .netease, cookie: "MUSIC_U=test-only")
-    #expect(await client.validations == 1)
-    #expect(await client.libraryFetches == 0)
-    #expect(await client.validatedOnMain == false)
-    #expect(await store.session(for: .netease) != nil)
+    #expect(try fixture.providerRequests().count == 1)
+    #expect(try fixture.providerRequests().allSatisfy {$0.contains("nuser/account/get")})
+    #expect(fixture.rpcProbe.calledOnMain == false)
+    #expect(try await store.session(for: .netease) != nil)
 }
 
 private actor LoginOnlyMusicClient: AccountMusicProviderClient {
@@ -186,16 +171,16 @@ private actor LoginOnlyMusicClient: AccountMusicProviderClient {
     func search(_ request: MusicSearchRequest, session: MusicProviderSession) async throws -> [MusicProviderTrack] { [] }
 }
 
-@Test
-func musicAccountValidationFailureDoesNotPersistAConnection() async {
-    let client = LoginOnlyMusicClient(rejectsValidation: true)
-    let store = InMemoryMusicProviderSessionStore()
-    let service = MusicAccountCommandService(sessions: store, neteaseClient: client, qqMusicClient: client)
-    await #expect(throws: MusicAccountTestError.self) {
-        try await service.connect(providerID: .netease, cookie: "MUSIC_U=test-only")
+@Test @MainActor
+func musicAccountValidationFailureDoesNotPersistAConnection() async throws {
+    let fixture=try await PrivateMusicAccountFixture.start()
+    defer {withExtendedLifetime(fixture){}}
+    let store=fixture.sessions,service=fixture.service
+    await #expect(throws: (any Error).self) {
+        try await service.connect(providerID: .netease, cookie: "MUSIC_U=expired")
     }
-    #expect(await store.session(for: .netease) == nil)
-    #expect(await client.libraryFetches == 0)
+    #expect(try await store.session(for: .netease) == nil)
+    #expect(try fixture.providerRequests().allSatisfy {$0.contains("nuser/account/get")})
 }
 
 private struct MusicAccountClientStub: AccountMusicProviderClient {

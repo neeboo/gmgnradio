@@ -196,10 +196,10 @@ fn bounded(raw: &str, code: &'static str) -> Result<String> {
     Ok(raw.to_owned())
 }
 
-/// Canonical JSON text of a value (object keys sorted by `serde_json`'s
-/// BTreeMap-backed map) — the one definition of a record's content.
+/// Canonical JSON text with recursively sorted object keys, independent of
+/// serde_json map features — the one definition of a record's content.
 fn canonical(value: &Value) -> Result<String> {
-    serde_json::to_string(value).map_err(|_| "invalid_world_state")
+    crate::canonical_json::to_string(value).map_err(|_| "invalid_world_state")
 }
 
 fn digest_of(value: &Value) -> Result<String> {
@@ -207,7 +207,6 @@ fn digest_of(value: &Value) -> Result<String> {
     hasher.update(canonical(value)?.as_bytes());
     Ok(format!("{:x}", hasher.finalize()))
 }
-
 
 // ---------------------------------------------------------------------------
 // wire shapes
@@ -444,6 +443,9 @@ fn validate_object_entry(object_id: &str, value: &Value) -> Result<Value> {
 /// Validate a whole `state.json` document and split it into the world-level
 /// record value and the per-object entries.
 fn validate_document(state: &Value) -> Result<(Value, Vec<(String, Value)>)> {
+    // Map traversal also defines record/fact order, not only serialized bytes.
+    // Restore the historical BTree key order even with preserve_order enabled.
+    let state = crate::canonical_json::sorted(state);
     let object = state.as_object().ok_or("invalid_world_state")?;
     if let Some(world_id) = object.get("worldID") {
         if world_id.as_str().is_none() {
@@ -474,50 +476,109 @@ fn validate_document(state: &Value) -> Result<(Value, Vec<(String, Value)>)> {
 
 /// Layout remains Swift-owned. Independently check the new atomic nearby-drop
 /// receipt against the current holder before accepting its replacement document.
-fn validate_drop_held(previous: &Map<String, Value>, objects: &std::collections::BTreeMap<String, RecordRow>, next: &Value) -> Result<()> {
-    let Some(receipts) = next.get("layoutReceipts").and_then(Value::as_object) else { return Ok(()); };
+fn validate_drop_held(
+    previous: &Map<String, Value>,
+    objects: &std::collections::BTreeMap<String, RecordRow>,
+    next: &Value,
+) -> Result<()> {
+    let Some(receipts) = next.get("layoutReceipts").and_then(Value::as_object) else {
+        return Ok(());
+    };
     for (id, receipt) in receipts {
-        if previous.get("layoutReceipts").and_then(Value::as_object).and_then(|r| r.get(id)) == Some(receipt) {
+        if previous
+            .get("layoutReceipts")
+            .and_then(Value::as_object)
+            .and_then(|r| r.get(id))
+            == Some(receipt)
+        {
             continue;
         }
-        let Some(drop) = receipt.get("dropHeld") else { continue; };
-        let held = previous.get("heldProp").filter(|v| v.is_object()).ok_or("invalid_drop_held")?;
-        let object_id = drop.get("objectID").and_then(Value::as_str).ok_or("invalid_drop_held")?;
-        let holder = held.get("avatarAssetID").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid_drop_held")?;
+        let Some(drop) = receipt.get("dropHeld") else {
+            continue;
+        };
+        let held = previous
+            .get("heldProp")
+            .filter(|v| v.is_object())
+            .ok_or("invalid_drop_held")?;
+        let object_id = drop
+            .get("objectID")
+            .and_then(Value::as_str)
+            .ok_or("invalid_drop_held")?;
+        let holder = held
+            .get("avatarAssetID")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("invalid_drop_held")?;
         if held.get("objectID").and_then(Value::as_str) != Some(object_id)
             || drop.get("avatarAssetID").and_then(Value::as_str) != Some(holder)
             || next.get("heldProp").is_some_and(|v| !v.is_null())
-            || next.get("layoutUndo").is_some_and(|v| !v.is_null()) {
+            || next.get("layoutUndo").is_some_and(|v| !v.is_null())
+        {
             return Err("invalid_drop_held");
         }
         let placement = drop.get("placement").ok_or("invalid_drop_held")?;
         let position = placement.get("position").ok_or("invalid_drop_held")?;
         validate_vector(position, &["x", "y", "z"])?;
-        let yaw = finite_number(placement.get("yaw").ok_or("invalid_drop_held")?).ok_or("invalid_drop_held")?;
-        let surface = placement.get("surfaceID").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid_drop_held")?;
-        let agent = previous.get("agentTransform").and_then(|v| v.get("position")).ok_or("invalid_drop_held")?;
-        let coordinate = |v: &Value, axis: &str| -> Result<f64> { finite_number(v.get(axis).ok_or("invalid_drop_held")?).ok_or("invalid_drop_held") };
+        let yaw = finite_number(placement.get("yaw").ok_or("invalid_drop_held")?)
+            .ok_or("invalid_drop_held")?;
+        let surface = placement
+            .get("surfaceID")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("invalid_drop_held")?;
+        let agent = previous
+            .get("agentTransform")
+            .and_then(|v| v.get("position"))
+            .ok_or("invalid_drop_held")?;
+        let coordinate = |v: &Value, axis: &str| -> Result<f64> {
+            finite_number(v.get(axis).ok_or("invalid_drop_held")?).ok_or("invalid_drop_held")
+        };
         let dx = coordinate(position, "x")? - coordinate(agent, "x")?;
         let dz = coordinate(position, "z")? - coordinate(agent, "z")?;
-        if dx * dx + dz * dz > 0.6001_f64.powi(2) { return Err("prop_out_of_reach"); }
-        let old = objects.get(object_id).filter(|r| !r.tombstone).ok_or("invalid_drop_held")?;
-        let new = next.get("objectStates").and_then(|v| v.get(object_id)).ok_or("invalid_drop_held")?;
+        if dx * dx + dz * dz > 0.6001_f64.powi(2) {
+            return Err("prop_out_of_reach");
+        }
+        let old = objects
+            .get(object_id)
+            .filter(|r| !r.tombstone)
+            .ok_or("invalid_drop_held")?;
+        let new = next
+            .get("objectStates")
+            .and_then(|v| v.get(object_id))
+            .ok_or("invalid_drop_held")?;
         if new.get("isEnabled").and_then(Value::as_bool) != Some(true)
             || new.pointer("/transform/position") != Some(position)
             || new.pointer("/transform/scale") != old.value.pointer("/transform/scale")
-            || new.pointer("/metadata/gmgn.support-surface.v1").and_then(Value::as_str) != Some(surface) {
+            || new
+                .pointer("/metadata/gmgn.support-surface.v1")
+                .and_then(Value::as_str)
+                != Some(surface)
+        {
             return Err("invalid_drop_held");
         }
-        let rotation = new.pointer("/transform/rotation").ok_or("invalid_drop_held")?;
+        let rotation = new
+            .pointer("/transform/rotation")
+            .ok_or("invalid_drop_held")?;
         let expected_rotation = [0.0, (yaw / 2.0).sin(), 0.0, (yaw / 2.0).cos()];
         for (axis, expected) in ["x", "y", "z", "w"].into_iter().zip(expected_rotation) {
-            if (coordinate(rotation, axis)? - expected).abs() > 0.00001 { return Err("invalid_drop_held"); }
+            if (coordinate(rotation, axis)? - expected).abs() > 0.00001 {
+                return Err("invalid_drop_held");
+            }
         }
         // The support key changes; asset identity, dimensions and grip must not.
-        let old_metadata = old.value.get("metadata").and_then(Value::as_object).ok_or("invalid_drop_held")?;
-        let new_metadata = new.get("metadata").and_then(Value::as_object).ok_or("invalid_drop_held")?;
+        let old_metadata = old
+            .value
+            .get("metadata")
+            .and_then(Value::as_object)
+            .ok_or("invalid_drop_held")?;
+        let new_metadata = new
+            .get("metadata")
+            .and_then(Value::as_object)
+            .ok_or("invalid_drop_held")?;
         for (key, value) in old_metadata {
-            if key != "gmgn.support-surface.v1" && new_metadata.get(key) != Some(value) { return Err("invalid_drop_held"); }
+            if key != "gmgn.support-surface.v1" && new_metadata.get(key) != Some(value) {
+                return Err("invalid_drop_held");
+            }
         }
     }
     Ok(())
@@ -603,7 +664,9 @@ fn object_rows(connection: &Connection, world_id: &str) -> Result<Vec<(String, R
 }
 
 fn world_revision(connection: &Connection, world_id: &str) -> Result<i64> {
-    Ok(world_row(connection, world_id)?.map(|row| row.revision).unwrap_or(0))
+    Ok(world_row(connection, world_id)?
+        .map(|row| row.revision)
+        .unwrap_or(0))
 }
 
 /// The materialized `state.json` document: the world record value plus every
@@ -683,10 +746,7 @@ pub fn read_window(after: Option<i64>, limit: Option<usize>) -> Result<(i64, usi
     Ok((after, limit))
 }
 
-pub fn read_facts(
-    connection: &Connection,
-    request: &FactsRequest,
-) -> Result<(Vec<Value>, i64)> {
+pub fn read_facts(connection: &Connection, request: &FactsRequest) -> Result<(Vec<Value>, i64)> {
     validate_world_id(&request.world_id)?;
     let (after, limit) = read_window(request.after, request.limit)?;
     let mut statement = connection
@@ -814,11 +874,7 @@ pub fn read_cursors(connection: &Connection, world_id: &str) -> Result<Vec<Value
 // blobs
 // ---------------------------------------------------------------------------
 
-pub fn blob_put(
-    connection: &Connection,
-    root: &Path,
-    request: &BlobPutRequest,
-) -> Result<Value> {
+pub fn blob_put(connection: &Connection, root: &Path, request: &BlobPutRequest) -> Result<Value> {
     let sha256 = request.sha256.trim().to_ascii_lowercase();
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("invalid_blob_hash");
@@ -959,7 +1015,9 @@ fn record_blob_fault(
     let mut scopes: Vec<String> = Vec::new();
     {
         let mut statement = connection
-            .prepare("SELECT DISTINCT world_id FROM world_records WHERE value LIKE '%' || ?1 || '%'")
+            .prepare(
+                "SELECT DISTINCT world_id FROM world_records WHERE value LIKE '%' || ?1 || '%'",
+            )
             .map_err(|_| "storage_unavailable")?;
         let rows = statement
             .query_map(params![sha256], |row| row.get::<_, String>(0))
@@ -1082,68 +1140,92 @@ fn upsert_object(
     facts: &mut Vec<Fact>,
     changed_objects: &mut Vec<String>,
 ) -> Result<()> {
-// Object upsert with diff-derived facts. `revision` is per object and counts
-// successful mutations of that object; a tombstoned record keeps its
-// revision so a re-registration continues the same identity.
+    // Object upsert with diff-derived facts. `revision` is per object and counts
+    // successful mutations of that object; a tombstoned record keeps its
+    // revision so a re-registration continues the same identity.
 
-let canonical_value = validate_object_entry(object_id, &value)?;
-let hash = digest_of(&canonical_value)?;
-let previous = objects.get(object_id);
-if let Some(expected) = expected_revision {
-    let current = previous.map(|row| row.revision).unwrap_or(0);
-    if expected != current {
-        return Err("object_revision_conflict");
+    let canonical_value = validate_object_entry(object_id, &value)?;
+    let hash = digest_of(&canonical_value)?;
+    let previous = objects.get(object_id);
+    if let Some(expected) = expected_revision {
+        let current = previous.map(|row| row.revision).unwrap_or(0);
+        if expected != current {
+            return Err("object_revision_conflict");
+        }
     }
-}
-let (revision, tombstone) = match previous {
-    Some(row) if row.hash == hash && !row.tombstone => (row.revision, false),
-    Some(row) => (row.revision + 1, false),
-    None => (1, false),
-};
-if previous.map(|row| row.hash.clone()) == Some(hash.clone())
-    && previous.map(|row| row.tombstone) == Some(false)
-{
-    return Ok(());
-}
-let kind = match previous {
-    None => "object.registered",
-    Some(row) if row.tombstone => "object.registered",
-    Some(row) => object_change_kind(&row.value, &canonical_value),
-};
-let payload = json!({
-    "objectID": object_id,
-    "revision": revision,
-    "from": previous.map(|row| row.value.clone()),
-    "to": canonical_value.clone(),
-});
-facts.push(Fact {
-    id: format!("object:{}:{}:{}", kind, object_id, revision),
-    kind: kind.into(),
-    subject_domain: OBJECT_DOMAIN.into(),
-    subject_key: object_id.into(),
-    revision,
-    payload,
-});
-objects.insert(
-    object_id.to_owned(),
-    RecordRow {
+    let (revision, tombstone) = match previous {
+        Some(row) if row.hash == hash && !row.tombstone => (row.revision, false),
+        Some(row) => (row.revision + 1, false),
+        None => (1, false),
+    };
+    if previous.map(|row| row.hash.clone()) == Some(hash.clone())
+        && previous.map(|row| row.tombstone) == Some(false)
+    {
+        return Ok(());
+    }
+    let kind = match previous {
+        None => "object.registered",
+        Some(row) if row.tombstone => "object.registered",
+        Some(row) => object_change_kind(&row.value, &canonical_value),
+    };
+    let payload = json!({
+        "objectID": object_id,
+        "revision": revision,
+        "from": previous.map(|row| row.value.clone()),
+        "to": canonical_value.clone(),
+    });
+    facts.push(Fact {
+        id: format!("object:{}:{}:{}", kind, object_id, revision),
+        kind: kind.into(),
+        subject_domain: OBJECT_DOMAIN.into(),
+        subject_key: object_id.into(),
         revision,
-        value: canonical_value,
-        hash,
-        tombstone,
-        updated_at_ms: now_ms(),
-    },
-);
-changed_objects.push(object_id.to_owned());
-Ok(())
+        payload,
+    });
+    objects.insert(
+        object_id.to_owned(),
+        RecordRow {
+            revision,
+            value: canonical_value,
+            hash,
+            tombstone,
+            updated_at_ms: now_ms(),
+        },
+    );
+    changed_objects.push(object_id.to_owned());
+    Ok(())
 }
 
 /// Apply the ops of one commit to the records, deriving facts and revisions.
+fn is_generated_prop(value: &Value) -> bool {
+    value
+        .get("metadata")
+        .and_then(|m| m.get("gmgn.generated-prop.v1"))
+        .is_some()
+}
+
+fn same_prop_projection(before: &Value, after: &Value, activity_authorized: bool) -> bool {
+    if !activity_authorized {
+        return before == after;
+    }
+    let strip_usage = |value: &Value| {
+        let mut value = value.clone();
+        if let Some(metadata) = value.get_mut("metadata").and_then(Value::as_object_mut) {
+            metadata.remove("gmgn.prop-usage.v1");
+        }
+        value
+    };
+    strip_usage(before) == strip_usage(after)
+}
+
 fn apply(
     transaction: &Transaction<'_>,
     world_id: &str,
     producer: &str,
     ops: &[Op],
+    activity_authorized: bool,
+    prop_authorized: bool,
+    control_authorized: bool,
 ) -> Result<Applied> {
     let existing_world = world_row(transaction, world_id)?;
     let mut world_value = match &existing_world {
@@ -1154,9 +1236,8 @@ fn apply(
             .ok_or("world_record_unreadable")?,
         None => Map::new(),
     };
-    let mut objects: std::collections::BTreeMap<String, RecordRow> = object_rows(transaction, world_id)?
-        .into_iter()
-        .collect();
+    let mut objects: std::collections::BTreeMap<String, RecordRow> =
+        object_rows(transaction, world_id)?.into_iter().collect();
     let previous_state = {
         let mut document = world_value.clone();
         let mut live = Map::new();
@@ -1178,13 +1259,119 @@ fn apply(
     let mut current_simulation_revision = previous_simulation_revision;
 
     let mut facts: Vec<Fact> = Vec::new();
+    let prop_owned = !prop_authorized && transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_prop_native')", [], |r| r.get::<_, bool>(0),
+    ).map_err(|_| "storage_unavailable")? && transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM world_prop_native WHERE world=?1)", [world_id], |r| r.get::<_, bool>(0),
+    ).map_err(|_| "storage_unavailable")?;
     let mut changed_objects: Vec<String> = Vec::new();
     let mut changed_world_keys: Vec<String> = Vec::new();
+    let control_owned = !control_authorized && existing_world.is_some()
+        && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_control_catalog')",
+            [], |r| r.get::<_, bool>(0),
+        ).map_err(|_| "storage_unavailable")?
+        && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM world_control_catalog WHERE world_id=?1)",
+            [world_id], |r| r.get::<_, bool>(0),
+        ).map_err(|_| "storage_unavailable")?;
+    let activity_owned = if !activity_authorized {
+        let has_table: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='world_activity_runs')",
+            [], |r| r.get(0),
+        ).map_err(|_| "storage_unavailable")?;
+        has_table
+            && transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM world_activity_runs WHERE world_id=?1)",
+                    [world_id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(|_| "storage_unavailable")?
+    } else {
+        false
+    };
 
     for op in ops {
         match op.op.as_str() {
             "replaceState" => {
                 let state = op.state.as_ref().ok_or("invalid_op")?;
+                if control_owned
+                    && ["weather", "liveCamera", "completedGoals"]
+                        .iter()
+                        .any(|key| {
+                            state.get(*key).unwrap_or(&Value::Null)
+                                != world_value.get(*key).unwrap_or(&Value::Null)
+                        })
+                {
+                    return Err("world_control_owned_projection");
+                }
+                if prop_owned {
+                    for key in [
+                        "layoutRevision",
+                        "heldProp",
+                        "layoutUndo",
+                        "layoutReceipts",
+                        "propTombstones",
+                    ] {
+                        if state.get(key) != world_value.get(key) {
+                            return Err("world_prop_owned_projection");
+                        }
+                    }
+                    let incoming = state
+                        .get("objectStates")
+                        .and_then(Value::as_object)
+                        .ok_or("invalid_world_state")?;
+                    for (id, row) in &objects {
+                        if !row.tombstone
+                            && is_generated_prop(&row.value)
+                            && incoming.get(id).is_none_or(|v| {
+                                !same_prop_projection(&row.value, v, activity_authorized)
+                            })
+                        {
+                            return Err("world_prop_owned_projection");
+                        }
+                    }
+                    for (id, value) in incoming {
+                        if is_generated_prop(value)
+                            && objects.get(id).filter(|r| !r.tombstone).is_none_or(|r| {
+                                !same_prop_projection(&r.value, value, activity_authorized)
+                            })
+                        {
+                            return Err("world_prop_owned_projection");
+                        }
+                    }
+                }
+                if !activity_authorized {
+                    if activity_owned
+                        && state.get("activeActivity").unwrap_or(&Value::Null)
+                            != world_value.get("activeActivity").unwrap_or(&Value::Null)
+                    {
+                        return Err("world_activity_owned_projection");
+                    }
+                    if activity_owned {
+                        // Usage is a receipt projection of the same activity
+                        // authority. Layout/pose writes must preserve it; a
+                        // producer label cannot grant permission to forge it.
+                        if let Some(incoming) = state.get("objectStates").and_then(Value::as_object)
+                        {
+                            for (id, item) in incoming {
+                                let usage = |v: &Value| {
+                                    v.get("metadata")
+                                        .and_then(|m| m.get("gmgn.prop-usage.v1"))
+                                        .cloned()
+                                };
+                                let prior = objects
+                                    .get(id)
+                                    .filter(|r| !r.tombstone)
+                                    .and_then(|r| usage(&r.value));
+                                if usage(item) != prior {
+                                    return Err("world_activity_owned_projection");
+                                }
+                            }
+                        }
+                    }
+                }
                 let (next_world, next_objects) = validate_document(state)?;
                 validate_drop_held(&world_value, &objects, state)?;
                 let next_revision = state.get("revision").and_then(Value::as_u64).unwrap_or(0);
@@ -1246,14 +1433,57 @@ fn apply(
                     changed_objects.push(object_id);
                 }
                 for (object_id, value) in next_objects {
-                    upsert_object(&mut objects, &object_id, value, None, &mut facts, &mut changed_objects)?;
+                    upsert_object(
+                        &mut objects,
+                        &object_id,
+                        value,
+                        None,
+                        &mut facts,
+                        &mut changed_objects,
+                    )?;
                 }
             }
             "setWorldFacts" => {
                 let facts_value = op.facts.as_ref().ok_or("invalid_op")?;
+                let facts_value = crate::canonical_json::sorted(facts_value);
                 let patch = facts_value.as_object().ok_or("invalid_world_facts")?;
+                if control_owned
+                    && ["weather", "liveCamera", "completedGoals"]
+                        .iter()
+                        .any(|key| {
+                            patch.get(*key).is_some_and(|incoming| {
+                                incoming != world_value.get(*key).unwrap_or(&Value::Null)
+                            })
+                        })
+                {
+                    return Err("world_control_owned_projection");
+                }
+                if prop_owned
+                    && [
+                        "layoutRevision",
+                        "heldProp",
+                        "layoutUndo",
+                        "layoutReceipts",
+                        "propTombstones",
+                    ]
+                    .iter()
+                    .any(|key| {
+                        patch
+                            .get(*key)
+                            .is_some_and(|v| Some(v) != world_value.get(*key))
+                    })
+                {
+                    return Err("world_prop_owned_projection");
+                }
                 if patch.contains_key("objectStates") {
                     return Err("invalid_world_facts");
+                }
+                if activity_owned
+                    && patch.get("activeActivity").is_some_and(|incoming| {
+                        incoming != world_value.get("activeActivity").unwrap_or(&Value::Null)
+                    })
+                {
+                    return Err("world_activity_owned_projection");
                 }
                 if let (Some(stored), Some(incoming)) = (
                     world_value.get("revision").and_then(Value::as_u64),
@@ -1282,9 +1512,37 @@ fn apply(
             "upsertObject" => {
                 let value = op.object.as_ref().ok_or("invalid_op")?;
                 let object_id = op.object_id.clone().or_else(|| {
-                    value.get("objectID").and_then(Value::as_str).map(str::to_owned)
+                    value
+                        .get("objectID")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                 });
                 let object_id = object_id.ok_or("invalid_object_id")?;
+                if prop_owned {
+                    let prior = objects.get(&object_id).filter(|r| !r.tombstone);
+                    if (is_generated_prop(value)
+                        || prior.is_some_and(|r| is_generated_prop(&r.value)))
+                        && prior.is_none_or(|r| {
+                            !same_prop_projection(&r.value, value, activity_authorized)
+                        })
+                    {
+                        return Err("world_prop_owned_projection");
+                    }
+                }
+                if activity_owned {
+                    let usage = |v: &Value| {
+                        v.get("metadata")
+                            .and_then(|m| m.get("gmgn.prop-usage.v1"))
+                            .cloned()
+                    };
+                    let prior = objects
+                        .get(&object_id)
+                        .filter(|r| !r.tombstone)
+                        .and_then(|r| usage(&r.value));
+                    if usage(value) != prior {
+                        return Err("world_activity_owned_projection");
+                    }
+                }
                 upsert_object(
                     &mut objects,
                     &object_id,
@@ -1301,6 +1559,9 @@ fn apply(
                 };
                 if row.tombstone {
                     continue;
+                }
+                if prop_owned && is_generated_prop(&row.value) {
+                    return Err("world_prop_owned_projection");
                 }
                 let revision = row.revision + 1;
                 let previous = row.value.clone();
@@ -1325,7 +1586,8 @@ fn apply(
                 changed_objects.push(object_id);
             }
             "advanceCursor" => {
-                let consumer = validate_consumer(op.consumer.as_deref().ok_or("invalid_consumer")?)?;
+                let consumer =
+                    validate_consumer(op.consumer.as_deref().ok_or("invalid_consumer")?)?;
                 let seq = op.seq.ok_or("invalid_cursor")?;
                 if seq < 0 {
                     return Err("invalid_cursor");
@@ -1346,11 +1608,7 @@ fn apply(
     }
 
     // Persist the world-level record.
-    let revision = existing_world
-        .as_ref()
-        .map(|row| row.revision)
-        .unwrap_or(0)
-        + 1;
+    let revision = existing_world.as_ref().map(|row| row.revision).unwrap_or(0) + 1;
     let world_value = Value::Object(world_value);
     let world_hash = digest_of(&world_value)?;
     // A world record must carry its own identity: it is the foreign key every
@@ -1466,16 +1724,45 @@ fn object_change_kind(previous: &Value, next: &Value) -> &'static str {
 }
 
 fn prop_size(value: &Value) -> Option<Value> {
-    let blob = value
-        .get("metadata")?
-        .get(GENERATED_PROP_KEY)?
-        .as_str()?;
+    let blob = value.get("metadata")?.get(GENERATED_PROP_KEY)?.as_str()?;
     let parsed: Value = serde_json::from_str(blob).ok()?;
     parsed.get("size").cloned()
 }
 
 /// One commit: idempotency, CAS, ops, facts, all in the caller's transaction.
 pub fn commit(transaction: &Transaction<'_>, request: &CommitRequest) -> Result<Value> {
+    commit_internal(transaction, request, false, false, false)
+}
+
+/// Typed prop reducer may write its derived layout, but owns neither activity
+/// nor usage. Keep precisely the same projection guards as public commits.
+pub(crate) fn commit_prop(transaction: &Transaction<'_>, request: &CommitRequest) -> Result<Value> {
+    commit_internal(transaction, request, false, true, false)
+}
+
+/// Internal activity authority only; RPC producer strings cannot enable this.
+pub(crate) fn commit_activity(
+    transaction: &Transaction<'_>,
+    request: &CommitRequest,
+) -> Result<Value> {
+    commit_internal(transaction, request, true, false, false)
+}
+
+/// Typed world-control reducer only. Producer labels cannot grant this authority.
+pub(crate) fn commit_control(
+    transaction: &Transaction<'_>,
+    request: &CommitRequest,
+) -> Result<Value> {
+    commit_internal(transaction, request, false, false, true)
+}
+
+fn commit_internal(
+    transaction: &Transaction<'_>,
+    request: &CommitRequest,
+    activity_authorized: bool,
+    prop_authorized: bool,
+    control_authorized: bool,
+) -> Result<Value> {
     validate_world_id(&request.world_id)?;
     let request_id = bounded(&request.request_id, "invalid_request_id")?;
     if request.expected_revision < 0 {
@@ -1509,7 +1796,15 @@ pub fn commit(transaction: &Transaction<'_>, request: &CommitRequest) -> Result<
         return Err("revision_conflict");
     }
 
-    let applied = apply(transaction, &request.world_id, &producer, &request.ops)?;
+    let applied = apply(
+        transaction,
+        &request.world_id,
+        &producer,
+        &request.ops,
+        activity_authorized,
+        prop_authorized,
+        control_authorized,
+    )?;
     let at = now_ms();
 
     // The commit fact is inserted first so the commit's own `seq` is the first
@@ -1669,7 +1964,15 @@ pub fn import(transaction: &Transaction<'_>, request: &ImportRequest) -> Result<
         state: Some(state),
         ..Op::default()
     };
-    let applied = apply(transaction, &request.world_id, &producer, &[op])?;
+    let applied = apply(
+        transaction,
+        &request.world_id,
+        &producer,
+        &[op],
+        true,
+        false,
+        false,
+    )?;
     let at = now_ms();
     let commit_fact = Fact {
         id: format!("import:{}", request_id),
@@ -1782,6 +2085,39 @@ mod tests {
 
     const WORLD: &str = "84503420-3010-4944-8fde-2f383cd08ebe";
 
+    #[test]
+    fn record_bytes_and_digest_ignore_nested_object_insertion_order() {
+        let first: Value =
+            serde_json::from_str(r#"{"z":{"b":2,"a":1},"a":[{"y":2,"x":1}]}"#).unwrap();
+        let retry: Value =
+            serde_json::from_str(r#"{"a":[{"x":1,"y":2}],"z":{"a":1,"b":2}}"#).unwrap();
+        assert_eq!(canonical(&first).unwrap(), canonical(&retry).unwrap());
+        assert_eq!(digest_of(&first).unwrap(), digest_of(&retry).unwrap());
+        assert_eq!(
+            canonical(&first).unwrap(),
+            r#"{"a":[{"x":1,"y":2}],"z":{"a":1,"b":2}}"#
+        );
+    }
+
+    #[test]
+    fn document_records_use_lexical_order_even_for_reversed_input() {
+        let mut state = fixture();
+        let original = state["objectStates"].as_object().unwrap();
+        let mut keys: Vec<_> = original.keys().cloned().collect();
+        keys.sort();
+        let reversed: Map<String, Value> = keys
+            .iter()
+            .rev()
+            .map(|key| (key.clone(), original[key].clone()))
+            .collect();
+        state["objectStates"] = Value::Object(reversed);
+        let (_, records) = validate_document(&state).unwrap();
+        assert_eq!(
+            records.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            keys
+        );
+    }
+
     fn setup() -> Connection {
         let connection = Connection::open_in_memory().unwrap();
         schema(&connection).unwrap();
@@ -1847,8 +2183,14 @@ mod tests {
             6965564,
             16,
             vec![
-                ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", true, -2.625, (0.29, 0.35, 0.47))),
-                ("wish-prop-02bfee6e", object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086))),
+                (
+                    "wish-prop-ebfc07be",
+                    object_entry("wish-prop-ebfc07be", true, -2.625, (0.29, 0.35, 0.47)),
+                ),
+                (
+                    "wish-prop-02bfee6e",
+                    object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086)),
+                ),
             ],
         )
     }
@@ -1857,15 +2199,18 @@ mod tests {
         let transaction = connection.transaction().unwrap();
         let state_json = canonical(&state)?;
         let state_sha256 = digest_text_bytes(state_json.as_bytes());
-        let result = super::import(&transaction, &ImportRequest {
-            world_id: WORLD.into(),
-            request_id: request_id.into(),
-            producer: None,
-            package_id: "marble-living-cabin".into(),
-            package_version: "1.2.0".into(),
-            state_sha256,
-            state_json,
-        });
+        let result = super::import(
+            &transaction,
+            &ImportRequest {
+                world_id: WORLD.into(),
+                request_id: request_id.into(),
+                producer: None,
+                package_id: "marble-living-cabin".into(),
+                package_version: "1.2.0".into(),
+                state_sha256,
+                state_json,
+            },
+        );
         match result {
             Ok(value) => {
                 transaction.commit().unwrap();
@@ -1879,15 +2224,18 @@ mod tests {
         let transaction = connection.transaction().unwrap();
         let state_json = canonical(&state).unwrap();
         let state_sha256 = digest_text_bytes(state_json.as_bytes());
-        let code = super::import(&transaction, &ImportRequest {
-            world_id: WORLD.into(),
-            request_id: request_id.into(),
-            producer: None,
-            package_id: "marble-living-cabin".into(),
-            package_version: "1.2.0".into(),
-            state_sha256,
-            state_json,
-        })
+        let code = super::import(
+            &transaction,
+            &ImportRequest {
+                world_id: WORLD.into(),
+                request_id: request_id.into(),
+                producer: None,
+                package_id: "marble-living-cabin".into(),
+                package_version: "1.2.0".into(),
+                state_sha256,
+                state_json,
+            },
+        )
         .unwrap_err();
         drop(transaction);
         code
@@ -1900,14 +2248,17 @@ mod tests {
         ops: Vec<Op>,
     ) -> Result<Value> {
         let transaction = connection.transaction().unwrap();
-        let result = super::commit(&transaction, &CommitRequest {
-            world_id: WORLD.into(),
-            request_id: request_id.into(),
-            expected_revision,
-            producer: Some("test".into()),
-            intent: None,
-            ops,
-        });
+        let result = super::commit(
+            &transaction,
+            &CommitRequest {
+                world_id: WORLD.into(),
+                request_id: request_id.into(),
+                expected_revision,
+                producer: Some("test".into()),
+                intent: None,
+                ops,
+            },
+        );
         match result {
             Ok(value) => {
                 transaction.commit().unwrap();
@@ -1924,30 +2275,40 @@ mod tests {
         ops: Vec<Op>,
     ) -> &'static str {
         let transaction = connection.transaction().unwrap();
-        let code = super::commit(&transaction, &CommitRequest {
-            world_id: WORLD.into(),
-            request_id: request_id.into(),
-            expected_revision,
-            producer: None,
-            intent: None,
-            ops,
-        })
+        let code = super::commit(
+            &transaction,
+            &CommitRequest {
+                world_id: WORLD.into(),
+                request_id: request_id.into(),
+                expected_revision,
+                producer: None,
+                intent: None,
+                ops,
+            },
+        )
         .unwrap_err();
         drop(transaction);
         code
     }
 
     fn snapshot_state(connection: &Connection) -> Value {
-        snapshot(connection, &SnapshotRequest {
-            world_id: WORLD.into(),
-            include_state: Some(true),
-        })
+        snapshot(
+            connection,
+            &SnapshotRequest {
+                world_id: WORLD.into(),
+                include_state: Some(true),
+            },
+        )
         .unwrap()["record"]["state"]
             .clone()
     }
 
     fn reload() -> Op {
-        Op { op: "replaceState".into(), state: None, ..Op::default() }
+        Op {
+            op: "replaceState".into(),
+            state: None,
+            ..Op::default()
+        }
     }
 
     #[test]
@@ -1959,17 +2320,30 @@ mod tests {
         before["objectStates"][object_id]["isEnabled"] = json!(false);
         before["heldProp"] = json!({"objectID":object_id,"avatarAssetID":"avatar-test","hand":"rightHand","returnState":return_state});
         import(&mut connection, "drop-import", before.clone()).unwrap();
-        let revision = snapshot(&connection, &SnapshotRequest {world_id:WORLD.into(), include_state:Some(true)}).unwrap()["record"]["recordRevision"].as_i64().unwrap();
+        let revision = snapshot(
+            &connection,
+            &SnapshotRequest {
+                world_id: WORLD.into(),
+                include_state: Some(true),
+            },
+        )
+        .unwrap()["record"]["recordRevision"]
+            .as_i64()
+            .unwrap();
         let mut after = before.clone();
         after.as_object_mut().unwrap().remove("heldProp");
         after["layoutRevision"] = json!(17);
         let position = json!({"x":1.1,"y":0.0,"z":-3.55});
         after["objectStates"][object_id]["isEnabled"] = json!(true);
         after["objectStates"][object_id]["transform"]["position"] = position.clone();
-        after["objectStates"][object_id]["transform"]["rotation"] = json!({"x":0.0,"y":0.0,"z":0.0,"w":1.0});
+        after["objectStates"][object_id]["transform"]["rotation"] =
+            json!({"x":0.0,"y":0.0,"z":0.0,"w":1.0});
         after["objectStates"][object_id]["metadata"][SUPPORT_SURFACE_KEY] = json!("floor");
         after["layoutReceipts"]["nearby-drop"] = json!({"dropHeld":{"objectID":object_id,"avatarAssetID":"avatar-test","placement":{"surfaceID":"floor","position":position,"yaw":0.0}}});
-        let operation = |state:Value| Op {state:Some(state), ..reload()};
+        let operation = |state: Value| Op {
+            state: Some(state),
+            ..reload()
+        };
         for (case, mut invalid, error) in [
             ("far", after.clone(), "prop_out_of_reach"),
             ("holder", after.clone(), "invalid_drop_held"),
@@ -1979,26 +2353,74 @@ mod tests {
             ("rotation", after.clone(), "invalid_drop_held"),
         ] {
             match case {
-                "far" => invalid["layoutReceipts"]["nearby-drop"]["dropHeld"]["placement"]["position"]["x"] = json!(9.0),
-                "holder" => invalid["layoutReceipts"]["nearby-drop"]["dropHeld"]["avatarAssetID"] = json!("other"),
-                "asset" => invalid["objectStates"][object_id]["metadata"][GENERATED_PROP_KEY] = json!(prop_blob(object_id, (1.0,1.0,1.0))),
+                "far" => {
+                    invalid["layoutReceipts"]["nearby-drop"]["dropHeld"]["placement"]["position"]
+                        ["x"] = json!(9.0)
+                }
+                "holder" => {
+                    invalid["layoutReceipts"]["nearby-drop"]["dropHeld"]["avatarAssetID"] =
+                        json!("other")
+                }
+                "asset" => {
+                    invalid["objectStates"][object_id]["metadata"][GENERATED_PROP_KEY] =
+                        json!(prop_blob(object_id, (1.0, 1.0, 1.0)))
+                }
                 "still-held" => invalid["heldProp"] = before["heldProp"].clone(),
-                "missing" => { invalid["objectStates"].as_object_mut().unwrap().remove(object_id); },
-                "rotation" => invalid["objectStates"][object_id]["transform"]["rotation"]["x"] = json!(0.5),
+                "missing" => {
+                    invalid["objectStates"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(object_id);
+                }
+                "rotation" => {
+                    invalid["objectStates"][object_id]["transform"]["rotation"]["x"] = json!(0.5)
+                }
                 _ => unreachable!(),
             }
-            assert_eq!(commit_err(&mut connection, case, revision, vec![operation(invalid)]), error, "{case}");
+            assert_eq!(
+                commit_err(&mut connection, case, revision, vec![operation(invalid)]),
+                error,
+                "{case}"
+            );
             assert_eq!(snapshot_state(&connection), before);
         }
-        let result = commit(&mut connection, "nearby-drop", revision, vec![operation(after.clone())]).unwrap();
-        let replay = commit(&mut connection, "nearby-drop", revision, vec![operation(after.clone())]).unwrap();
+        let result = commit(
+            &mut connection,
+            "nearby-drop",
+            revision,
+            vec![operation(after.clone())],
+        )
+        .unwrap();
+        let replay = commit(
+            &mut connection,
+            "nearby-drop",
+            revision,
+            vec![operation(after.clone())],
+        )
+        .unwrap();
         assert_eq!(replay["replayed"], json!(true));
         assert_eq!(replay["revision"], result["revision"]);
         assert_eq!(snapshot_state(&connection), after);
-        assert_eq!(commit_err(&mut connection, "stale-drop", revision, vec![operation(after.clone())]), "revision_conflict");
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "stale-drop",
+                revision,
+                vec![operation(after.clone())]
+            ),
+            "revision_conflict"
+        );
         let mut changed = after;
         changed["weather"] = json!("rain");
-        assert_eq!(commit_err(&mut connection, "nearby-drop", revision, vec![operation(changed)]), "request_id_conflict");
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "nearby-drop",
+                revision,
+                vec![operation(changed)]
+            ),
+            "request_id_conflict"
+        );
     }
 
     fn fact_kinds(connection: &Connection) -> Vec<String> {
@@ -2062,14 +2484,16 @@ mod tests {
         .unwrap();
         assert_eq!(blob.local_path, "/tmp/x.glb");
         assert_eq!(blob.remote_key.as_deref(), Some("cloud/x.glb"));
-        let cursors: CursorsRequest =
-            serde_json::from_value(json!({"worldID": WORLD})).unwrap();
+        let cursors: CursorsRequest = serde_json::from_value(json!({"worldID": WORLD})).unwrap();
         assert_eq!(cursors.world_id, WORLD);
         let records: RecordsRequest =
             serde_json::from_value(json!({"worldID": WORLD, "domain": "objects"})).unwrap();
         assert_eq!(records.domain.as_deref(), Some("objects"));
         // strictness: an unknown key is rejected, not dropped
-        assert!(serde_json::from_value::<CursorsRequest>(json!({"worldID": WORLD, "extra": 1})).is_err());
+        assert!(
+            serde_json::from_value::<CursorsRequest>(json!({"worldID": WORLD, "extra": 1}))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2083,7 +2507,17 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(names, vec!["world_blobs", "world_cursors", "world_facts", "world_imports", "world_records", "world_requests"]);
+        assert_eq!(
+            names,
+            vec![
+                "world_blobs",
+                "world_cursors",
+                "world_facts",
+                "world_imports",
+                "world_records",
+                "world_requests"
+            ]
+        );
     }
 
     #[test]
@@ -2092,9 +2526,15 @@ mod tests {
         let state = fixture();
         import(&mut connection, "import-1", state.clone()).unwrap();
         let materialized = snapshot_state(&connection);
-        assert_eq!(canonical(&materialized).unwrap(), canonical(&state).unwrap());
+        assert_eq!(
+            canonical(&materialized).unwrap(),
+            canonical(&state).unwrap()
+        );
         // and the equivalence witness agrees on both documents
-        assert_eq!(digest_of(&materialized).unwrap(), digest_of(&state).unwrap());
+        assert_eq!(
+            digest_of(&materialized).unwrap(),
+            digest_of(&state).unwrap()
+        );
     }
 
     #[test]
@@ -2124,7 +2564,10 @@ mod tests {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
         let other = document(1, 1, vec![]);
-        assert_eq!(import_err(&mut connection, "import-2", other), "import_conflict");
+        assert_eq!(
+            import_err(&mut connection, "import-2", other),
+            "import_conflict"
+        );
     }
 
     #[test]
@@ -2133,43 +2576,270 @@ mod tests {
         let transaction = connection.transaction().unwrap();
         let state_json = canonical(&fixture()).unwrap();
         // a hash that does not describe the bytes is refused
-        let code = super::import(&transaction, &ImportRequest {
-            world_id: WORLD.into(),
-            request_id: "import-1".into(),
-            producer: None,
-            package_id: "marble-living-cabin".into(),
-            package_version: "1.2.0".into(),
-            state_sha256: "0".repeat(64),
-            state_json: state_json.clone(),
-        })
+        let code = super::import(
+            &transaction,
+            &ImportRequest {
+                world_id: WORLD.into(),
+                request_id: "import-1".into(),
+                producer: None,
+                package_id: "marble-living-cabin".into(),
+                package_version: "1.2.0".into(),
+                state_sha256: "0".repeat(64),
+                state_json: state_json.clone(),
+            },
+        )
         .unwrap_err();
         assert_eq!(code, "import_hash_mismatch");
         // tampered text under an otherwise valid hash is refused too
         let mut tampered = fixture();
         tampered["weather"] = json!("rain");
-        let code = super::import(&transaction, &ImportRequest {
-            world_id: WORLD.into(),
-            request_id: "import-2".into(),
-            producer: None,
-            package_id: "marble-living-cabin".into(),
-            package_version: "1.2.0".into(),
-            state_sha256: digest_text_bytes(state_json.as_bytes()),
-            state_json: canonical(&tampered).unwrap(),
-        })
+        let code = super::import(
+            &transaction,
+            &ImportRequest {
+                world_id: WORLD.into(),
+                request_id: "import-2".into(),
+                producer: None,
+                package_id: "marble-living-cabin".into(),
+                package_version: "1.2.0".into(),
+                state_sha256: digest_text_bytes(state_json.as_bytes()),
+                state_json: canonical(&tampered).unwrap(),
+            },
+        )
         .unwrap_err();
         assert_eq!(code, "import_hash_mismatch");
         // a short/illegal declared hash is its own code, not a silent accept
-        let code = super::import(&transaction, &ImportRequest {
-            world_id: WORLD.into(),
-            request_id: "import-3".into(),
-            producer: None,
-            package_id: "marble-living-cabin".into(),
-            package_version: "1.2.0".into(),
-            state_sha256: "nope".into(),
-            state_json,
-        })
+        let code = super::import(
+            &transaction,
+            &ImportRequest {
+                world_id: WORLD.into(),
+                request_id: "import-3".into(),
+                producer: None,
+                package_id: "marble-living-cabin".into(),
+                package_version: "1.2.0".into(),
+                state_sha256: "nope".into(),
+                state_json,
+            },
+        )
         .unwrap_err();
         assert_eq!(code, "invalid_import_hash");
+    }
+
+    #[test]
+    fn activity_projection_changes_require_internal_authority_not_producer_text() {
+        let mut connection = setup();
+        import(&mut connection, "import-activity", fixture()).unwrap();
+        connection.execute_batch("CREATE TABLE world_activity_runs(world_id TEXT PRIMARY KEY,payload TEXT NOT NULL);").unwrap();
+        connection
+            .execute("INSERT INTO world_activity_runs VALUES(?1,'{}')", [WORLD])
+            .unwrap();
+        let mut changed = fixture();
+        changed["activeActivity"] = json!({"definitionID":"sit","startedAt":0});
+        let request = CommitRequest {
+            world_id: WORLD.into(),
+            request_id: "activity-change".into(),
+            expected_revision: 1,
+            producer: Some("world_activity".into()),
+            intent: None,
+            ops: vec![Op {
+                state: Some(changed),
+                ..reload()
+            }],
+        };
+        {
+            let transaction = connection.transaction().unwrap();
+            assert_eq!(
+                super::commit(&transaction, &request),
+                Err("world_activity_owned_projection")
+            );
+        }
+        {
+            let transaction = connection.transaction().unwrap();
+            assert_eq!(
+                super::commit_activity(&transaction, &request).unwrap()["revision"],
+                2
+            );
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "forged-stop",
+                2,
+                vec![Op {
+                    state: Some(fixture()),
+                    ..reload()
+                }]
+            ),
+            "world_activity_owned_projection"
+        );
+    }
+
+    #[test]
+    fn activity_owned_usage_rejects_forged_terminal_and_preserves_layout_writes() {
+        let mut connection = setup();
+        let id = "wish-prop-ebfc07be";
+        let key = "gmgn.prop-usage.v1";
+        let mut initial = fixture();
+        initial["objectStates"][id]["metadata"][key] =
+            json!("{\"status\":\"running\",\"activityRequestID\":\"actual-run\"}");
+        import(&mut connection, "usage-import", initial.clone()).unwrap();
+        connection.execute_batch("CREATE TABLE world_activity_runs(world_id TEXT PRIMARY KEY,payload TEXT NOT NULL);").unwrap();
+        connection
+            .execute("INSERT INTO world_activity_runs VALUES(?1,'{}')", [WORLD])
+            .unwrap();
+        let mut layout = initial.clone();
+        layout["objectStates"][id]["transform"]["position"]["x"] = json!(1.25);
+        layout["objectStates"][id]["metadata"]["user-note"] = json!("preserve user changes");
+        commit(
+            &mut connection,
+            "usage-layout",
+            1,
+            vec![Op {
+                state: Some(layout.clone()),
+                ..reload()
+            }],
+        )
+        .unwrap();
+        for (request_id, forged) in [
+            ("forged-complete", Some(json!("{\"status\":\"completed\"}"))),
+            (
+                "forged-run",
+                Some(json!(
+                    "{\"status\":\"running\",\"activityRequestID\":\"other\"}"
+                )),
+            ),
+            ("forged-clear", None),
+        ] {
+            let mut state = layout.clone();
+            if let Some(value) = forged {
+                state["objectStates"][id]["metadata"][key] = value;
+            } else {
+                state["objectStates"][id]["metadata"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+            }
+            let transaction = connection.transaction().unwrap();
+            let request = CommitRequest {
+                world_id: WORLD.into(),
+                request_id: request_id.into(),
+                expected_revision: 2,
+                producer: Some("world.activity".into()),
+                intent: None,
+                ops: vec![Op {
+                    state: Some(state),
+                    ..reload()
+                }],
+            };
+            assert_eq!(
+                super::commit(&transaction, &request),
+                Err("world_activity_owned_projection")
+            );
+        }
+        let mut inserted = layout.clone();
+        inserted["objectStates"]["wish-prop-02bfee6e"]["metadata"][key] =
+            json!("{\"status\":\"running\"}");
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "forged-insert",
+                2,
+                vec![Op {
+                    state: Some(inserted),
+                    ..reload()
+                }]
+            ),
+            "world_activity_owned_projection"
+        );
+        let mut forged_object = layout["objectStates"][id].clone();
+        forged_object["metadata"][key] = json!("{\"status\":\"completed\"}");
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "forged-object-terminal",
+                2,
+                vec![Op {
+                    op: "upsertObject".into(),
+                    object_id: Some(id.into()),
+                    object: Some(forged_object),
+                    ..Default::default()
+                }]
+            ),
+            "world_activity_owned_projection"
+        );
+        let mut cleared_object = layout["objectStates"][id].clone();
+        cleared_object["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "forged-object-clear",
+                2,
+                vec![Op {
+                    op: "upsertObject".into(),
+                    object_id: Some(id.into()),
+                    object: Some(cleared_object),
+                    ..Default::default()
+                }]
+            ),
+            "world_activity_owned_projection"
+        );
+        // A normal object layout write with the exact usage projection works.
+        {
+            let transaction = connection.transaction().unwrap();
+            let request = CommitRequest {
+                world_id: WORLD.into(),
+                request_id: "usage-object-layout".into(),
+                expected_revision: 2,
+                producer: None,
+                intent: None,
+                ops: vec![Op {
+                    op: "upsertObject".into(),
+                    object_id: Some(id.into()),
+                    object: Some(layout["objectStates"][id].clone()),
+                    ..Default::default()
+                }],
+            };
+            assert_eq!(
+                super::commit(&transaction, &request).unwrap()["revision"],
+                3
+            );
+        }
+        assert_eq!(
+            commit_err(
+                &mut connection,
+                "forged-facts-activity",
+                2,
+                vec![Op {
+                    op: "setWorldFacts".into(),
+                    facts: Some(json!({"activeActivity":{"activityID":"forged"}})),
+                    ..Default::default()
+                }]
+            ),
+            "world_activity_owned_projection"
+        );
+        let mut legal = layout;
+        legal["objectStates"][id]["metadata"][key] =
+            json!("{\"status\":\"stopped\",\"activityRequestID\":\"actual-run\"}");
+        let transaction = connection.transaction().unwrap();
+        let request = CommitRequest {
+            world_id: WORLD.into(),
+            request_id: "real-usage-stop".into(),
+            expected_revision: 2,
+            producer: Some("world.activity".into()),
+            intent: None,
+            ops: vec![Op {
+                state: Some(legal),
+                ..reload()
+            }],
+        };
+        assert_eq!(
+            super::commit_activity(&transaction, &request).unwrap()["revision"],
+            3
+        );
+        transaction.commit().unwrap();
     }
 
     #[test]
@@ -2177,11 +2847,20 @@ mod tests {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
         let state = fixture();
-        let op = Op { state: Some(state.clone()), ..reload() };
+        let op = Op {
+            state: Some(state.clone()),
+            ..reload()
+        };
         // stale
-        assert_eq!(commit_err(&mut connection, "commit-stale", 0, vec![op.clone()]), "revision_conflict");
+        assert_eq!(
+            commit_err(&mut connection, "commit-stale", 0, vec![op.clone()]),
+            "revision_conflict"
+        );
         // future
-        assert_eq!(commit_err(&mut connection, "commit-future", 7, vec![op.clone()]), "revision_conflict");
+        assert_eq!(
+            commit_err(&mut connection, "commit-future", 7, vec![op.clone()]),
+            "revision_conflict"
+        );
         // exact
         let ok = commit(&mut connection, "commit-1", 1, vec![op]).unwrap();
         assert_eq!(ok["revision"], 2);
@@ -2193,7 +2872,10 @@ mod tests {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
         let stale = document(6965000, 16, vec![]);
-        let op = Op { state: Some(stale), ..reload() };
+        let op = Op {
+            state: Some(stale),
+            ..reload()
+        };
         assert_eq!(
             commit_err(&mut connection, "commit-old", 1, vec![op]),
             "subject_revision_regression"
@@ -2207,23 +2889,52 @@ mod tests {
     fn commit_replays_the_same_request_id_and_conflicts_on_different_content() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let moved = document(6965565, 16, vec![
-            ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", true, -2.0, (0.29, 0.35, 0.47))),
-            ("wish-prop-02bfee6e", object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086))),
-        ]);
-        let op = Op { state: Some(moved.clone()), ..reload() };
+        let moved = document(
+            6965565,
+            16,
+            vec![
+                (
+                    "wish-prop-ebfc07be",
+                    object_entry("wish-prop-ebfc07be", true, -2.0, (0.29, 0.35, 0.47)),
+                ),
+                (
+                    "wish-prop-02bfee6e",
+                    object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086)),
+                ),
+            ],
+        );
+        let op = Op {
+            state: Some(moved.clone()),
+            ..reload()
+        };
         let first = commit(&mut connection, "request-1", 1, vec![op.clone()]).unwrap();
         let replay = commit(&mut connection, "request-1", 1, vec![op]).unwrap();
         assert_eq!(replay["replayed"], true);
         assert_eq!(replay["revision"], first["revision"]);
         assert_eq!(replay["seq"], first["seq"]);
         // same id, different content: a contract violation, not a retry
-        let other = document(6965566, 16, vec![
-            ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", true, -3.5, (0.29, 0.35, 0.47))),
-            ("wish-prop-02bfee6e", object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086))),
-        ]);
-        let op = Op { state: Some(other), ..reload() };
-        assert_eq!(commit_err(&mut connection, "request-1", 1, vec![op]), "request_id_conflict");
+        let other = document(
+            6965566,
+            16,
+            vec![
+                (
+                    "wish-prop-ebfc07be",
+                    object_entry("wish-prop-ebfc07be", true, -3.5, (0.29, 0.35, 0.47)),
+                ),
+                (
+                    "wish-prop-02bfee6e",
+                    object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086)),
+                ),
+            ],
+        );
+        let op = Op {
+            state: Some(other),
+            ..reload()
+        };
+        assert_eq!(
+            commit_err(&mut connection, "request-1", 1, vec![op]),
+            "request_id_conflict"
+        );
     }
 
     #[test]
@@ -2231,77 +2942,154 @@ mod tests {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
         let before = fact_kinds(&connection);
-        assert_eq!(before, vec!["world.imported", "object.registered", "object.registered"]);
+        assert_eq!(
+            before,
+            vec!["world.imported", "object.registered", "object.registered"]
+        );
         // move one object, resize the other
-        let next = document(6965565, 17, vec![
-            ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", false, -2.625, (0.29, 0.35, 0.47))),
-            ("wish-prop-02bfee6e", object_entry("wish-prop-02bfee6e", true, -2.625, (0.95, 0.755, 0.093))),
-        ]);
-        let op = Op { state: Some(next), ..reload() };
+        let next = document(
+            6965565,
+            17,
+            vec![
+                (
+                    "wish-prop-ebfc07be",
+                    object_entry("wish-prop-ebfc07be", false, -2.625, (0.29, 0.35, 0.47)),
+                ),
+                (
+                    "wish-prop-02bfee6e",
+                    object_entry("wish-prop-02bfee6e", true, -2.625, (0.95, 0.755, 0.093)),
+                ),
+            ],
+        );
+        let op = Op {
+            state: Some(next),
+            ..reload()
+        };
         let result = commit(&mut connection, "request-1", 1, vec![op]).unwrap();
         assert_eq!(result["facts"].as_array().unwrap().len(), 3);
         let after = fact_kinds(&connection);
         // object id order is the deterministic order of the stored document
-        assert_eq!(&after[3..], &["world.stateCommitted", "object.resized", "object.withdrawn"]);
+        assert_eq!(
+            &after[3..],
+            &["world.stateCommitted", "object.resized", "object.withdrawn"]
+        );
         // the committed document is the one the caller sent
-        assert_eq!(canonical(&snapshot_state(&connection)).unwrap(),
-                   canonical(&document(6965565, 17, vec![
-                       ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", false, -2.625, (0.29, 0.35, 0.47))),
-                       ("wish-prop-02bfee6e", object_entry("wish-prop-02bfee6e", true, -2.625, (0.95, 0.755, 0.093))),
-                   ])).unwrap());
+        assert_eq!(
+            canonical(&snapshot_state(&connection)).unwrap(),
+            canonical(&document(
+                6965565,
+                17,
+                vec![
+                    (
+                        "wish-prop-ebfc07be",
+                        object_entry("wish-prop-ebfc07be", false, -2.625, (0.29, 0.35, 0.47))
+                    ),
+                    (
+                        "wish-prop-02bfee6e",
+                        object_entry("wish-prop-02bfee6e", true, -2.625, (0.95, 0.755, 0.093))
+                    ),
+                ]
+            ))
+            .unwrap()
+        );
     }
 
     #[test]
     fn object_revisions_advance_only_for_the_object_that_changed() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let record = snapshot(&connection, &SnapshotRequest {
-            world_id: WORLD.into(),
-            include_state: Some(false),
-        })
+        let record = snapshot(
+            &connection,
+            &SnapshotRequest {
+                world_id: WORLD.into(),
+                include_state: Some(false),
+            },
+        )
         .unwrap();
         let revisions: BTreeMap<String, i64> = record["record"]["objects"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|entry| (entry["objectID"].as_str().unwrap().to_owned(), entry["revision"].as_i64().unwrap()))
+            .map(|entry| {
+                (
+                    entry["objectID"].as_str().unwrap().to_owned(),
+                    entry["revision"].as_i64().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(revisions["wish-prop-ebfc07be"], 1);
         assert_eq!(revisions["wish-prop-02bfee6e"], 1);
 
-        let next = document(6965565, 17, vec![
-            ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", true, -2.0, (0.29, 0.35, 0.47))),
-            ("wish-prop-02bfee6e", object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086))),
-        ]);
-        let op = Op { state: Some(next), ..reload() };
+        let next = document(
+            6965565,
+            17,
+            vec![
+                (
+                    "wish-prop-ebfc07be",
+                    object_entry("wish-prop-ebfc07be", true, -2.0, (0.29, 0.35, 0.47)),
+                ),
+                (
+                    "wish-prop-02bfee6e",
+                    object_entry("wish-prop-02bfee6e", true, -2.625, (0.88, 0.7, 0.086)),
+                ),
+            ],
+        );
+        let op = Op {
+            state: Some(next),
+            ..reload()
+        };
         commit(&mut connection, "request-1", 1, vec![op]).unwrap();
-        let record = snapshot(&connection, &SnapshotRequest {
-            world_id: WORLD.into(),
-            include_state: Some(false),
-        })
+        let record = snapshot(
+            &connection,
+            &SnapshotRequest {
+                world_id: WORLD.into(),
+                include_state: Some(false),
+            },
+        )
         .unwrap();
         let revisions: BTreeMap<String, i64> = record["record"]["objects"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|entry| (entry["objectID"].as_str().unwrap().to_owned(), entry["revision"].as_i64().unwrap()))
+            .map(|entry| {
+                (
+                    entry["objectID"].as_str().unwrap().to_owned(),
+                    entry["revision"].as_i64().unwrap(),
+                )
+            })
             .collect();
-        assert_eq!(revisions["wish-prop-ebfc07be"], 2, "moved object keeps its own revision");
-        assert_eq!(revisions["wish-prop-02bfee6e"], 1, "untouched object must not advance");
+        assert_eq!(
+            revisions["wish-prop-ebfc07be"], 2,
+            "moved object keeps its own revision"
+        );
+        assert_eq!(
+            revisions["wish-prop-02bfee6e"], 1,
+            "untouched object must not advance"
+        );
     }
 
     #[test]
     fn removed_object_is_tombstoned_and_omitted_from_the_document() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let next = document(6965565, 17, vec![
-            ("wish-prop-ebfc07be", object_entry("wish-prop-ebfc07be", true, -2.625, (0.29, 0.35, 0.47))),
-        ]);
-        let op = Op { state: Some(next), ..reload() };
+        let next = document(
+            6965565,
+            17,
+            vec![(
+                "wish-prop-ebfc07be",
+                object_entry("wish-prop-ebfc07be", true, -2.625, (0.29, 0.35, 0.47)),
+            )],
+        );
+        let op = Op {
+            state: Some(next),
+            ..reload()
+        };
         let result = commit(&mut connection, "request-1", 1, vec![op]).unwrap();
         assert_eq!(result["changedObjects"], json!(["wish-prop-02bfee6e"]));
         let materialized = snapshot_state(&connection);
-        assert!(materialized["objectStates"].get("wish-prop-02bfee6e").is_none());
+        assert!(materialized["objectStates"]
+            .get("wish-prop-02bfee6e")
+            .is_none());
         let tombstone: i64 = connection
             .query_row(
                 "SELECT tombstone FROM world_records WHERE world_id=?1 AND domain=?2 AND key=?3",
@@ -2319,15 +3107,28 @@ mod tests {
         import(&mut connection, "import-1", fixture()).unwrap();
         let op = Op {
             op: "upsertObject".into(),
-            object: Some(object_entry("wish-prop-ebfc07be", true, -2.0, (0.29, 0.35, 0.47))),
+            object: Some(object_entry(
+                "wish-prop-ebfc07be",
+                true,
+                -2.0,
+                (0.29, 0.35, 0.47),
+            )),
             object_id: Some("wish-prop-ebfc07be".into()),
             expected_object_revision: Some(5),
             ..Op::default()
         };
-        assert_eq!(commit_err(&mut connection, "request-1", 1, vec![op]), "object_revision_conflict");
+        assert_eq!(
+            commit_err(&mut connection, "request-1", 1, vec![op]),
+            "object_revision_conflict"
+        );
         let op = Op {
             op: "upsertObject".into(),
-            object: Some(object_entry("wish-prop-ebfc07be", true, -2.0, (0.29, 0.35, 0.47))),
+            object: Some(object_entry(
+                "wish-prop-ebfc07be",
+                true,
+                -2.0,
+                (0.29, 0.35, 0.47),
+            )),
             object_id: Some("wish-prop-ebfc07be".into()),
             expected_object_revision: Some(1),
             ..Op::default()
@@ -2340,29 +3141,38 @@ mod tests {
     fn facts_read_window_returns_a_monotonic_next_cursor() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let (facts, next) = read_facts(&connection, &FactsRequest {
-            world_id: WORLD.into(),
-            after: Some(0),
-            limit: Some(2),
-        })
+        let (facts, next) = read_facts(
+            &connection,
+            &FactsRequest {
+                world_id: WORLD.into(),
+                after: Some(0),
+                limit: Some(2),
+            },
+        )
         .unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(next, facts[1]["seq"].as_i64().unwrap());
-        let (rest, next2) = read_facts(&connection, &FactsRequest {
-            world_id: WORLD.into(),
-            after: Some(next),
-            limit: Some(100),
-        })
+        let (rest, next2) = read_facts(
+            &connection,
+            &FactsRequest {
+                world_id: WORLD.into(),
+                after: Some(next),
+                limit: Some(100),
+            },
+        )
         .unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(next2, rest[0]["seq"].as_i64().unwrap());
         assert!(next2 > next);
         // a re-read of the same window is stable
-        let (again, next3) = read_facts(&connection, &FactsRequest {
-            world_id: WORLD.into(),
-            after: Some(0),
-            limit: Some(2),
-        })
+        let (again, next3) = read_facts(
+            &connection,
+            &FactsRequest {
+                world_id: WORLD.into(),
+                after: Some(0),
+                limit: Some(2),
+            },
+        )
         .unwrap();
         assert_eq!(again, facts);
         assert_eq!(next3, next);
@@ -2389,14 +3199,28 @@ mod tests {
     fn records_expose_the_cloud_sync_shape() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let records = read_records(&connection, &RecordsRequest {
-            world_id: WORLD.into(),
-            domain: None,
-        })
+        let records = read_records(
+            &connection,
+            &RecordsRequest {
+                world_id: WORLD.into(),
+                domain: None,
+            },
+        )
         .unwrap();
         assert_eq!(records.len(), 3); // 1 world + 2 objects
         for record in &records {
-            for key in ["id", "scope", "domain", "key", "revision", "updatedAt", "updatedBy", "tombstone", "hash", "value"] {
+            for key in [
+                "id",
+                "scope",
+                "domain",
+                "key",
+                "revision",
+                "updatedAt",
+                "updatedBy",
+                "tombstone",
+                "hash",
+                "value",
+            ] {
                 assert!(record.get(key).is_some(), "missing {key} in {record}");
             }
             assert_eq!(record["scope"], format!("world:{}", WORLD));
@@ -2405,10 +3229,13 @@ mod tests {
             assert_eq!(record["tombstone"], false);
             assert_eq!(record["hash"].as_str().unwrap().len(), 64);
         }
-        let objects = read_records(&connection, &RecordsRequest {
-            world_id: WORLD.into(),
-            domain: Some(OBJECT_DOMAIN.into()),
-        })
+        let objects = read_records(
+            &connection,
+            &RecordsRequest {
+                world_id: WORLD.into(),
+                domain: Some(OBJECT_DOMAIN.into()),
+            },
+        )
         .unwrap();
         assert_eq!(objects.len(), 2);
         assert!(objects[0]["id"].as_str().unwrap().starts_with("object:"));
@@ -2417,56 +3244,85 @@ mod tests {
     #[test]
     fn blob_put_is_content_addressed_and_verifies_the_hash() {
         let connection = setup();
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let bytes = b"glTF\x02\x00\x00\x00 fake model bytes";
         let path = root.join("model.glb");
         std::fs::write(&path, bytes).unwrap();
         let sha256 = digest_text_bytes(bytes);
-        let stored = blob_put(&connection, &root, &BlobPutRequest {
-            sha256: sha256.clone(),
-            mime: "model/gltf-binary".into(),
-            local_path: path.to_string_lossy().into_owned(),
-            remote_key: None,
-        })
+        let stored = blob_put(
+            &connection,
+            &root,
+            &BlobPutRequest {
+                sha256: sha256.clone(),
+                mime: "model/gltf-binary".into(),
+                local_path: path.to_string_lossy().into_owned(),
+                remote_key: None,
+            },
+        )
         .unwrap();
         assert_eq!(stored["sha256"], sha256);
         assert_eq!(stored["bytes"], bytes.len() as i64);
         // idempotent by content: a second put is a no-op, not a second row
-        blob_put(&connection, &root, &BlobPutRequest {
-            sha256: sha256.clone(),
-            mime: "model/gltf-binary".into(),
-            local_path: path.to_string_lossy().into_owned(),
-            remote_key: Some("cloud/model.glb".into()),
-        })
+        blob_put(
+            &connection,
+            &root,
+            &BlobPutRequest {
+                sha256: sha256.clone(),
+                mime: "model/gltf-binary".into(),
+                local_path: path.to_string_lossy().into_owned(),
+                remote_key: Some("cloud/model.glb".into()),
+            },
+        )
         .unwrap();
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM world_blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
-        let fetched = blob_get(&connection, &root, &BlobGetRequest { sha256: sha256.clone() }).unwrap();
+        let fetched = blob_get(
+            &connection,
+            &root,
+            &BlobGetRequest {
+                sha256: sha256.clone(),
+            },
+        )
+        .unwrap();
         assert_eq!(fetched["blob"]["remoteKey"], "cloud/model.glb");
         // 本机绝对路径是本机细节；外发必须用相对私根的 localRef。
         assert_eq!(fetched["blob"]["localState"], "present");
         assert_eq!(fetched["blob"]["localRef"], "model.glb");
         // a declared hash that does not match the bytes is refused
-        let code = blob_put(&connection, &root, &BlobPutRequest {
-            sha256: "1".repeat(64),
-            mime: "model/gltf-binary".into(),
-            local_path: path.to_string_lossy().into_owned(),
-            remote_key: None,
-        })
+        let code = blob_put(
+            &connection,
+            &root,
+            &BlobPutRequest {
+                sha256: "1".repeat(64),
+                mime: "model/gltf-binary".into(),
+                local_path: path.to_string_lossy().into_owned(),
+                remote_key: None,
+            },
+        )
         .unwrap_err();
         assert_eq!(code, "blob_hash_mismatch");
         // and bytes outside the private root are refused by path, not by hash
-        let outside = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-outside-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-outside-{}", uuid::Uuid::new_v4()));
         std::fs::write(&outside, bytes).unwrap();
-        let code = blob_put(&connection, &root, &BlobPutRequest {
-            sha256: digest_text_bytes(bytes),
-            mime: "model/gltf-binary".into(),
-            local_path: outside.to_string_lossy().into_owned(),
-            remote_key: None,
-        })
+        let code = blob_put(
+            &connection,
+            &root,
+            &BlobPutRequest {
+                sha256: digest_text_bytes(bytes),
+                mime: "model/gltf-binary".into(),
+                local_path: outside.to_string_lossy().into_owned(),
+                remote_key: None,
+            },
+        )
         .unwrap_err();
         assert_eq!(code, "blob_outside_private_root");
         std::fs::remove_dir_all(&root).ok();
@@ -2477,7 +3333,10 @@ mod tests {
     fn blob_get_reports_a_missing_local_file_and_appends_a_visible_fact() {
         let mut connection = setup();
         import(&mut connection, "import-1", fixture()).unwrap();
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let bytes = b"glTF\x02\x00\x00\x00 fake model bytes";
         let path = root.join("model.glb");
@@ -2506,7 +3365,14 @@ mod tests {
         commit(&mut connection, "blob-ref", 1, vec![op]).unwrap();
         // 写侧校验通过 ≠ 字节还在：把文件删掉，读侧必须**可见地**失败。
         std::fs::remove_file(&path).unwrap();
-        let fetched = blob_get(&connection, &root, &BlobGetRequest { sha256: sha256.clone() }).unwrap();
+        let fetched = blob_get(
+            &connection,
+            &root,
+            &BlobGetRequest {
+                sha256: sha256.clone(),
+            },
+        )
+        .unwrap();
         assert_eq!(fetched["blob"]["localState"], "missing");
         assert!(fetched["blob"]["observedBytes"].is_null());
         // 文件不在了也必须给得出**相对**引用：那正是最需要它的时候。
@@ -2525,12 +3391,22 @@ mod tests {
             },
         )
         .unwrap();
-        let missing: Vec<&Value> = facts.iter().filter(|fact| fact["kind"] == "blob.missing").collect();
+        let missing: Vec<&Value> = facts
+            .iter()
+            .filter(|fact| fact["kind"] == "blob.missing")
+            .collect();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0]["subject"]["domain"], "blobs");
         assert_eq!(missing[0]["subject"]["key"], sha256);
         // 幂等：再读一次不留第二条同样的事实。
-        blob_get(&connection, &root, &BlobGetRequest { sha256: sha256.clone() }).unwrap();
+        blob_get(
+            &connection,
+            &root,
+            &BlobGetRequest {
+                sha256: sha256.clone(),
+            },
+        )
+        .unwrap();
         let (facts, _) = read_facts(
             &connection,
             &FactsRequest {
@@ -2540,14 +3416,23 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(facts.iter().filter(|fact| fact["kind"] == "blob.missing").count(), 1);
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact["kind"] == "blob.missing")
+                .count(),
+            1
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn blob_get_reports_a_truncated_local_file_as_corrupt() {
         let connection = setup();
-        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gmgn-world-blob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let bytes = b"glTF\x02\x00\x00\x00 fake model bytes";
         let path = root.join("model.glb");
@@ -2566,12 +3451,26 @@ mod tests {
         .unwrap();
         // 截断：大小先对不上，直接判 corrupt（不会拿半个模型去渲染）。
         std::fs::write(&path, &bytes[..8]).unwrap();
-        let fetched = blob_get(&connection, &root, &BlobGetRequest { sha256: sha256.clone() }).unwrap();
+        let fetched = blob_get(
+            &connection,
+            &root,
+            &BlobGetRequest {
+                sha256: sha256.clone(),
+            },
+        )
+        .unwrap();
         assert_eq!(fetched["blob"]["localState"], "corrupt");
         assert_eq!(fetched["blob"]["observedBytes"], 8);
         // 等长改写也必须被抓到：这时只能靠重算 sha256。
         std::fs::write(&path, b"glTF\x02\x00\x00\x00 FAKE model bytes").unwrap();
-        let fetched = blob_get(&connection, &root, &BlobGetRequest { sha256: sha256.clone() }).unwrap();
+        let fetched = blob_get(
+            &connection,
+            &root,
+            &BlobGetRequest {
+                sha256: sha256.clone(),
+            },
+        )
+        .unwrap();
         assert_eq!(fetched["blob"]["localState"], "corrupt");
         assert_eq!(fetched["blob"]["observedBytes"], bytes.len() as i64);
         // 一个引用都没有的 blob 落到保留 scope，但事实依然可读。
@@ -2584,7 +3483,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(facts.iter().filter(|fact| fact["kind"] == "blob.corrupt").count(), 1);
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact["kind"] == "blob.corrupt")
+                .count(),
+            1
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2595,37 +3500,68 @@ mod tests {
         // worldID that does not match the request
         let mut mismatched = fixture();
         mismatched["worldID"] = json!("some-other-world");
-        let op = Op { state: Some(mismatched), ..reload() };
-        assert_eq!(commit_err(&mut connection, "bad-1", 1, vec![op]), "world_id_mismatch");
+        let op = Op {
+            state: Some(mismatched),
+            ..reload()
+        };
+        assert_eq!(
+            commit_err(&mut connection, "bad-1", 1, vec![op]),
+            "world_id_mismatch"
+        );
         // an object whose generated-prop blob is not decodable
         let mut broken = fixture();
-        broken["objectStates"]["wish-prop-ebfc07be"]["metadata"][GENERATED_PROP_KEY] = json!("{not json");
-        let op = Op { state: Some(broken), ..reload() };
-        assert_eq!(commit_err(&mut connection, "bad-2", 1, vec![op]), "invalid_generated_prop");
+        broken["objectStates"]["wish-prop-ebfc07be"]["metadata"][GENERATED_PROP_KEY] =
+            json!("{not json");
+        let op = Op {
+            state: Some(broken),
+            ..reload()
+        };
+        assert_eq!(
+            commit_err(&mut connection, "bad-2", 1, vec![op]),
+            "invalid_generated_prop"
+        );
         // a document whose object entry carries an unknown field
         let mut unknown = fixture();
         unknown["objectStates"]["wish-prop-ebfc07be"]["colour"] = json!("red");
-        let op = Op { state: Some(unknown), ..reload() };
-        assert_eq!(commit_err(&mut connection, "bad-3", 1, vec![op]), "invalid_world_state");
+        let op = Op {
+            state: Some(unknown),
+            ..reload()
+        };
+        assert_eq!(
+            commit_err(&mut connection, "bad-3", 1, vec![op]),
+            "invalid_world_state"
+        );
         // setWorldFacts may not smuggle object state past the object records
         let op = Op {
             op: "setWorldFacts".into(),
             facts: Some(json!({"objectStates": {}})),
             ..Op::default()
         };
-        assert_eq!(commit_err(&mut connection, "bad-4", 1, vec![op]), "invalid_world_facts");
+        assert_eq!(
+            commit_err(&mut connection, "bad-4", 1, vec![op]),
+            "invalid_world_facts"
+        );
         // an unknown op name is refused rather than ignored
-        let op = Op { op: "teleport".into(), ..Op::default() };
-        assert_eq!(commit_err(&mut connection, "bad-5", 1, vec![op]), "invalid_op");
+        let op = Op {
+            op: "teleport".into(),
+            ..Op::default()
+        };
+        assert_eq!(
+            commit_err(&mut connection, "bad-5", 1, vec![op]),
+            "invalid_op"
+        );
     }
 
     #[test]
     fn snapshot_of_an_unknown_world_is_null_not_an_empty_world() {
         let connection = setup();
-        let record = snapshot(&connection, &SnapshotRequest {
-            world_id: "nobody".into(),
-            include_state: Some(true),
-        })
+        let record = snapshot(
+            &connection,
+            &SnapshotRequest {
+                world_id: "nobody".into(),
+                include_state: Some(true),
+            },
+        )
         .unwrap();
         assert_eq!(record["record"], Value::Null);
     }
@@ -2648,9 +3584,15 @@ mod tests {
 
         // limit：0 与超过上限 invalid_limit；1 与 MAX_READ_LIMIT 是合法边界。
         assert_eq!(read_window(None, Some(0)), Err("invalid_limit"));
-        assert_eq!(read_window(None, Some(MAX_READ_LIMIT + 1)), Err("invalid_limit"));
+        assert_eq!(
+            read_window(None, Some(MAX_READ_LIMIT + 1)),
+            Err("invalid_limit")
+        );
         assert_eq!(read_window(None, Some(1)), Ok((0, 1)));
-        assert_eq!(read_window(None, Some(MAX_READ_LIMIT)), Ok((0, MAX_READ_LIMIT)));
+        assert_eq!(
+            read_window(None, Some(MAX_READ_LIMIT)),
+            Ok((0, MAX_READ_LIMIT))
+        );
         // 缺省仍是权威的默认值（不是 0，也不是"不限制"）。
         assert_eq!(read_window(None, None), Ok((0, DEFAULT_READ_LIMIT)));
 
@@ -2661,7 +3603,12 @@ mod tests {
             "invalid_revision"
         );
         assert_eq!(
-            commit_err(&mut connection, "very-negative-revision", i64::MIN, vec![reload()]),
+            commit_err(
+                &mut connection,
+                "very-negative-revision",
+                i64::MIN,
+                vec![reload()]
+            ),
             "invalid_revision"
         );
 

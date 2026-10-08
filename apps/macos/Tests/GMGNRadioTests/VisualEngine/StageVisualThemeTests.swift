@@ -6,8 +6,11 @@ import Testing
 @Test
 @MainActor
 func stageUsesANearBlackCanvasForNeonVisuals() throws {
+    let spatialStage = SpatialStageStore()
     let controller = StageWindowController(
-        audioFeatures: VisualAudioFeatureStore()
+        audioFeatures: VisualAudioFeatureStore(),
+        spatialStage: spatialStage,
+        marbleLibrary: stageMarbleLibraryForUI(spatialStage: spatialStage)
     )
     controller.show()
 

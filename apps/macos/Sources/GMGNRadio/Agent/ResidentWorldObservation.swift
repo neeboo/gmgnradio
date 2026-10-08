@@ -6,7 +6,8 @@ enum ResidentWorldObservation {
     static func event(
         _ event: WorldEvent,
         worldID: String,
-        scopeID: String
+        scopeID: String,
+        authorityFact: Bool = false
     ) -> ResidentAgentLoop.Event? {
         let kind: String
         let summary: String
@@ -74,6 +75,10 @@ enum ResidentWorldObservation {
         let dedupeID: String
         if case .observationGap = event.kind {
             dedupeID = "observation-gap:\(scopeID):\(worldID):\(event.sequence)"
+        } else if authorityFact {
+            // SQLite fact sequence survives host/context replacement. Do not
+            // include the native observer's ephemeral scope in this identity.
+            dedupeID = "world-fact:\(worldID):\(event.sequence)"
         } else {
             dedupeID = "world:\(scopeID):\(worldID):\(event.sequence)"
         }

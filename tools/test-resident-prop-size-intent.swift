@@ -1236,7 +1236,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
   }
   try await Task.sleep(for: .milliseconds(200))
   check(readSubmits(scratch).count == beforeDeclared, "畸形尺寸一个提交都不许发出去")
-  let axisPending = coordinator.pendingDrafts(worldID: world, residentScope: resident)
+  let axisPending = try await coordinator.pendingDrafts(worldID: world, residentScope: resident)
   check(axisPending.contains { $0.id.uuidString == axisPendingID },
       "缺轴的草稿必须落盘（续办要用它）")
 

@@ -1,24 +1,27 @@
 import Foundation
 
 /// Reads the user's existing library and prepares one explicitly chosen track.
-/// The only mutation of the official playback queue is the synchronous commit.
+/// Commits playback only after authority-confirmed program construction.
 @MainActor
 final class MusicLibraryAgentService {
     private let store: SyncedMusicLibraryStore
+    private let programClient: RustMusicProgramClient
     private let fetchPage: @MainActor (MusicProviderID, String, Int, Int) async throws -> MusicPlaylistPage
     private let makeQueue: @MainActor () -> ProgramPlaybackQueue
     private let isCurrent: @MainActor () -> Bool
-    private let commit: @MainActor (ProgramPlan, ProgramPlaybackQueue, Int) throws -> Void
+    private let commit: @MainActor (ProgramPlan, ProgramPlaybackQueue, Int) async throws -> Void
     private var isPreparing = false
 
     init(
         store: SyncedMusicLibraryStore,
+        programClient: RustMusicProgramClient? = nil,
         fetchPage: @escaping @MainActor (MusicProviderID, String, Int, Int) async throws -> MusicPlaylistPage,
         makeQueue: @escaping @MainActor () -> ProgramPlaybackQueue,
         isCurrent: @escaping @MainActor () -> Bool,
-        commit: @escaping @MainActor (ProgramPlan, ProgramPlaybackQueue, Int) throws -> Void
+        commit: @escaping @MainActor (ProgramPlan, ProgramPlaybackQueue, Int) async throws -> Void
     ) {
         self.store = store
+        self.programClient = programClient ?? RustMusicProgramClient()
         self.fetchPage = fetchPage
         self.makeQueue = makeQueue
         self.isCurrent = isCurrent
@@ -53,23 +56,17 @@ final class MusicLibraryAgentService {
                 let cachedCount = playlist.tracks.count
                 let requestedCount = min(offset + limit, playlist.trackCount) - cachedCount
                 let page: MusicPlaylistPage
+                let ticket = try await store.beginPage(playlistID: playlistID, offset: cachedCount,
+                    limit: requestedCount, strict: true)
                 do {
-                    page = try await fetchPage(playlist.providerID, playlistID, cachedCount, requestedCount)
+                    page = try await fetchPage(ticket.providerID, ticket.playlistID, ticket.offset, ticket.limit)
+                    try checkCurrent()
+                    try await store.append(page, ticket: ticket)
                 } catch {
+                    await store.endPage(ticket)
                     try checkCurrent()
                     throw DJAgentMusicLibraryError.libraryUnavailable
                 }
-                try checkCurrent()
-                guard store.playlist(id: playlistID) == playlist else { throw DJAgentMusicLibraryError.interrupted }
-                guard page.playlistID == playlistID, page.offset == cachedCount,
-                      !page.tracks.isEmpty, page.tracks.count <= requestedCount,
-                      page.tracks.allSatisfy({ $0.providerID == playlist.providerID }),
-                      Set(page.tracks.map(\.id)).count == page.tracks.count,
-                      Set(page.tracks.map(\.id)).isDisjoint(with: Set(playlist.tracks.map(\.id))) else {
-                    throw DJAgentMusicLibraryError.libraryUnavailable
-                }
-                store.append(page)
-                try await store.flush()
                 playlist = try supportedPlaylist(id: playlistID)
             }
         }
@@ -92,7 +89,7 @@ final class MusicLibraryAgentService {
         guard Self.supports(playlist.tracks[index].providerID) else { throw DJAgentMusicLibraryError.sourceUnsupported }
         isPreparing = true
         defer { isPreparing = false }
-        let plan = SyncedPlaylistProgramBuilder.makePlan(from: playlist)
+        let plan = try await SyncedPlaylistProgramBuilder.makePlan(from: playlist, client: programClient)
         let queue = makeQueue()
         do {
             try await queue.select(plan, at: index)
@@ -107,7 +104,7 @@ final class MusicLibraryAgentService {
         }
         guard case .localFile = prepared.target else { throw DJAgentMusicLibraryError.sourceUnsupported }
         do {
-            try commit(plan, queue, index)
+            try await commit(plan, queue, index)
         } catch let error as DJAgentMusicLibraryError {
             throw error
         } catch is CancellationError {

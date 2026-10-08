@@ -26,48 +26,35 @@ extension DJShowPlanningAgent {
     }
 }
 
-struct AgentProgramPlanner: Sendable {
+protocol DJPlanningConfigurationProviding: DJTrackRankingAgent {
+    var planningConfiguration: DJPlanningConfiguration { get }
+}
+
+@MainActor struct AgentProgramPlanner {
     private let agent: any DJTrackRankingAgent
-    private let fallback: ProgramPlanner
+    private let client: RustMusicProgramClient
 
     init(
         agent: any DJTrackRankingAgent,
-        fallback: ProgramPlanner = ProgramPlanner()
+        client: RustMusicProgramClient? = nil
     ) {
         self.agent = agent
-        self.fallback = fallback
+        self.client = client ?? RustMusicProgramClient()
     }
 
     func makePlan(
         brief: ProgramBrief,
-        candidates: [MusicCandidate],
-        revision: Int = 1,
-        generatedAt: Date = Date()
+        candidates: [MusicCandidate]
     ) async throws -> ProgramPlan {
-        let proposal: AgentShowProposal?
-        let preferredTrackIDs: [String]
-        if let showAgent = agent as? any DJShowPlanningAgent {
-            proposal = try? await showAgent.proposeShow(
-                brief: brief,
-                candidates: candidates
-            )
-            preferredTrackIDs = proposal?.slots.map(\.trackID) ?? []
-        } else {
-            proposal = nil
-            preferredTrackIDs = (
-                try? await agent.rankTracks(
-                    brief: brief,
-                    candidates: candidates
-                )
-            ) ?? []
+        try await makePlan(brief: brief, discoveryCandidates: candidates, libraryCandidates: [])
+    }
+    func makePlan(brief: ProgramBrief, discoveryCandidates: [MusicCandidate],
+                  libraryCandidates: [MusicCandidate]) async throws -> ProgramPlan {
+        guard let config = (agent as? any DJPlanningConfigurationProviding)?.planningConfiguration else {
+            throw CodexTrackRankingError.invalidResponse
         }
-        return try fallback.makePlan(
-            brief: brief,
-            candidates: candidates,
-            preferredTrackIDs: preferredTrackIDs,
-            showProposal: proposal,
-            revision: revision,
-            generatedAt: generatedAt
-        )
+        return try await client.plan(brief: brief, discoveryCandidates: discoveryCandidates,
+            libraryCandidates: libraryCandidates, hostPrompt: config.hostPrompt,
+            executable: config.executable, environment: config.environment, model: config.model)
     }
 }

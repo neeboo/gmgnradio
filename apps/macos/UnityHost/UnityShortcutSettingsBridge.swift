@@ -11,8 +11,8 @@ final class UnityShortcutSettingsBridge {
 
     static let supportedCommands = ["shortcuts.record", "shortcuts.capture", "shortcuts.cancel", "shortcuts.reset", "shortcuts.save", "shortcuts.global", "shortcuts.media"]
 
-    init(defaults: UserDefaults, performAction: @escaping @MainActor (GMGNShortcutAction) -> Void) {
-        store = GMGNShortcutSettingsStore(defaults: defaults)
+    init(defaults: UserDefaults, settings: RustProductSettingsClient = .shared, performAction: @escaping @MainActor (GMGNShortcutAction) -> Void) {
+        store = GMGNShortcutSettingsStore(defaults: defaults, settings: settings)
         coordinator = GMGNShortcutCoordinator(settings: store, performAction: performAction)
     }
 
@@ -31,7 +31,7 @@ final class UnityShortcutSettingsBridge {
         }, "globalEnabled": store.globalEnabled, "mediaKeysEnabled": store.mediaKeysEnabled,
          "recordingID": store.recordingTarget?.action.rawValue as Any? ?? NSNull(),
          "recordingScope": store.recordingTarget?.scope.rawValue as Any? ?? NSNull(),
-         "validationMessage": validationMessage as Any? ?? NSNull(), "notice": NSNull()]
+         "validationMessage": (validationMessage ?? store.settingsError) as Any? ?? NSNull(), "notice": NSNull()]
     }
 
     func command(_ value: [String: Any]) -> Bool {

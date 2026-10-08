@@ -21,7 +21,10 @@ func musicRedirectPolicyUpgradesHTTPAudioURLsToHTTPS() throws {
 }
 
 @Test
+@MainActor
 func streamingMusicCacheDownloadsWithProviderHeaders() async throws {
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
     let root = FileManager.default.temporaryDirectory
         .appending(path: "gmgn-stream-cache-tests-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -33,7 +36,7 @@ func streamingMusicCacheDownloadsWithProviderHeaders() async throws {
         ),
     ])
     let cache = StreamingMusicCache(
-        rootURL: root,
+        authority: privateStreamingCacheAuthority(authority.root),
         transport: transport
     )
     let asset = MusicPlaybackAsset(
@@ -56,7 +59,10 @@ func streamingMusicCacheDownloadsWithProviderHeaders() async throws {
 }
 
 @Test
+@MainActor
 func streamingMusicCacheReusesAnExistingCompleteFile() async throws {
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
     let root = FileManager.default.temporaryDirectory
         .appending(path: "gmgn-stream-cache-tests-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -68,7 +74,7 @@ func streamingMusicCacheReusesAnExistingCompleteFile() async throws {
         ),
     ])
     let cache = StreamingMusicCache(
-        rootURL: root,
+        authority: privateStreamingCacheAuthority(authority.root),
         transport: transport
     )
     let asset = MusicPlaybackAsset(
@@ -84,7 +90,10 @@ func streamingMusicCacheReusesAnExistingCompleteFile() async throws {
 }
 
 @Test
+@MainActor
 func streamingMusicCacheReplacesAnHTMLFileMasqueradingAsAudio() async throws {
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
     let root = FileManager.default.temporaryDirectory
         .appending(path: "gmgn-stream-cache-tests-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -92,18 +101,16 @@ func streamingMusicCacheReplacesAnHTMLFileMasqueradingAsAudio() async throws {
         at: root,
         withIntermediateDirectories: true
     )
-    let broken = root.appending(path: "netease-42.mp3")
-    try Data("<!DOCTYPE html><title>music</title>".utf8)
-        .write(to: broken)
     let transport = ProviderHTTPTransportStub(responses: [
         MusicProviderHTTPResponse(
             data: mp3Fixture(),
             statusCode: 200,
             mimeType: "audio/mpeg"
         ),
+        MusicProviderHTTPResponse(data: mp3Fixture(), statusCode: 200, mimeType: "audio/mpeg"),
     ])
     let cache = StreamingMusicCache(
-        rootURL: root,
+        authority: privateStreamingCacheAuthority(authority.root),
         transport: transport
     )
     let asset = MusicPlaybackAsset(
@@ -111,15 +118,20 @@ func streamingMusicCacheReplacesAnHTMLFileMasqueradingAsAudio() async throws {
         requestHeaders: [:]
     )
 
+    let broken = try await cache.store(asset, trackID: "netease:42")
+    try Data("<!DOCTYPE html><title>music</title>".utf8).write(to: broken)
     let localURL = try await cache.store(asset, trackID: "netease:42")
 
     #expect(localURL == broken)
     #expect(try Data(contentsOf: localURL) == mp3Fixture())
-    #expect(await transport.requests.count == 1)
+    #expect(await transport.requests.count == 2)
 }
 
 @Test
+@MainActor
 func streamingMusicCacheRejectsHTMLDownloadsBeforePersisting() async throws {
+    let authority = try await PrivateMusicAuthorityFixture.start()
+    defer { withExtendedLifetime(authority) {} }
     let root = FileManager.default.temporaryDirectory
         .appending(path: "gmgn-stream-cache-tests-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
@@ -131,7 +143,7 @@ func streamingMusicCacheRejectsHTMLDownloadsBeforePersisting() async throws {
         ),
     ])
     let cache = StreamingMusicCache(
-        rootURL: root,
+        authority: privateStreamingCacheAuthority(authority.root),
         transport: transport
     )
     let asset = MusicPlaybackAsset(
@@ -148,6 +160,12 @@ func streamingMusicCacheRejectsHTMLDownloadsBeforePersisting() async throws {
             atPath: root.appending(path: "netease-42.mp3").path
         )
     )
+}
+
+private func privateStreamingCacheAuthority(_ root: URL) -> RustMusicCacheClient {
+    RustMusicCacheClient(endpointFile: root.appendingPathComponent("taskd.endpoint.json").path,
+        helperPath: "/private-fixture-no-launch", allowsLaunching: false,
+        taskRoot: root, hostSessionID: UUID().uuidString)
 }
 
 private func mp3Fixture() -> Data {

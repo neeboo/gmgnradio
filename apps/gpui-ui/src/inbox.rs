@@ -51,9 +51,12 @@ impl InboxState {
     }
     fn open(&mut self) {
         if let Some(row) = self.selected_row() {
+            let Some(event) = row["eventID"].as_str().filter(|event| !event.is_empty()) else {
+                return;
+            };
             self.commands
                 .push(json!({"op":"inbox.open", "id": row["id"],
-                "scope":self.snapshot["scope"]}));
+                "scope":self.snapshot["scope"], "expectedEventID":event}));
         }
     }
     fn move_selection(&mut self, direction: isize) {
@@ -289,7 +292,7 @@ impl Render for InboxPane {
                     .label("打开")
                     .tooltip("打开选中的系统消息并标记为已读")
                     .accessibility_label("打开选中的系统消息")
-                    .disabled(self.state.selected_row().is_none())
+                    .disabled(!self.state.selected_row().is_some_and(|row| row["eventID"].as_str().is_some_and(|event| !event.is_empty())))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.state.open();
                         window.focus(&this.focus, cx);
@@ -332,7 +335,7 @@ impl Render for InboxPane {
 mod tests {
     use super::*;
     fn snapshot(scope: &str) -> Value {
-        json!({"scope":scope,"entries":[{"id":"one","isRead":false}]})
+        json!({"scope":scope,"entries":[{"id":"one","eventID":"event-one","isRead":false}]})
     }
     #[core::prelude::v1::test]
     fn selection_does_not_mark_read_or_send_command() {
@@ -365,9 +368,29 @@ mod tests {
         state.open();
         assert_eq!(
             state.commands,
-            vec![json!({"op":"inbox.open","id":"one","scope":"world-a"})]
+            vec![json!({"op":"inbox.open","id":"one","scope":"world-a","expectedEventID":"event-one"})]
         );
         assert_eq!(state.selected_row().unwrap()["isRead"], false);
+    }
+    #[core::prelude::v1::test]
+    fn queued_open_keeps_the_displayed_event_when_new_content_arrives() {
+        let mut state = InboxState::default();
+        state.update(snapshot("world-a"));
+        state.select("one".into());
+        state.open();
+        state.update(json!({"scope":"world-a","entries":[{"id":"one","eventID":"event-two","isRead":false}]}));
+        assert_eq!(state.commands[0]["expectedEventID"], "event-one");
+        assert_eq!(state.selected_row().unwrap()["isRead"], false);
+        state.open();
+        assert_eq!(state.commands[1]["expectedEventID"], "event-two");
+    }
+    #[core::prelude::v1::test]
+    fn open_without_a_confirmed_display_event_cannot_mark_read() {
+        let mut state = InboxState::default();
+        state.update(json!({"scope":"world-a","entries":[{"id":"one","isRead":false}]}));
+        state.select("one".into());
+        state.open();
+        assert!(state.commands.is_empty());
     }
     #[core::prelude::v1::test]
     fn scope_switch_and_removed_entry_invalidate_selection() {

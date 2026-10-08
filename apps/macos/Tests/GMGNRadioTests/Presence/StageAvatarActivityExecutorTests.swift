@@ -7,8 +7,8 @@ import WorldRuntime
 @MainActor
 struct StageAvatarActivityExecutorTests {
     @Test
-    func worldActivityCoexistsWithSpeakingWithoutChangingSelectionRevision() throws {
-        let fixture = try Fixture()
+    func worldActivityCoexistsWithSpeakingWithoutChangingSelectionRevision() async throws {
+        let fixture = try await Fixture()
         let selectionRevision = fixture.runtime.snapshot.revision
         fixture.runtime.setActivity(.speaking)
         fixture.runtime.setVoiceLevel(0.8)
@@ -37,8 +37,8 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func worldNavigationUsesAbsoluteVisualAnchorsWithoutAddingSavedPlacement() throws {
-        let fixture = try Fixture()
+    func worldNavigationUsesAbsoluteVisualAnchorsWithoutAddingSavedPlacement() async throws {
+        let fixture = try await Fixture()
         let base = StageAvatarPlacement(
             position: SIMD3<Float>(0.1, 0, 1.1),
             scale: 0.6,
@@ -60,15 +60,16 @@ struct StageAvatarActivityExecutorTests {
         #expect(fixture.stage.avatarPlacement.position == SIMD3<Float>(-0.3, 0.05, 0.3))
         #expect(fixture.stage.avatarPlacement.scale == base.scale)
 
-        let restored = SpatialStageStore(defaults: fixture.defaults)
+        let restored = SpatialStageStore(defaults: fixture.defaults, settings: try await fixture.settingsFixture.reopenedSettings())
+        try await restored.awaitSettingsReady()
         restored.selectWorld(id: fixture.worldID)
         restored.installAvatarPlacement(base)
         #expect(restored.avatarPlacement == base)
     }
 
     @Test
-    func warmKitchenCenterCannotBePushedOutsideTheVisibleRoomBySavedXYZ() throws {
-        let fixture = try Fixture()
+    func warmKitchenCenterCannotBePushedOutsideTheVisibleRoomBySavedXYZ() async throws {
+        let fixture = try await Fixture()
         fixture.stage.installAvatarPlacement(
             StageAvatarPlacement(
                 position: SIMD3<Float>(0, 0, 1.1),
@@ -76,8 +77,8 @@ struct StageAvatarActivityExecutorTests {
                 yaw: 0.67
             )
         )
-        fixture.stage.setAvatarPosition(-0.09, axis: .y)
-        fixture.stage.setAvatarPosition(-0.75, axis: .z)
+        try await fixture.stage.setAvatarPosition(rawValue: -0.09, axis: "y")
+        try await fixture.stage.setAvatarPosition(rawValue: -0.75, axis: "z")
 
         _ = fixture.executor.apply(
             transform: .test(
@@ -93,17 +94,17 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func worldSpawnKeepsTheUsersSavedXYZAndYaw() throws {
-        let fixture = try Fixture()
+    func worldSpawnKeepsTheUsersSavedXYZAndYaw() async throws {
+        let fixture = try await Fixture()
         let calibrated = StageAvatarPlacement(
             position: SIMD3<Float>(0, 0.055, 1.1),
             scale: 0.6,
             yaw: 0.67
         )
         fixture.stage.installAvatarPlacement(calibrated)
-        fixture.stage.setAvatarPosition(0, axis: .x)
-        fixture.stage.setAvatarPosition(-0.09, axis: .y)
-        fixture.stage.setAvatarPosition(-0.75, axis: .z)
+        try await fixture.stage.setAvatarPosition(rawValue: 0, axis: "x")
+        try await fixture.stage.setAvatarPosition(rawValue: -0.09, axis: "y")
+        try await fixture.stage.setAvatarPosition(rawValue: -0.75, axis: "z")
         let saved = fixture.stage.avatarPlacement
 
         _ = fixture.executor.apply(
@@ -120,8 +121,8 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func staleRevisionCannotReplaceActivityOrPlacement() throws {
-        let fixture = try Fixture()
+    func staleRevisionCannotReplaceActivityOrPlacement() async throws {
+        let fixture = try await Fixture()
         _ = fixture.executor.apply(
             transform: .test(position: .init(x: 0.4, y: 0, z: 0.2), yaw: 0.3),
             activity: .gaze(targetID: "window.gaze"),
@@ -144,8 +145,8 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func identicalWorldTicksDoNotReinstallTheVisibleActivity() throws {
-        let fixture = try Fixture()
+    func identicalWorldTicksDoNotReinstallTheVisibleActivity() async throws {
+        let fixture = try await Fixture()
         let transform = WorldTransform.test(
             position: .init(x: 0.4, y: 0, z: 0.2),
             yaw: 0.3
@@ -178,15 +179,15 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func completingActivityRestoresStablePlacementAndKeepsVoiceOverlay() throws {
-        let fixture = try Fixture()
+    func completingActivityRestoresStablePlacementAndKeepsVoiceOverlay() async throws {
+        let fixture = try await Fixture()
         let base = StageAvatarPlacement(
             position: SIMD3<Float>(0.2, 0, 0.9),
             scale: 0.62,
             yaw: 0.1
         )
         fixture.stage.installAvatarPlacement(base)
-        fixture.stage.setAvatarPosition(-0.25, axis: .x)
+        try await fixture.stage.setAvatarPosition(rawValue: -0.25, axis: "x")
         let userPlacement = fixture.stage.avatarPlacement
         fixture.runtime.setActivity(.listening)
 
@@ -205,8 +206,8 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func onlyApprovedTemporaryMotionCanReplaceNaturalIdle() throws {
-        let fixture = try Fixture()
+    func onlyApprovedTemporaryMotionCanReplaceNaturalIdle() async throws {
+        let fixture = try await Fixture()
         let approved = StageMotionAsset(
             id: "walk.forward",
             name: "Licensed Walk",
@@ -230,8 +231,8 @@ struct StageAvatarActivityExecutorTests {
     }
 
     @Test
-    func missingLivingMotionsAllFallBackToNaturalIdle() throws {
-        let fixture = try Fixture()
+    func missingLivingMotionsAllFallBackToNaturalIdle() async throws {
+        let fixture = try await Fixture()
         let activities: [LifeActivity] = [
             .walk(destinationID: "wp.center"),
             .sit(anchorID: "chair.sit"),
@@ -341,19 +342,22 @@ struct StageAvatarActivityExecutorTests {
     private final class Fixture {
         let worldID = "world-labs-example-warm-kitchen"
         let defaults: UserDefaults
+        let settingsFixture: PrivateStageSettingsFixture
         let runtime: StageAvatarRuntimeStore
         let stage: SpatialStageStore
         let executor: StageAvatarActivityExecutor
 
-        init() throws {
+        init() async throws {
             let suiteName = "StageAvatarActivityExecutorTests.\(UUID().uuidString)"
             defaults = try #require(UserDefaults(suiteName: suiteName))
             defaults.removePersistentDomain(forName: suiteName)
+            settingsFixture = try await PrivateStageSettingsFixture.start(defaults: defaults)
             runtime = StageAvatarRuntimeStore(
                 packageStore: nil,
                 motionPackageStore: nil
             )
-            stage = SpatialStageStore(defaults: defaults)
+            stage = SpatialStageStore(defaults: defaults, settings: settingsFixture.settings)
+            try await stage.awaitSettingsReady()
             stage.selectWorld(id: worldID)
             executor = StageAvatarActivityExecutor(
                 runtime: runtime,

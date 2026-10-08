@@ -111,6 +111,17 @@ final class WorldAgentContext {
     let collisionWorld: ReplaceableCollisionWorld
     private var baseCollisionWorld: any WorldCollisionQuerying
     private let authoredActivityCatalog: ActivityCatalog
+    private let rustActivityCatalog: RustActivityCatalogClient?
+    private let rustWorldActivity: RustWorldActivityClient?
+    private let rustPropCapability: RustPropCapabilityClient?
+    private var capabilityRefresh: Task<Void, Never>?
+    private var capabilityGeneration: UInt64 = 0
+    private var confirmedOperationSpots: [String: RustPropCapabilityClient.Target] = [:]
+    private var confirmedFunctionPointSpots: [String: RustPropCapabilityClient.Target] = [:]
+    private var confirmedDevicePlaces: [String: RustPropCapabilityClient.PlaceBinding] = [:]
+    private var confirmedDevicePlaceLayoutRevision: UInt64?
+    private var confirmedCapabilityCollisionRevision: UInt64?
+    private(set) var activityCatalogFault: Error?
 
     /// A bound prop capability becomes one concrete, discoverable activity with
     /// a standable operation spot resolved against the current collision world.
@@ -163,7 +174,16 @@ final class WorldAgentContext {
 
     private(set) var simulation: WorldSimulation
     private(set) var activityExecutor: ActivityExecutor
-    var currentActivityRequestID: String? { activityExecutor.currentRequestID }
+    var currentActivityRequestID: String? {
+        if let rustWorldActivity { return rustWorldActivity.running?.requestID }
+        return activityExecutor.currentRequestID
+    }
+    /// The current authority receipt, never an executor-invented activity identity.
+    var currentRustActivityRun: RustWorldActivityClient.Run? {rustWorldActivity?.running}
+    private var rustApproach: MovementRun?
+    private var rustActivityDeadlineTask: Task<Void, Never>?
+    private var rustActivityReceiptFault: Error?
+    private var rustCatalogInput: Data?
     var currentMovementRequestID: String? { movement?.requestID }
     private var movement: MovementRun?
     private var patrol: PatrolRun?
@@ -182,6 +202,31 @@ final class WorldAgentContext {
     private var walkingSpeed: Float
     private let capsule: WorldCapsule
     private let maximumStepHeight: Float
+    struct NativePhysicsRequest: Sendable {
+        let worldID: String
+        let hostSessionID: String
+        let layoutRevision: UInt64
+        let physicsGeneration: UInt64
+        let probes: [RustPropCapabilityClient.Probe]
+        let capsuleRadius: Float
+        let capsuleHeight: Float
+    }
+    typealias NativePhysics = @MainActor @Sendable (NativePhysicsRequest) async throws -> [RustPropCapabilityClient.Measurement]
+    let nativePhysics: NativePhysics?
+    private struct NativeMovementProof {
+        let runID: String
+        let index: Int
+        let layout: UInt64
+        let collision: UInt64
+        let generation: UInt64
+        let from: WorldVector3
+        let target: WorldVector3
+        var result: Result<RustPropCapabilityClient.Measurement, Error>?
+    }
+    private var nativeMovementProof: NativeMovementProof?
+    private var nativeMovementProbeTask: Task<Void, Never>?
+    var physicsCapsule: WorldCapsule { capsule }
+    var physicsStepHeight: Float { maximumStepHeight }
     private var tickingTask: Task<Void, Never>?
     var isTicking: Bool { tickingTask != nil }
     private var lastCheckpointWorldTime: Date?
@@ -195,6 +240,10 @@ final class WorldAgentContext {
 
     var onSnapshotChanged: (@MainActor (WorldAgentSnapshot) -> Void)?
     var onEventsPublished: (@MainActor ([WorldEvent]) -> Void)?
+    /// Persisted Rust facts have their own sequence namespace, distinct from
+    /// the native frame/pose observation cache.
+    var onRustEventsPublished: (@MainActor ([WorldEvent]) -> Void)?
+    private var publishedRustFactSequence: UInt64 = 0
     var onTickError: (@MainActor (Error) -> Void)?
 
     init(
@@ -205,8 +254,15 @@ final class WorldAgentContext {
         capsule: WorldCapsule = WorldCapsule(radius: 0.2, height: 1.8),
         maximumStepHeight: Float = 0.3,
         propFunctionSources: [WorldPropFunctionSource] = [],
-        initialCollisionWorld: (any WorldCollisionQuerying)? = nil
+        initialCollisionWorld: (any WorldCollisionQuerying)? = nil,
+        rustActivityCatalog: RustActivityCatalogClient? = nil,
+        rustWorldActivity: RustWorldActivityClient? = nil,
+        rustPropCapability: RustPropCapabilityClient? = nil,
+        nativePhysics: NativePhysics? = nil
     ) throws {
+        guard nativePhysics == nil || initialCollisionWorld != nil else {
+            throw RustPropCapabilityClient.Failure.unavailable
+        }
         self.manifest = manifest
         self.propFunctionSources = propFunctionSources
         navigationGraph = WaypointNavigationGraph(manifest: manifest)
@@ -214,7 +270,11 @@ final class WorldAgentContext {
         collisionWorld = ReplaceableCollisionWorld(
             initial: baseCollisionWorld
         )
-        authoredActivityCatalog = try ActivityCatalog(manifest: manifest)
+        self.rustActivityCatalog = rustActivityCatalog
+        self.rustWorldActivity = rustWorldActivity
+        self.rustPropCapability = rustPropCapability
+        self.nativePhysics = nativePhysics
+        authoredActivityCatalog = try rustActivityCatalog?.manifest(manifest) ?? ActivityCatalog(manifest: manifest)
         self.persistence = persistence
         self.walkingSpeed = max(0, walkingSpeed)
         self.capsule = capsule
@@ -232,8 +292,9 @@ final class WorldAgentContext {
             simulation = WorldSimulation(manifest: manifest, startedAt: startedAt)
         }
 
-        collisionWorld.replace(with: PropLayoutCollisionWorld(base: baseCollisionWorld,
-            obstacles: WorldLayoutObstacles.resolve(simulation.state).obstacles))
+        if nativePhysics != nil { collisionWorld.replace(with: baseCollisionWorld) }
+        else { collisionWorld.replace(with: PropLayoutCollisionWorld(base: baseCollisionWorld,
+            obstacles: WorldLayoutObstacles.resolve(simulation.state).obstacles)) }
 
         let transform = simulation.state.agentTransform
         activityExecutor = ActivityExecutor(
@@ -247,116 +308,110 @@ final class WorldAgentContext {
 
         rebuildPropActivities()
 
-        if let active = simulation.state.activeActivity,
-           let restored = resolvedActivityPlan(activityID: active.activityID)
-        {
-            let request = ScheduledActivity(
-                id: "\(executionScopeID)-restored-\(active.activityID)-\(active.startedAt.timeIntervalSince1970)",
-                definitionID: active.activityID,
-                activity: restored.definition.activity,
-                priority: .autonomousIdle,
-                requestedAt: active.startedAt
-            )
-            let effects = activityExecutor.start(
-                request,
-                definition: restored.definition,
-                at: simulation.state.worldTime
-            )
-            if effects.contains(where: \.requestsPath) {
-                let path = try navigationGraph.route(
-                    from: transform.position.simd,
-                    to: restored.entryWaypointID
-                )
-                var points = path.points
-                if let approachPoint = restored.approachPoint { points.append(approachPoint) }
-                _ = try activityExecutor.supplyApproach(
-                    ActivityApproachPlan(
-                        waypoints: points,
-                        targetYaw: restored.targetYaw
-                    )
-                )
-            }
-            if active.activityID == "home.walk" {
-                patrol = PatrolRun(targetID: restored.entryWaypointID)
-            }
-        } else if let active = simulation.state.activeActivity,
-                  propActivities[active.activityID] == nil,
-                  let stale = simulation.state.objectStates.first(where: { objectID, item in
-                      // Map the stale run through the persisted capability, not
-                      // through currently discoverable activities: the machine
-                      // may have no operation spot at all after a restart.
-                      guard let capability = item.propCapability else { return false }
-                      return WorldPropActivityTemplate.activityID(
-                          objectID: objectID, templateID: capability.templateID
-                      ) == active.activityID
-                  }),
-                  let capability = stale.value.propCapability {
-            // The operation spot no longer resolves after a restart (layout or
-            // collision changed while stopped). End the phantom run: a prop
-            // usage nothing can ever finish must not survive as "running".
-            let reason = "重启后无法到达物件操作位点"
-            _ = try? simulation.cancelActivity(reason: reason,
-                expectedRevision: simulation.state.revision)
-            _ = try? simulation.recordPropUsage(objectID: stale.key,
-                usage: WorldPropUsageState(templateID: capability.templateID, status: .stopped,
-                    activityRequestID: "restored", updatedAt: simulation.state.worldTime, reason: reason),
-                expectedRevision: simulation.state.revision)
-            try? publish(forcePersistence: true)
-        }
+        if let activityCatalogFault { throw activityCatalogFault }
+
+        // Persisted activity is a projection; only Rust can restore execution.
     }
 
-    /// Resolves an activity against **registered prop function-point anchors**
-    /// first, then bound prop capabilities, then the authored manifest.
-    ///
-    /// 「活动规划只认注册出来的锚点」：道具功能点锚点的几何只有注册表知道，
-    /// `manifest.activities` 那一行**不含**任何几何（见 `WorldActivityEntry`）。
-    private func resolvedActivityPlan(
-        activityID: String
-    ) -> (definition: LifeActivityDefinition, entryWaypointID: String,
-          approachPoint: WorldVector3?, targetYaw: Float)? {
-        if let propActivity = propActivities[activityID] {
-            return (propActivity.definition, propActivity.entryWaypointID,
-                    propActivity.approachPoint, propActivity.targetYaw)
+    /// Startup/tests can await the current authority receipt without frame polling.
+    func awaitConfirmedActivityCatalog() async throws {
+        while true {
+            try Task.checkCancellation()
+            let generation = capabilityGeneration
+            await capabilityRefresh?.value
+            if generation != capabilityGeneration { continue }
+            if let activityCatalogFault { throw activityCatalogFault }
+            guard confirmedCapabilityCollisionRevision == collisionWorld.revision else {
+                throw RustPropCapabilityClient.Failure.unavailable
+            }
+            return
         }
-        guard let definition = authoredActivityCatalog.definition(id: activityID),
-              let anchor = manifest.activities.first(where: { $0.id == activityID })
-        else { return nil }
-        // 世界固有锚点：几何随世界烘焙。道具功能点锚点在 `propActivities` 里，
-        // 走不到这一行 —— 不注册就**没有**锚点，绝不回退到任何烘焙值。
-        guard let entryWaypointID = anchor.entryWaypointID,
-              let transform = anchor.transform else { return nil }
-        return (definition, entryWaypointID, nil, Self.yaw(of: transform.rotation))
     }
 
     private func rebuildPropActivities() {
+        capabilityGeneration &+= 1
+        let generation = capabilityGeneration
+        capabilityRefresh?.cancel()
+        propActivities = [:]; seatProjections = [:]; confirmedOperationSpots = [:]; confirmedFunctionPointSpots = [:]
+        confirmedDevicePlaces = [:]; confirmedDevicePlaceLayoutRevision = nil
+        confirmedCapabilityCollisionRevision = nil
+        combinedActivityCatalog = try? ActivityCatalog(definitions: [])
+        activityCatalogFault = nil
+        guard rustPropCapability != nil, rustWorldActivity != nil else {
+            activityCatalogFault = RustPropCapabilityClient.Failure.unavailable
+            return
+        }
+        capabilityRefresh = Task { [weak self] in
+            guard let self else { return }
+            do { try await rebuildPropActivitiesFromAuthority(generation: generation) }
+            catch is CancellationError { }
+            catch {
+                guard capabilityGeneration == generation else { return }
+                activityCatalogFault = error
+                onTickError?(error)
+            }
+        }
+    }
+
+    private func rebuildPropActivitiesFromAuthority(generation: UInt64) async throws {
+        guard let rustPropCapability, let rustWorldActivity else { throw RustPropCapabilityClient.Failure.unavailable }
+        let layoutRevision = state.layoutRevision
+        let collisionRevision = collisionWorld.revision
+        let objects = state.objectStates
+        func current() throws {
+            try Task.checkCancellation()
+            guard capabilityGeneration == generation, state.layoutRevision == layoutRevision,
+                  state.objectStates == objects, collisionWorld.revision == collisionRevision else { throw CancellationError() }
+        }
         rebuildPropAnchorRegistry()
+        let devicePlaces = try await rustPropCapability.places(worldID: manifest.worldID,
+            hostSessionID: rustWorldActivity.hostSessionID, layoutRevision: layoutRevision)
+        try current()
         var rebuilt: [String: PropActivity] = [:]
         var seats: [String: WorldPropSeatProjection] = [:]
-        for (objectID, item) in simulation.state.objectStates {
+        var spots: [String: RustPropCapabilityClient.Target] = [:]
+        var functionSpots: [String: RustPropCapabilityClient.Target] = [:]
+        let measure: @MainActor @Sendable (RustPropCapabilityClient.Probe) -> RustPropCapabilityClient.Measurement = { [weak self] probe in
+            guard let self, self.capabilityGeneration == generation,
+                  self.collisionWorld.revision == collisionRevision else {
+                return .init(key: probe.key, position: probe.position, grounded: nil, canTraverse: false)
+            }
+            let grounded = self.groundedPosition(probe.position, in: self.collisionWorld)
+            let traversable = probe.from.flatMap { from in grounded.map { target in
+                self.collisionWorld.canTraverse(self.capsule, from: from.simd, to: target.simd,
+                    maximumStepHeight: self.maximumStepHeight)
+            } } ?? false
+            return .init(key: probe.key, position: probe.position, grounded: grounded, canTraverse: traversable)
+        }
+        let batch: RustPropCapabilityClient.BatchPhysics = { [weak self] probes in
+            guard let self else { throw CancellationError() }
+            return try await self.measureNativePhysics(probes)
+        }
+        for objectID in objects.keys.sorted() {
+            guard let item = objects[objectID] else { continue }
             guard item.isEnabled,
-                  let prop = item.generatedProp, prop.objectID == objectID,
-                  let capability = item.propCapability, capability.objectID == objectID,
-                  let template = WorldPropActivityTemplate.supported[capability.templateID]
+                  let prop = item.generatedProp, prop.objectID == objectID
             else { continue }
-            guard let entry = resolvedOperationSpot(
-                propCenter: item.transform.position,
-                propYaw: Self.yaw(of: item.transform.rotation),
-                propHalfExtents: WorldVector3(
-                    x: prop.size.x / 2, y: prop.size.y / 2, z: prop.size.z / 2
-                ),
-                in: collisionWorld
-            ) else { continue }
-            let yaw = atan2(
-                item.transform.position.x - entry.standPoint.x,
-                item.transform.position.z - entry.standPoint.z
-            )
+            let destination = try await rustPropCapability.resolve(worldID: manifest.worldID,
+                hostSessionID: rustWorldActivity.hostSessionID, objectID: objectID, layoutRevision: layoutRevision,
+                kind: "objectDestination", capsuleRadius: capsule.radius, waypoints: manifest.waypoints, physics: measure, batchPhysics: batch)
+            try current()
+            if let target = destination.target { spots[objectID] = target }
+            guard item.propCapability != nil else { continue }
+            let capability = try await rustPropCapability.resolve(worldID: manifest.worldID,
+                hostSessionID: rustWorldActivity.hostSessionID, objectID: objectID, layoutRevision: layoutRevision,
+                kind: "capability", capsuleRadius: capsule.radius, waypoints: manifest.waypoints, physics: measure, batchPhysics: batch)
+            try current()
+            guard let definition = capability.definition, let binding = capability.usageBinding,
+                  let templateID = binding["templateID"], binding["objectID"] == objectID,
+                  let entry = capability.target else { continue }
             let activity = PropActivity(
-                definition: template.definition(objectID: objectID),
+                definition: definition,
                 objectID: objectID,
-                templateID: capability.templateID,
+                templateID: templateID,
                 entryWaypointID: entry.waypointID,
                 approachPoint: entry.approachPoint,
-                targetYaw: yaw,
+                targetYaw: entry.targetYaw,
                 functionPointAnchorID: nil,
                 functionPointPosition: nil,
                 origin: .boundCapability
@@ -365,52 +420,77 @@ final class WorldAgentContext {
         }
         for activityID in propAnchorRegistry.registeredActivityIDs {
             guard let anchor = propAnchorRegistry.entry(activityID: activityID),
-                  let definition = authoredActivityCatalog.definition(id: activityID),
-                  let entry = resolvedFunctionPointSpot(anchor: anchor, in: collisionWorld)
+                  let definition = authoredActivityCatalog.definition(id: activityID)
             else { continue }
+            let resolved = try await rustPropCapability.approach(worldID: manifest.worldID,
+                hostSessionID: rustWorldActivity.hostSessionID, objectID: anchor.objectID,
+                layoutRevision: layoutRevision, kind: "functionPoint", role: anchor.role,
+                activityID: activityID, waypoints: manifest.waypoints, physics: measure, batchPhysics: batch)
+            try current()
+            guard let entry = resolved.target else { continue }
+            functionSpots[anchor.id] = entry
             rebuilt[activityID] = PropActivity(
                 definition: definition,
                 objectID: anchor.objectID,
                 templateID: activityID,
                 entryWaypointID: entry.waypointID,
                 approachPoint: entry.approachPoint,
-                targetYaw: anchor.yaw,
+                targetYaw: entry.targetYaw,
                 functionPointAnchorID: anchor.id,
-                functionPointPosition: anchor.position,
+                functionPointPosition: resolved.position,
                 origin: .functionPointAnchor
             )
         }
         for (objectID, item) in simulation.state.objectStates {
-            guard let seat = item.seatCalibration?.resolve(objectID: objectID, state: item),
-                  let entry = resolvedSeatEntry(seat, in: collisionWorld) else { continue }
-            let definition = LifeActivityDefinition(id: seat.activityID,
-                displayName: "坐到\(item.generatedProp?.displayName ?? objectID)上休息",
-                activity: .sit(anchorID: seat.activityID),
-                phases: LifeActivityPhase.allCases.map { phase in
-                    ActivityPhaseContract(phase: phase,
-                        requiredAnchorIDs: phase == .approach ? [seat.activityID] : [],
-                        motionIDs: phase == .approach
-                            ? ["gmgn.motion.bones.walk-loop-pmx", "gmgn.motion.bones.walk-loop-vrm"]
-                            : phase == .loop
-                                ? ["gmgn.motion.bones.chair-sit-loop-pmx", "gmgn.motion.bones.chair-sit-loop-vrm"] : [],
-                        propIDs: phase == .loop ? [objectID] : [],
-                        durationSeconds: phase == .enter || phase == .exit ? 0.2 : nil)
-                }, interruptible: true, cooldownSeconds: 0)
+            // Raw generated-object facts only; Rust owns seat eligibility and projection.
+            guard item.isEnabled, item.generatedProp != nil else { continue }
+            let resolved = try await rustPropCapability.approach(worldID: manifest.worldID,
+                hostSessionID: rustWorldActivity.hostSessionID, objectID: objectID,
+                layoutRevision: layoutRevision, kind: "seat", role: nil, activityID: nil,
+                waypoints: manifest.waypoints, physics: measure, batchPhysics: batch)
+            try current()
+            guard let entry = resolved.target, let seat = resolved.seatProjection,
+                  seat.objectID == objectID, let definition = resolved.definition else { continue }
             rebuilt[seat.activityID] = PropActivity(definition: definition, objectID: objectID,
                 templateID: "seat.sit", entryWaypointID: entry.waypointID,
-                approachPoint: entry.approachPoint, targetYaw: seat.facingYaw,
+                approachPoint: entry.approachPoint, targetYaw: entry.targetYaw,
                 functionPointAnchorID: nil, functionPointPosition: nil, origin: .seatCalibration)
             seats[seat.activityID] = seat
         }
-        seatProjections = seats
-        propActivities = rebuilt
         // Registered device anchors intentionally replace their authored
         // definitions. Including both copies makes ActivityCatalog reject the
         // entire merge, silently dropping dynamic seat/capability contracts.
-        combinedActivityCatalog = try? ActivityCatalog(
-            definitions: authoredActivityCatalog.definitions.filter { rebuilt[$0.id] == nil }
-                + rebuilt.values.map(\.definition)
-        )
+        let dynamic = rebuilt.values.map(\.definition).sorted { $0.id < $1.id }
+        let definitions = try await rustPropCapability.merge(authored: authoredActivityCatalog.definitions, dynamic: dynamic)
+        try current()
+        let catalog = try ActivityCatalog(definitions: definitions)
+        do {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            let bindings = rebuilt.compactMapValues { activity -> [String: String]? in
+                guard activity.origin == .boundCapability,
+                      state.objectStates[activity.objectID]?.generatedProp != nil else { return nil }
+                return ["objectID": activity.objectID, "templateID": activity.templateID]
+            }
+            var input = try encoder.encode(catalog.definitions)
+            input.append(try encoder.encode(bindings))
+            if rustCatalogInput != input {
+                let receipt = try await rustPropCapability.bindCatalog(worldID: manifest.worldID,
+                    hostSessionID: rustWorldActivity.hostSessionID, definitions: catalog.definitions,
+                    waypoints: manifest.waypoints, usageBindings: bindings,
+                    routes: manifest.routes, authoredActivities: manifest.activities)
+                try current()
+                try rustWorldActivity.acceptConfirmedCatalog(receipt)
+                rustCatalogInput = input
+            }
+        }
+        try current()
+        seatProjections = seats; propActivities = rebuilt; confirmedOperationSpots = spots
+        confirmedFunctionPointSpots = functionSpots
+        confirmedDevicePlaces = devicePlaces; confirmedDevicePlaceLayoutRevision = layoutRevision
+        confirmedCapabilityCollisionRevision = collisionRevision
+        generatedPlacesCache = nil
+        combinedActivityCatalog = catalog; activityCatalogFault = nil
+        onSnapshotChanged?(snapshot)
     }
 
     /// 从（声明 × 摆放）重新派生注册表。
@@ -433,105 +513,25 @@ final class WorldAgentContext {
         }
     }
 
-    /// 把一个**已注册的功能点锚点**落成可走的落点：先找落在锚点上的路点
-    /// （世界包烘焙时 `wp.jukebox` / `wish_machine.pickup` 就是锚点本身，于是
-    /// 种子摆放下的路线与旧行为逐字一致），找不到就退到"最近的可站立路点 + 一段
-    /// 经过碰撞校验的最后接近"。两者都不成立 = 这件道具的活动**不可用**。
-    private func resolvedFunctionPointSpot(
-        anchor: WorldPropFunctionAnchor,
-        in world: any WorldCollisionQuerying
-    ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
-        func occupiable(_ position: WorldVector3) -> WorldVector3? {
-            groundedPosition(position, in: world)
-        }
-        guard let standPoint = occupiable(anchor.position) else { return nil }
-        if let exact = manifest.waypoints.first(where: { waypoint in
-            guard waypoint.enabled else { return false }
-            let dx = waypoint.position.x - anchor.position.x
-            let dy = waypoint.position.y - anchor.position.y
-            let dz = waypoint.position.z - anchor.position.z
-            return (dx * dx + dy * dy + dz * dz) <= 0.0001
-        }) {
-            return (exact.id, nil, standPoint)
-        }
-        for waypoint in WorldPropActivityTemplate.operationAnchorCandidates(
-            propCenter: WorldVector3(x: anchor.position.x, y: anchor.position.y, z: anchor.position.z),
-            waypoints: manifest.waypoints,
-            canStand: { occupiable($0) != nil }
-        ) {
-            guard world.canTraverse(
-                capsule, from: waypoint.position.simd, to: standPoint.simd,
-                maximumStepHeight: maximumStepHeight
-            ) else { continue }
-            return (waypoint.id, standPoint, standPoint)
-        }
-        return nil
-    }
-
     private static let log = Logger(subsystem: "gmgn.world", category: "prop-anchors")
-
-    private func resolvedSeatEntry(_ seat: WorldPropSeatProjection,
-        in world: any WorldCollisionQuerying
-    ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
-        resolvedFunctionPointSpot(anchor: WorldPropFunctionAnchor(
-            id: seat.activityID, objectID: seat.objectID, role: "seat.approach", kind: .standingSpot,
-            position: seat.approachPoint, yaw: seat.facingYaw, activityID: seat.activityID), in: world)
-    }
 
     /// Contact point stays explicit; agentTransform is the safe approach capsule.
     /// Unity projects the actual animated pelvis onto this calibrated seat.
     var activeSeatProjection: WorldPropSeatProjection? {
         guard let active = runningActivity, active.phase == .loop,
               let seat = seatProjections[active.id],
-              let item = state.objectStates[seat.objectID],
-              item.seatCalibration?.resolve(objectID: seat.objectID, state: item) == seat
+              confirmedCapabilityCollisionRevision == collisionWorld.revision
         else { return nil }
         return seat
     }
 
-    /// Resolves where the resident actually stands to operate the machine:
-    /// the nearest standable anchor waypoint, and — when that waypoint lies
-    /// outside arm's reach — a short final leg marched toward the footprint and
-    /// verified against the installed collision world (grounded, capsule fits,
-    /// straight-line traversable). No qualifying spot means the activity is
-    /// explicitly unavailable; a remote button press is never assumed.
+    /// An acknowledged Rust target only. Snapshot/frame reads never perform HTTP or choose a destination.
     private func resolvedOperationSpot(
-        propCenter: WorldVector3,
-        propYaw: Float,
-        propHalfExtents: WorldVector3,
-        minimumEdgeDistance: Float = 0,
-        in world: any WorldCollisionQuerying
+        objectID: String
     ) -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
-        func occupiable(_ position: WorldVector3) -> WorldVector3? {
-            groundedPosition(position, in: world)
-        }
-        for waypoint in WorldPropActivityTemplate.operationAnchorCandidates(
-            propCenter: propCenter,
-            waypoints: manifest.waypoints,
-            canStand: { occupiable($0) != nil }
-        ) {
-            let waypointEdge = WorldPropActivityTemplate.footprintEdgeDistance(
-                from: waypoint.position, propCenter: propCenter,
-                propYaw: propYaw, propHalfExtents: propHalfExtents
-            )
-            guard waypointEdge > WorldPropActivityTemplate.interactionReach else {
-                guard waypointEdge >= minimumEdgeDistance else { continue }
-                return (waypoint.id, nil, waypoint.position)
-            }
-            if let approachPoint = WorldPropActivityTemplate.finalApproachPoint(
-                from: waypoint.position, propCenter: propCenter,
-                propYaw: propYaw, propHalfExtents: propHalfExtents,
-                resolve: occupiable
-            ), WorldPropActivityTemplate.footprintEdgeDistance(from: approachPoint,
-                propCenter: propCenter, propYaw: propYaw, propHalfExtents: propHalfExtents) >= minimumEdgeDistance,
-            world.canTraverse(
-                capsule, from: waypoint.position.simd, to: approachPoint.simd,
-                maximumStepHeight: maximumStepHeight
-            ) {
-                return (waypoint.id, approachPoint, approachPoint)
-            }
-        }
-        return nil
+        guard confirmedCapabilityCollisionRevision == collisionWorld.revision,
+              let target = confirmedOperationSpots[objectID] else { return nil }
+        return (target.waypointID, target.approachPoint, target.standPoint)
     }
 
     /// 这件活动是不是**生成物件绑定的能力模板**活动。只有它才有"回执驱动的进入动作"，
@@ -591,6 +591,125 @@ final class WorldAgentContext {
         try await Task.detached(priority: .utility) { try persistence.acceptSnapshot(adopted) }.value
     }
 
+    var nativePropActivityBindingSources: [String: (objectID: String, metadataKey: String)] {
+        propActivities.mapValues { activity in
+            let key: String = switch activity.origin {
+            case .boundCapability: "gmgn.prop-capability.v1"
+            case .functionPointAnchor: "gmgn.prop-function-points.v1"
+            case .seatCalibration: "gmgn.prop-seat.v1"
+            }
+            return (activity.objectID, key)
+        }
+    }
+
+    func rustPropAuthoritySnapshot(client: RustWorldPropClient, identity: RustWorldPropClient.Identity) async throws -> (WorldState, UInt64) {
+        struct Snapshot: Decodable {
+            struct Record: Decodable { let state: WorldState; let recordRevision: UInt64 }
+            let record: Record
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let snapshot = try decoder.decode(Snapshot.self, from:await client.snapshot(identity))
+        guard snapshot.record.state.worldID == manifest.worldID, identity.worldID == manifest.worldID else {
+            throw RustWorldPropError.invalidResponse
+        }
+        return (snapshot.record.state, snapshot.record.recordRevision)
+    }
+
+    func adoptRustPropReceipt(_ data: Data) async throws {
+        struct Snapshot: Decodable { struct Record: Decodable { let state: WorldState }; let record: Record }
+        struct Receipt: Decodable { let snapshot: Snapshot }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let receipt = try decoder.decode(Receipt.self, from:data)
+        guard receipt.snapshot.record.state.worldID == manifest.worldID,
+              let latest = try await readAuthoritySnapshot() else { throw RustWorldPropError.invalidResponse }
+        try adoptAuthorityState(latest, propFunctionSources:propFunctionSources,
+            replacingUncommittedProjection:true)
+        try await acceptAuthoritySnapshot(latest)
+    }
+
+    /// Rust owns the reduction; native measurements do not authorize a mutation.
+    func executeRustPropTool(_ name: String, callID: String, arguments: Data,
+                             client: RustWorldPropClient, identity: RustWorldPropClient.Identity,
+                             nativeFacts: @MainActor () async throws -> Data,
+                             isCurrent: @MainActor () -> Bool) async throws -> Data {
+        guard identity.worldID == manifest.worldID, isCurrent(), !Task.isCancelled else { throw CancellationError() }
+        if name == "read_owned_props" {
+            let raw = try await client.read(identity)
+            var result = try JSONSerialization.jsonObject(with: raw) as? [String: Any] ?? [:]
+            result["ok"] = true; result["layout_revision"] = result["layoutRevision"]
+            result["can_undo"] = result["canUndo"]
+            if let rows = result["objects"] as? [[String: Any]] {
+                result["objects"] = rows.map { row in
+                    var projected = row
+                    projected["object_id"] = row["objectID"]
+                    if let prop = row["prop"] as? [String: Any] {
+                        projected["name"] = prop["displayName"]
+                        projected["asset_id"] = prop["assetID"]
+                    }
+                    return projected
+                }
+            }
+            return try JSONSerialization.data(withJSONObject: result, options: .sortedKeys)
+        }
+        let mutations: Set<String> = ["apply_prop_placement","withdraw_prop","undo_prop_placement","hold_prop",
+            "adjust_held_prop_grip","return_held_prop","drop_held_prop","delete_prop","enable_prop_capability","resize_prop"]
+        guard mutations.contains(name) || name == "preview_prop_placement" || name == "list_placement_surfaces" else {
+            throw RustWorldPropError.rejected("world_prop_operation_not_migrated")
+        }
+        let dispatch = ResidentWorldToolSession.rustDispatchAuthority
+        if mutations.contains(name) {
+            guard let dispatch, dispatch.worldID == identity.worldID, dispatch.residentScope == identity.residentScope,
+                  dispatch.hostSessionID == identity.hostSessionID, dispatch.callID == callID,
+                  dispatch.toolName == name else { throw RustWorldPropError.rejected("world_prop_unauthorized") }
+        }
+        struct Snapshot: Decodable {
+            struct Record: Decodable { let recordRevision: UInt64; let state: WorldState }
+            let record: Record
+        }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .millisecondsSince1970
+        let snapshot = try decoder.decode(Snapshot.self, from: await client.snapshot(identity))
+        guard snapshot.record.state.worldID == identity.worldID, isCurrent() else { throw CancellationError() }
+        let needsGeometry = !["delete_prop","withdraw_prop","enable_prop_capability"].contains(name)
+        var geometryID: String?
+        if needsGeometry {
+            let facts = try await nativeFacts()
+            let observed = try await client.observe(identity, expectedRevision: snapshot.record.recordRevision,
+                layoutRevision: snapshot.record.state.layoutRevision, facts: facts)
+            geometryID = observed.geometryID
+        }
+        guard isCurrent(), !Task.isCancelled else { throw CancellationError() }
+        if name == "list_placement_surfaces", let geometryID { return try await client.surfaces(identity, geometryID: geometryID) }
+        if name == "preview_prop_placement" {
+            guard let args = try JSONSerialization.jsonObject(with: arguments) as? [String: Any],
+                  let object = args["object_id"] as? String, let surface = args["surface_id"] as? String,
+                  let x = args["x"] as? NSNumber, let y = args["y"] as? NSNumber,
+                  let z = args["z"] as? NSNumber, let yaw = args["yaw"] as? NSNumber else {
+                throw RustWorldPropError.rejected("world_prop_invalid_input")
+            }
+            let command = try JSONSerialization.data(withJSONObject: ["op":"place","objectID":object,
+                "surfaceID":surface,"position":[x,y,z],"yaw":yaw])
+            guard let geometryID else { throw RustWorldPropError.invalidResponse }
+            return try await client.preview(identity, expectedRevision: snapshot.record.recordRevision,
+                layoutRevision: snapshot.record.state.layoutRevision, geometryID: geometryID, command: command)
+        }
+        guard let dispatch else { throw RustWorldPropError.rejected("world_prop_unauthorized") }
+        let authority = RustWorldPropClient.AgentAuthority(identity:identity, runID:dispatch.runID,
+            callID:dispatch.callID, operationID:dispatch.operationID)
+        do {
+            let raw = try await client.command(authority, expectedRevision:snapshot.record.recordRevision,
+                layoutRevision:snapshot.record.state.layoutRevision, geometryID:geometryID,
+                requestID:"agent:\(dispatch.runID):\(dispatch.callID):\(dispatch.operationID)")
+            struct Mutation: Decodable { let snapshot: Snapshot }
+            let mutation = try decoder.decode(Mutation.self, from: raw)
+            guard mutation.snapshot.record.state.worldID == identity.worldID, isCurrent() else { throw CancellationError() }
+            try adoptAuthorityState(mutation.snapshot.record.state, propFunctionSources: propFunctionSources,
+                replacingUncommittedProjection:true)
+            try await acceptAuthoritySnapshot(mutation.snapshot.record.state)
+            return raw
+        } catch RustWorldPropError.rejected(let code) { throw RustWorldPropError.rejected(code) }
+        catch { throw RustWorldPropError.executionUnknown }
+    }
+
     func adoptAuthorityState(_ restored: WorldState, propFunctionSources sources: [WorldPropFunctionSource],
                              replacingUncommittedProjection: Bool = false) throws {
         guard restored.worldID == manifest.worldID else {
@@ -599,12 +718,15 @@ final class WorldAgentContext {
         guard replacingUncommittedProjection || restored.revision >= state.revision else { return }
         let preservesActivity = restored.activeActivity == state.activeActivity
             && currentActivityRequestID != nil
-        if let active = restored.activeActivity, !preservesActivity {
+        if rustWorldActivity == nil, let active = restored.activeActivity, !preservesActivity {
             // An external active run has no renderer lease in this context.
             // It must be restored by the normal bootstrap, not invented here.
             throw WorldAgentContextError.activityRejected(active.activityID)
         }
-        let registered = sources.filter { restored.objectStates[$0.declaration.objectID]?.isEnabled == true }
+        let registered = sources.filter {
+            let item = restored.objectStates[$0.declaration.objectID]
+            return item?.isEnabled == true && item?.functionPointDeclaration == nil
+        }
         let registry = try WorldPropAnchorRegistry.derive(sources: registered, objectStates: restored.objectStates)
         simulation = WorldSimulation(restoring: restored)
         propFunctionSources = registered
@@ -643,7 +765,10 @@ final class WorldAgentContext {
         merged.layoutUndo = restored.layoutUndo
         merged.heldProp = restored.heldProp
         merged.propTombstones = restored.propTombstones
-        let registered = sources.filter { merged.objectStates[$0.declaration.objectID]?.isEnabled == true }
+        let registered = sources.filter {
+            let item = merged.objectStates[$0.declaration.objectID]
+            return item?.isEnabled == true && item?.functionPointDeclaration == nil
+        }
         let registry = try WorldPropAnchorRegistry.derive(sources: registered, objectStates: merged.objectStates)
         simulation = WorldSimulation(restoring: merged)
         propFunctionSources = registered
@@ -656,35 +781,32 @@ final class WorldAgentContext {
     }
 
     func completeActivityPlayback(requestID: String, phase: LifeActivityPhase) throws {
-        guard currentActivityRequestID == requestID, state.activeActivity != nil,
-              activityExecutor.status.phase == phase, phase != .approach else { return }
-        // An indefinite loop has no renderer completion authority.
-        if phase == .loop,
-           activityCatalog.definition(id: activityExecutor.status.activityID ?? "")?
-            .contract(for: .loop)?.durationSeconds == nil { return }
-        guard patrol == nil else { return }
-        activityPhaseElapsed = 0
-        try applyActivityEffects(activityExecutor.advancePhase(at: state.worldTime),
-            usageRequestID: requestID)
-        try publish(forcePersistence: true)
+        if let rustWorldActivity {
+            guard let run = rustWorldActivity.running, run.requestID == requestID, run.phase == phase else { return }
+            do { try applyRustActivityReceipt(run: run, kind: "clipCompleted") }
+            catch WorldAuthorityError.daemon(let code) where code == "world_activity_infinite_loop" { return }
+            return
+        }
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     func failActivityPlayback(requestID: String, phase: LifeActivityPhase) throws {
-        guard currentActivityRequestID == requestID, state.activeActivity != nil,
-              activityExecutor.status.phase == phase else { return }
-        patrol = nil
-        try applyActivityEffects(activityExecutor.fail(.missingMotion, at: state.worldTime),
-            usageRequestID: requestID)
-        try publish(forcePersistence: true)
+        if let rustWorldActivity {
+            guard let run = rustWorldActivity.running, run.requestID == requestID, run.phase == phase else { return }
+            try applyRustActivityReceipt(run: run, kind: "failed")
+            return
+        }
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     func failMovementPlayback(requestID: String) throws {
         guard let run = movement, run.requestID == requestID else { return }
-        movement = nil
-        try simulation.recordMovementOutcome(requestID: run.requestID,
-            destinationID: run.path.destinationID, failure: ActivityExecutionFailure.missingMotion.rawValue,
-            expectedRevision: state.revision)
-        try publish(forcePersistence: true)
+        if let rustWorldActivity, let authorityRun = rustWorldActivity.movement,
+           authorityRun.requestID == requestID {
+            try applyRustActivityReceipt(run: authorityRun, kind: "failed")
+            return
+        }
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     /// 建造模式派生格子用的几何入口 —— 交出去的是**世界几何**（`baseCollisionWorld`：
@@ -727,7 +849,8 @@ final class WorldAgentContext {
     }
 
     func layoutCollisionWorld(for state: WorldState) -> any WorldCollisionQuerying {
-        PropLayoutCollisionWorld(base: baseCollisionWorld,
+        if nativePhysics != nil { return baseCollisionWorld }
+        return PropLayoutCollisionWorld(base: baseCollisionWorld,
             obstacles: WorldLayoutObstacles.resolve(state).obstacles)
     }
 
@@ -744,90 +867,8 @@ final class WorldAgentContext {
     @discardableResult
     func commitPropLayout(_ command: WorldPropLayoutCommand, expectedLayoutRevision: UInt64,
                           requestID: String, validate: (WorldState) throws -> Void) throws -> WorldState {
-        var candidate = simulation
-        let baseline = state
-        try candidate.applyPropLayout(command, expectedLayoutRevision: expectedLayoutRevision, requestID: requestID)
-        guard candidate.state != state else { return state }
-        try validate(candidate.state)
-        guard state == baseline else {
-            throw WorldPropLayoutError.staleRevision(submitted: expectedLayoutRevision, current: state.layoutRevision)
-        }
-        // The whole transaction is decided on the candidate: the stale-run
-        // cancel is folded into the candidate state, so the save is the single
-        // commit point. A failed save leaves memory — world, collision,
-        // executor, usage — completely untouched, and the old run keeps
-        // receiving its receipts. No callback ever sees anything unsaved.
-        let candidateCollision = PropLayoutCollisionWorld(base: baseCollisionWorld,
-            obstacles: WorldLayoutObstacles.resolve(candidate.state).obstacles)
-        var executorStopped = false
-        if let activeID = state.activeActivity?.activityID,
-           let active = propActivities[activeID] {
-            if active.origin == .seatCalibration {
-                let seat = candidate.state.objectStates[active.objectID].flatMap {
-                    $0.seatCalibration?.resolve(objectID: active.objectID, state: $0)
-                }
-                if seat == nil || seat != seatProjections[activeID]
-                    || seat.flatMap({ resolvedSeatEntry($0, in: candidateCollision) }) == nil {
-                    _ = try candidate.cancelActivity(reason: "座位已收回或移动，坐下中止",
-                        expectedRevision: candidate.state.revision)
-                    executorStopped = true
-                }
-            } else if active.isFunctionPoint {
-                // 道具功能点锚点：新位置由**候选状态**派生。锚点移动了、消失了、
-                // 或者在新位置上站不住，正在跑的那一次就必须中止 —— 否则居民会继续
-                // 在一个已经不存在的入口上等回执。
-                let candidateRegistry = try? WorldPropAnchorRegistry.derive(
-                    sources: propFunctionSources, objectStates: candidate.state.objectStates
-                )
-                let anchor = candidateRegistry?.anchor(id: active.functionPointAnchorID ?? "")
-                let spotResolved = anchor.flatMap {
-                    resolvedFunctionPointSpot(anchor: $0, in: candidateCollision)
-                }
-                if anchor?.position != active.functionPointPosition || spotResolved == nil {
-                    _ = try candidate.cancelActivity(reason: "物件已收回或移动，使用中止",
-                        expectedRevision: candidate.state.revision)
-                    executorStopped = true
-                }
-            } else {
-                let placementChanged: Bool = {
-                    guard let before = baseline.objectStates[active.objectID],
-                          let after = candidate.state.objectStates[active.objectID] else { return false }
-                    return before.isEnabled != after.isEnabled || before.transform != after.transform
-                }()
-                var spotResolved: (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)?
-                if !placementChanged, let item = candidate.state.objectStates[active.objectID],
-                   let prop = item.generatedProp, item.isEnabled,
-                   let capability = item.propCapability,
-                   WorldPropActivityTemplate.supported[capability.templateID] != nil {
-                    spotResolved = resolvedOperationSpot(
-                        propCenter: item.transform.position,
-                        propYaw: Self.yaw(of: item.transform.rotation),
-                        propHalfExtents: WorldVector3(
-                            x: prop.size.x / 2, y: prop.size.y / 2, z: prop.size.z / 2
-                        ),
-                        in: candidateCollision
-                    )
-                }
-                if placementChanged || spotResolved == nil {
-                    _ = try candidate.cancelActivity(reason: "物件已收回或移动，使用中止",
-                        expectedRevision: candidate.state.revision)
-                    executorStopped = true
-                }
-            }
-        }
-        try persistence?.save(candidate.state)
-        simulation = candidate
-        collisionWorld.replace(with: candidateCollision)
-        rebuildPropActivities()
-        if executorStopped {
-            _ = activityExecutor.stop(at: state.worldTime)
-            activityPhaseElapsed = 0
-        }
-        navigationTraversalCache.removeAll(keepingCapacity: true)
-        lastCheckpointWorldTime = state.worldTime
-        publishObservations()
-        onSnapshotChanged?(snapshot)
-        return state
+        // Layout mutations must enter the typed Rust prop reducer.
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     @discardableResult
@@ -880,21 +921,9 @@ final class WorldAgentContext {
         let deltaX = resolved.x - current.x
         let deltaZ = resolved.z - current.z
         if deltaX * deltaX + deltaZ * deltaZ > 0.0001 {
-            let stoppingActivityID = state.activeActivity?.activityID
-            let usageRequestID = currentActivityRequestID
+            if rustWorldActivity != nil, state.activeActivity != nil { try stopActivity() }
             movement = nil
             patrol = nil
-            _ = activityExecutor.stop(at: state.worldTime)
-            if state.activeActivity != nil {
-                _ = try simulation.cancelActivity(
-                    reason: "碰撞网格更新后迁移到可站立位置",
-                    expectedRevision: state.revision
-                )
-                if let stoppingActivityID {
-                    syncPropUsage(stoppingActivityID, status: .stopped,
-                        requestID: usageRequestID ?? "", reason: "碰撞网格更新后迁移到可站立位置")
-                }
-            }
             activityPhaseElapsed = 0
         }
 
@@ -916,23 +945,18 @@ final class WorldAgentContext {
     /// 领取这类"必须真的站在设备前"的判据要的是执行器这一份事实：没有 run 就**没有**
     /// 活动（`nil`），相位也只会是那个 run 自己的相位。
     var runningActivity: WorldAgentActiveActivitySnapshot? {
-        let status = activityExecutor.status
-        guard let id = status.activityID else { return nil }
-        return WorldAgentActiveActivitySnapshot(id: id, activity: status.activity, phase: status.phase,
-            seat: seatProjections[id])
+        if let rustWorldActivity {
+            guard let run = rustWorldActivity.running else { return nil }
+            return WorldAgentActiveActivitySnapshot(id: run.definition.id, activity: run.activity ?? run.definition.activity,
+                phase: run.phase, seat: seatProjections[run.definition.id])
+        }
+        return nil
     }
 
     /// The same simulation/executor projection as the full snapshot, without
     /// resolving discovery places for callers that only need activity state.
     var activeActivitySnapshot: WorldAgentActiveActivitySnapshot? {
-        let status = activityExecutor.status
-        return simulation.state.activeActivity.map { activity in
-            WorldAgentActiveActivitySnapshot(
-                id: activity.activityID,
-                activity: patrol.map { .walk(destinationID: $0.targetID) } ?? status.activity,
-                phase: status.phase, seat: seatProjections[activity.activityID]
-            )
-        }
+        runningActivity
     }
 
     var snapshot: WorldAgentSnapshot {
@@ -958,10 +982,12 @@ final class WorldAgentContext {
             places: (manifest.waypoints
                 .filter { $0.enabled && !$0.id.hasPrefix("wp.auto.") }
                 .compactMap { waypoint -> WorldAgentPlaceSnapshot? in
+                    guard confirmedDevicePlaceLayoutRevision == state.layoutRevision,
+                          confirmedCapabilityCollisionRevision == collisionWorld.revision else { return nil }
                     let position: WorldVector3
-                    if let anchorID = devicePlaceAnchorID(waypoint.id) {
-                        guard let anchor = propAnchorRegistry.anchors.first(where: { $0.id == anchorID }) else { return nil }
-                        position = anchor.position
+                    if let binding = confirmedDevicePlaces[waypoint.id] {
+                        guard let currentPosition = binding.position else { return nil }
+                        position = currentPosition
                     } else { position = waypoint.position }
                     return WorldAgentPlaceSnapshot(
                         id: waypoint.id,
@@ -1003,37 +1029,31 @@ final class WorldAgentContext {
     }
 
     func planRoute(to placeID: String) throws -> WorldPath {
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
+        guard confirmedDevicePlaceLayoutRevision == state.layoutRevision,
+              confirmedCapabilityCollisionRevision == collisionWorld.revision else {
+            throw WorldAgentContextError.routeBlocked(placeID)
+        }
         if let item = state.objectStates[placeID], item.isEnabled, item.generatedProp != nil {
             guard let spot = generatedObjectSpot(placeID) else { throw WorldAgentContextError.routeBlocked(placeID) }
             let path = try waypointRoute(to: spot.waypointID)
-            var points = path.points
-            var ids = path.waypointIDs
-            var length = path.totalLength
-            if let approach = spot.approachPoint {
-                let prior = points.last ?? state.agentTransform.position
-                length += simd_distance(prior.simd, approach.simd)
-                points.append(approach); ids.append(placeID)
+            if let rustWorldActivity {
+                return try rustWorldActivity.finalizeRoute(path, start: state.agentTransform.position,
+                    destinationID: placeID, finalTarget: spot.approachPoint, destinationKind: "generated")
             }
-            return WorldPath(destinationID: placeID, waypointIDs: ids, points: points,
-                             totalLength: length, arrivalTolerance: 0.05)
+            throw WorldAuthorityError.noAuthorityRecord
         }
         if let anchorID = devicePlaceAnchorID(placeID) {
-            guard let anchor = propAnchorRegistry.anchors.first(where: { $0.id == anchorID }),
-                  let spot = resolvedFunctionPointSpot(anchor: anchor, in: collisionWorld) else {
+            guard confirmedCapabilityCollisionRevision == collisionWorld.revision,
+                  let spot = confirmedFunctionPointSpots[anchorID] else {
                 throw WorldAgentContextError.routeBlocked(placeID)
             }
             let path = try waypointRoute(to: spot.waypointID)
-            var points = path.points
-            var ids = path.waypointIDs
-            var length = path.totalLength
-            if let approach = spot.approachPoint {
-                let prior = points.last ?? state.agentTransform.position
-                length += simd_distance(prior.simd, approach.simd)
-                points.append(approach)
-                ids.append(placeID)
+            if let rustWorldActivity {
+                return try rustWorldActivity.finalizeRoute(path, start: state.agentTransform.position,
+                    destinationID: placeID, finalTarget: spot.approachPoint, destinationKind: "device")
             }
-            return WorldPath(destinationID: placeID, waypointIDs: ids, points: points,
-                totalLength: length, arrivalTolerance: min(path.arrivalTolerance, 0.05))
+            throw WorldAuthorityError.noAuthorityRecord
         }
         return try waypointRoute(to: placeID)
     }
@@ -1061,26 +1081,19 @@ final class WorldAgentContext {
         -> (waypointID: String, approachPoint: WorldVector3?, standPoint: WorldVector3)? {
         guard let item = state.objectStates[objectID], item.isEnabled,
               let prop = item.generatedProp, prop.objectID == objectID else { return nil }
-        let size = prop.effectiveSize
-        return resolvedOperationSpot(propCenter: item.transform.position,
-            propYaw: Self.yaw(of: item.transform.rotation),
-            propHalfExtents: WorldVector3(x: size.x * abs(item.transform.scale.x) / 2,
-                y: size.y * abs(item.transform.scale.y) / 2,
-                z: size.z * abs(item.transform.scale.z) / 2),
-            minimumEdgeDistance: capsule.radius + 0.05, in: collisionWorld)
+        return resolvedOperationSpot(objectID: objectID)
     }
 
     /// Keep authored place IDs stable, but resolve device geometry from the saved placement.
-    /// Seed declarations identify the original waypoint without hard-coded device IDs.
+    /// The trusted Rust catalog carries explicit authored bindings, never a seed-coordinate guess.
     private func devicePlaceAnchorID(_ placeID: String) -> String? {
-        guard let waypoint = manifest.waypoints.first(where: { $0.id == placeID && $0.enabled }),
-              let seed = try? WorldPropAnchorRegistry.derive(sources: propFunctionSources, objectStates: [:]) else { return nil }
-        return seed.anchors.first {
-            $0.kind == .standingSpot && simd_distance_squared($0.position.simd, waypoint.position.simd) < 0.0001
-        }?.id
+        guard confirmedDevicePlaceLayoutRevision == state.layoutRevision,
+              confirmedCapabilityCollisionRevision == collisionWorld.revision else { return nil }
+        return confirmedDevicePlaces[placeID]?.anchorID
     }
 
     private func waypointRoute(to placeID: String) throws -> WorldPath {
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
         guard manifest.waypoints.contains(where: { $0.id == placeID && $0.enabled }) else {
             throw WorldAgentContextError.unknownPlace(placeID)
         }
@@ -1088,11 +1101,11 @@ final class WorldAgentContext {
         guard canTraverse(from: position, to: position) else {
             throw WorldAgentContextError.routeBlocked(placeID)
         }
-        return try navigationGraph.route(
-            from: position,
-            to: placeID,
-            canTraverse: cachedNavigationTraversal
-        )
+        if let rustWorldActivity {
+            return try rustWorldActivity.route(manifest: manifest, start: state.agentTransform.position,
+                destinationID: placeID, canTraverse: cachedNavigationTraversal)
+        }
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     private func cachedNavigationTraversal(from start: SIMD3<Float>, to end: SIMD3<Float>) -> Bool {
@@ -1112,152 +1125,162 @@ final class WorldAgentContext {
 
     @discardableResult
     func move(to placeID: String) throws -> WorldPath {
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
         let path = try planRoute(to: placeID)
-        if state.activeActivity != nil {
-            try stopActivity()
+        if let rustWorldActivity {
+            guard let authority = persistence as? AuthorityWorldStatePersistence else { throw WorldAuthorityError.noAuthorityRecord }
+            if authority.lastAppliedRevision == 0 { try authority.save(state) }
+            let receipt = try rustWorldActivity.move(world: state, expectedRevision: authority.lastAppliedRevision,
+                path: path, movementRequestID: UUID().uuidString)
+            try adoptRustActivity(receipt)
+            return path
         }
-        patrol = nil
-        movement = MovementRun(requestID: UUID().uuidString, path: path, nextPointIndex: 0)
-        try recordControlChange()
-        return path
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     /// Human XYZ editing shares the same grounded movement and durable owner as
     /// ordinary navigation. It never teleports a renderer or invents a floor.
     @discardableResult
     func move(to position: WorldVector3, requestID: String, expectedRevision: UInt64) throws -> WorldPath {
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
         guard expectedRevision == state.revision else {
             throw WorldSimulationError.staleRevision(submitted: expectedRevision, current: state.revision)
         }
         guard !requestID.isEmpty, requestID.utf8.count <= 256 else { throw WorldCoordinateMovementError.invalidPosition }
         let path = try coordinateRoute(to: position, destinationID: "coordinate." + requestID)
-        if state.activeActivity != nil { try stopActivity() }
-        let priorMovement = movement, priorPatrol = patrol
-        patrol = nil
-        movement = MovementRun(requestID: requestID, path: path, nextPointIndex: 0, coordinateTarget: path.points.last)
-        do { try recordControlChange() }
-        catch { movement = priorMovement; patrol = priorPatrol; throw error }
-        return path
+        if let rustWorldActivity {
+            guard let authority = persistence as? AuthorityWorldStatePersistence else { throw WorldAuthorityError.noAuthorityRecord }
+            if authority.lastAppliedRevision == 0 { try authority.save(state) }
+            let receipt = try rustWorldActivity.move(world: state, expectedRevision: authority.lastAppliedRevision,
+                path: path, movementRequestID: requestID, coordinateTarget: path.points.last)
+            try adoptRustActivity(receipt)
+            return path
+        }
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     private func coordinateRoute(to position: WorldVector3, destinationID: String) throws -> WorldPath {
-        guard position.x.isFinite, position.y.isFinite, position.z.isFinite else { throw WorldCoordinateMovementError.invalidPosition }
-        guard let ground = collisionWorld.groundHeight(at: position.simd), ground.isFinite else { throw WorldCoordinateMovementError.missingGround }
-        guard abs(position.y - ground) <= 0.05 else { throw WorldCoordinateMovementError.offGround }
-        let target = WorldVector3(x: position.x, y: ground, z: position.z)
-        guard collisionWorld.canOccupy(capsule, at: target.simd) else { throw WorldCoordinateMovementError.occupied }
-        let start = state.agentTransform.position
-        guard canTraverse(from: start.simd, to: start.simd) else { throw WorldCoordinateMovementError.blocked }
-        if canTraverse(from: start.simd, to: target.simd) {
-            return WorldPath(destinationID: destinationID, waypointIDs: [], points: [target],
-                totalLength: simd_distance(start.simd, target.simd), arrivalTolerance: 0.02)
+        if let rustWorldActivity {
+            let ground = collisionWorld.groundHeight(at: position.simd)
+            let measuredTarget = WorldVector3(x: position.x, y: ground ?? position.y, z: position.z)
+            return try rustWorldActivity.coordinateRoute(manifest: manifest, start: state.agentTransform.position,
+                target: position, destinationID: destinationID, ground: ground,
+                occupable: ground?.isFinite == true && collisionWorld.canOccupy(capsule, at: measuredTarget.simd),
+                startOccupable: canTraverse(from: state.agentTransform.position.simd, to: state.agentTransform.position.simd),
+                canTraverse: cachedNavigationTraversal)
         }
-        var best: WorldPath?
-        for waypoint in manifest.waypoints where waypoint.enabled {
-            guard let route = try? waypointRoute(to: waypoint.id) else { continue }
-            let last = route.points.last ?? start
-            guard canTraverse(from: last.simd, to: target.simd) else { continue }
-            let length = route.totalLength + simd_distance(last.simd, target.simd)
-            if best == nil || length < best!.totalLength {
-                best = WorldPath(destinationID: destinationID, waypointIDs: route.waypointIDs,
-                    points: route.points + [target], totalLength: length, arrivalTolerance: 0.02)
-            }
-        }
-        guard let best else { throw WorldCoordinateMovementError.blocked }
-        return best
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     func startActivity(id: String, requestedAt: Date? = nil) throws {
-        guard let plan = resolvedActivityPlan(activityID: id) else {
-            throw WorldAgentContextError.unknownActivity(id)
+        guard nativePhysics == nil else { throw RustPropCapabilityClient.Failure.unavailable }
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
+        if let activityCatalogFault { throw activityCatalogFault }
+        if let rustWorldActivity {
+            guard let authority = persistence as? AuthorityWorldStatePersistence else {
+                throw WorldAuthorityError.noAuthorityRecord
+            }
+            if authority.lastAppliedRevision == 0 { try authority.save(state) }
+            let receipt = try rustWorldActivity.start(world: state, expectedRevision: authority.lastAppliedRevision,
+                definitionID: id, capsuleRadius: capsule.radius,
+                waitsForRenderedCompletion: waitsForRenderedActivityCompletion?() == true,
+                measureApproach: { probe in
+                    let grounded = self.groundedPosition(probe.position, in: self.collisionWorld)
+                    let traversable = probe.from.flatMap { from in grounded.map { target in
+                        self.collisionWorld.canTraverse(self.capsule, from: from.simd, to: target.simd,
+                            maximumStepHeight: self.maximumStepHeight)
+                    } } ?? false
+                    return .init(key: probe.key, position: probe.position, grounded: grounded, canTraverse: traversable)
+                }, canTraverse: { self.canTraverse(from: $0, to: $1) })
+            movement = nil; patrol = nil
+            try adoptRustActivity(receipt)
+            return
         }
-        let definition = plan.definition
-        let entryWaypointID = plan.entryWaypointID
-        let targetYaw = plan.targetYaw
 
-        let date = requestedAt ?? state.worldTime
-        let request = ScheduledActivity(
-            id: "\(executionScopeID)-agent-\(id)-\(state.revision)",
-            definitionID: id,
-            activity: definition.activity,
-            priority: .explicitUserRequest,
-            requestedAt: date
-        )
-        // Validate the replacement and its approach before changing the current execution.
-        var preparedExecutor = activityExecutor
-        preparedExecutor.synchronizePlacement(position: state.agentTransform.position,
-            yaw: Self.yaw(of: state.agentTransform.rotation))
-        var effects = preparedExecutor.start(request, definition: definition, at: date)
-        for effect in effects {
-            if case let .rejected(_, reason) = effect {
-                throw WorldAgentContextError.activityStartRejected(id, reason)
+        throw WorldAuthorityError.noAuthorityRecord
+    }
+
+    func startActivityMeasured(id: String) async throws {
+        guard let rustWorldActivity, let rustPropCapability,
+              let authority = persistence as? AuthorityWorldStatePersistence else { throw WorldAuthorityError.noAuthorityRecord }
+        try await awaitConfirmedActivityCatalog()
+        if let activityCatalogFault { throw activityCatalogFault }
+        if authority.lastAppliedRevision == 0 { try authority.save(state) }
+        let world=state, revision=authority.lastAppliedRevision, collisionRevision=collisionWorld.revision,
+            generation=capabilityGeneration
+        let receipt=try await rustWorldActivity.startMeasured(world:world,expectedRevision:revision,definitionID:id,
+            capsuleRadius:capsule.radius,waitsForRenderedCompletion:waitsForRenderedActivityCompletion?() == true,
+            transport:rustPropCapability,measure:{ [weak self] probes in
+                guard let self, self.state.layoutRevision == world.layoutRevision,
+                      self.collisionWorld.revision == collisionRevision, self.capabilityGeneration == generation else { throw CancellationError() }
+                return try await self.measureNativePhysics(probes)
+            },validate:{ [weak self] in
+                guard let self, self.state.agentTransform == world.agentTransform,
+                      self.state.activeActivity == world.activeActivity, self.state.layoutRevision == world.layoutRevision,
+                      self.capabilityGeneration == generation, self.collisionWorld.revision == collisionRevision,
+                      authority.lastAppliedRevision == revision else { throw CancellationError() }
+            })
+        guard state.worldID == world.worldID, state.layoutRevision == world.layoutRevision,
+              collisionWorld.revision == collisionRevision, capabilityGeneration == generation else {
+            // A dispatched start is not replayed after geometry changes. Its actual
+            // authority snapshot remains recoverable by the normal observation path.
+            throw CancellationError()
+        }
+        movement=nil; patrol=nil
+        try adoptRustActivity(receipt)
+    }
+
+    private func measureNativePhysics(_ probes: [RustPropCapabilityClient.Probe]) async throws -> [RustPropCapabilityClient.Measurement] {
+        try Task.checkCancellation()
+        guard probes.count <= 4096, let rustWorldActivity else { throw RustPropCapabilityClient.Failure.unavailable }
+        if probes.isEmpty { return [] }
+        let worldID=state.worldID, layoutRevision=state.layoutRevision, generation=capabilityGeneration,
+            collisionRevision=collisionWorld.revision
+        let result: [RustPropCapabilityClient.Measurement]
+        if let nativePhysics {
+            result=try await nativePhysics(.init(worldID:worldID,hostSessionID:rustWorldActivity.hostSessionID,
+                layoutRevision:layoutRevision,physicsGeneration:generation,probes:probes,
+                capsuleRadius:capsule.radius,capsuleHeight:capsule.height))
+        } else {
+            result=probes.map { probe in
+                let grounded=groundedPosition(probe.position,in:collisionWorld)
+                let traversable=probe.from.flatMap { from in grounded.map { target in
+                    collisionWorld.canTraverse(capsule,from:from.simd,to:target.simd,maximumStepHeight:maximumStepHeight)
+                } } ?? false
+                return .init(key:probe.key,position:probe.position,grounded:grounded,canTraverse:traversable)
             }
         }
-        if effects.contains(where: \.isRejectedOrFailed) {
-            throw WorldAgentContextError.activityRejected(id)
-        }
-
-        if effects.contains(where: \.requestsPath) {
-            do {
-                let path = try waypointRoute(to: entryWaypointID)
-                var points = path.points
-                if let approachPoint = plan.approachPoint { points.append(approachPoint) }
-                effects += try preparedExecutor.supplyApproach(
-                    ActivityApproachPlan(
-                        waypoints: points,
-                        targetYaw: targetYaw
-                    )
-                )
-            } catch {
-                throw WorldAgentContextError.routeBlocked(entryWaypointID)
-            }
-        }
-        guard !effects.contains(where: \.isRejectedOrFailed) else {
-            throw WorldAgentContextError.routeBlocked(entryWaypointID)
-        }
-
-        let priorActivityID = state.activeActivity?.activityID
-        let priorRequestID = currentActivityRequestID
-        activityExecutor = preparedExecutor
-        movement = nil
-        patrol = id == "home.walk" ? PatrolRun(targetID: entryWaypointID) : nil
-        if let priorActivityID {
-            _ = try simulation.cancelActivity(expectedRevision: state.revision)
-            syncPropUsage(priorActivityID, status: .stopped, requestID: priorRequestID ?? "",
-                reason: "新的使用请求替换了当前运行")
-        }
-        _ = try simulation.startActivity(id, expectedRevision: state.revision)
-        syncPropUsage(id, status: .running, requestID: activityExecutor.currentRequestID ?? "")
-        activityPhaseElapsed = 0
-        try publish(forcePersistence: true)
+        try Task.checkCancellation()
+        guard state.worldID == worldID, state.layoutRevision == layoutRevision,
+              capabilityGeneration == generation, collisionWorld.revision == collisionRevision,
+              result.count == probes.count, zip(result,probes).allSatisfy({ $0.key == $1.key && $0.position == $1.position })
+        else { throw RustPropCapabilityClient.Failure.invalidReceipt }
+        return result
     }
 
     func stopActivity(reason: String? = nil) throws {
-        let wasMoving = movement != nil
-        let stoppingActivityID = state.activeActivity?.activityID
-        let usageRequestID = currentActivityRequestID
-        movement = nil
-        patrol = nil
-        let effects = activityExecutor.stop(at: state.worldTime)
-        guard state.activeActivity != nil else {
-            if wasMoving || !effects.isEmpty { try recordControlChange() }
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
+        if let rustWorldActivity {
+            movement = nil; patrol = nil; rustApproach = nil
+            rustActivityDeadlineTask?.cancel(); rustActivityDeadlineTask = nil
+            if let run = rustWorldActivity.running ?? rustWorldActivity.movement {
+                try applyRustActivityReceipt(run: run, kind: "stopped", stop: true)
+            } else if state.activeActivity != nil {
+                guard let authority = persistence as? AuthorityWorldStatePersistence else { throw WorldAuthorityError.noAuthorityRecord }
+                let receipt = try rustWorldActivity.stopUnknown(world: state, expectedRevision: authority.lastAppliedRevision)
+                try adoptRustActivity(receipt)
+            } else { try recordControlChange() }
             onActivityStopped?()
             return
         }
-        _ = try simulation.cancelActivity(
-            reason: Self.normalizedOptional(reason),
-            expectedRevision: state.revision
-        )
-        if let stoppingActivityID {
-            syncPropUsage(stoppingActivityID, status: .stopped, requestID: usageRequestID ?? "",
-                reason: Self.normalizedOptional(reason) ?? "使用已停止")
-        }
-        activityPhaseElapsed = 0
-        try publish(forcePersistence: true)
-        onActivityStopped?()
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     func look(at placeID: String) throws {
+        guard confirmedDevicePlaceLayoutRevision == state.layoutRevision,
+              confirmedCapabilityCollisionRevision == collisionWorld.revision else {
+            throw WorldAgentContextError.routeBlocked(placeID)
+        }
         if let item = state.objectStates[placeID], item.isEnabled, item.generatedProp != nil {
             let origin = state.agentTransform.position
             try updateTransform(position: origin,
@@ -1269,41 +1292,68 @@ final class WorldAgentContext {
         }
         let origin = state.agentTransform.position
         let target: WorldVector3
-        if let anchorID = devicePlaceAnchorID(placeID) {
-            guard let anchor = propAnchorRegistry.anchors.first(where: { $0.id == anchorID }) else {
-                throw WorldAgentContextError.unknownPlace(placeID)
-            }
-            target = anchor.position
+        if let binding = confirmedDevicePlaces[placeID] {
+            guard let position = binding.position else { throw WorldAgentContextError.routeBlocked(placeID) }
+            target = position
         } else { target = place.position }
         let yaw = atan2(target.x - origin.x, target.z - origin.z)
         try updateTransform(position: origin, yaw: yaw)
     }
 
-    func setWeather(_ weather: WorldWeather) throws {
-        _ = try simulation.setWeather(weather, expectedRevision: state.revision)
-        try publish(forcePersistence: true)
+    enum WorldControlSource: Equatable { case agent, ui }
+    private var rustWorldControlBinding: (client: RustWorldControlClient, identity: RustWorldControlClient.Identity)?
+    func bindWorldControl(client: RustWorldControlClient, identity: RustWorldControlClient.Identity) {
+        guard identity.worldID == manifest.worldID else { return }
+        rustWorldControlBinding = (client, identity)
     }
-
-    func selectCamera(id: String) throws {
-        guard let anchor = manifest.cameras.first(where: { $0.id == id }) else {
-            throw WorldAgentContextError.unknownCamera(id)
+    func setWeather(_ weather: WorldWeather, source: WorldControlSource = .agent) async throws {
+        try await setWeather(rawValue: weather.rawValue, source: source)
+    }
+    func setWeather(rawValue: String, source: WorldControlSource = .agent) async throws {
+        try await performWorldControl(["op": "weather", "weather": rawValue], source: source)
+    }
+    func selectCamera(id: String, source: WorldControlSource = .agent) async throws {
+        try await performWorldControl(["op": "camera", "cameraID": id], source: source)
+    }
+    func completeGoal(id: String, summary: String? = nil, source: WorldControlSource = .agent) async throws {
+        var command: [String: Any] = ["op": "goal", "goalID": id]
+        command["summary"] = summary.map { $0 as Any } ?? NSNull()
+        try await performWorldControl(command, source: source)
+    }
+    private func performWorldControl(_ command: [String: Any], source: WorldControlSource) async throws {
+        guard let binding = rustWorldControlBinding,
+              let authority = persistence as? AuthorityWorldStatePersistence else { throw WorldAuthorityError.noAuthorityRecord }
+        let dispatch = ResidentWorldToolSession.rustDispatchAuthority
+        switch source {
+        case .agent:
+            guard let dispatch, dispatch.worldID == binding.identity.worldID,
+                  dispatch.residentScope == binding.identity.residentScope,
+                  dispatch.hostSessionID == binding.identity.hostSessionID else { throw RustWorldControlClient.Failure.unavailable }
+        case .ui:
+            guard dispatch == nil else { throw RustWorldControlClient.Failure.unavailable }
         }
-        _ = try simulation.setLiveCamera(
-            WorldCameraState(anchor: anchor),
-            expectedRevision: state.revision
-        )
-        try publish(forcePersistence: true)
-    }
-
-    func completeGoal(id: String, summary: String? = nil) throws {
-        let normalized = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else { throw WorldAgentContextError.invalidGoalID }
-        _ = try simulation.completeGoal(
-            normalized,
-            summary: Self.normalizedOptional(summary),
-            expectedRevision: state.revision
-        )
-        try publish(forcePersistence: true)
+        if authority.lastAppliedRevision == 0 { try authority.save(state) }
+        let expectedRevision = authority.lastAppliedRevision
+        let requestID = dispatch.map { "agent:\($0.runID):\($0.callID):\($0.operationID)" } ?? UUID().uuidString
+        let receipt = try await binding.client.perform(identity: binding.identity, cameras: manifest.cameras,
+            expectedRevision: expectedRevision, requestID: requestID,
+            command: JSONSerialization.data(withJSONObject: command), agent: dispatch, uiRequested: source == .ui)
+        guard rustWorldControlBinding?.identity == binding.identity, authority.lastAppliedRevision == expectedRevision,
+              !Task.isCancelled else { throw RustWorldControlClient.Failure.invalidReceipt }
+        try await acceptAuthoritySnapshot(receipt.snapshot.record.state)
+        // The control reducer cannot move a native actor or undo time actually
+        // observed while its HTTP request was in flight.
+        var projected = receipt.snapshot.record.state
+        projected.agentTransform = state.agentTransform
+        projected.worldTime = state.worldTime
+        projected.revision = max(projected.revision, state.revision)
+        simulation = WorldSimulation(restoring: projected)
+        let events = receipt.events.filter { $0.sequence > publishedRustFactSequence }
+        if let last = events.last, let onRustEventsPublished {
+            publishedRustFactSequence = last.sequence
+            onRustEventsPublished(events)
+        }
+        onSnapshotChanged?(snapshot)
     }
 
     func tick(deltaTime: TimeInterval) throws {
@@ -1312,10 +1362,12 @@ final class WorldAgentContext {
         }
 
         let movementWasActive = movement != nil
-        let activityBeforeTick = activityExecutor.status
+        if movement == nil { nativeMovementProbeTask?.cancel(); nativeMovementProbeTask=nil; nativeMovementProof=nil }
+        let activityBeforeTick = runningActivity
         var tickError: Error?
         do {
-            _ = try simulation.advance(by: deltaTime, expectedRevision: state.revision)
+            _ = try simulation.advance(by: deltaTime, expectedRevision: state.revision,
+                recordActivityElapsed: false)
             if movement != nil {
                 try tickMovement(deltaTime: deltaTime)
             } else if state.activeActivity != nil {
@@ -1324,13 +1376,13 @@ final class WorldAgentContext {
         } catch {
             tickError = error
         }
-        let activityAfterTick = activityExecutor.status
+        let activityAfterTick = runningActivity
         let movementCompleted = movementWasActive && movement == nil
         let activityPhaseChanged =
-            activityBeforeTick.activityID != activityAfterTick.activityID
-                || activityBeforeTick.phase != activityAfterTick.phase
+            activityBeforeTick?.id != activityAfterTick?.id
+                || activityBeforeTick?.phase != activityAfterTick?.phase
         let actorIsMoving = movement != nil
-            || activityAfterTick.phase == .approach
+            || activityAfterTick?.phase == .approach
         let shouldCheckpoint = movementCompleted
             || activityPhaseChanged
             || (actorIsMoving && isMovementCheckpointDue)
@@ -1356,6 +1408,7 @@ final class WorldAgentContext {
     }
 
     func stopTicking(checkpoint: Bool = true) {
+        nativeMovementProbeTask?.cancel(); nativeMovementProbeTask=nil; nativeMovementProof=nil
         tickingTask?.cancel()
         tickingTask = nil
         guard checkpoint else { return }
@@ -1368,6 +1421,8 @@ final class WorldAgentContext {
 
     private func tickMovement(deltaTime: TimeInterval) throws {
         guard var run = movement else { return }
+        guard let authorityRun = rustWorldActivity?.movement,
+              authorityRun.requestID == run.requestID else { throw WorldAuthorityError.noAuthorityRecord }
         var remaining = walkingSpeed * Float(deltaTime)
         var position = state.agentTransform.position
         var yaw = Self.yaw(of: state.agentTransform.rotation)
@@ -1383,7 +1438,7 @@ final class WorldAgentContext {
                 yaw += max(-4.5 * Float(deltaTime), min(4.5 * Float(deltaTime), difference))
                 didTurn = true
             }
-            let destination: WorldVector3
+            var destination: WorldVector3
             if horizontalDistance <= remaining || horizontalDistance <= 0.0001 {
                 destination = target
             } else {
@@ -1395,7 +1450,18 @@ final class WorldAgentContext {
                 )
             }
 
-            guard let ground = collisionWorld.groundHeight(at: destination.simd),
+            let nativeMeasurement: RustPropCapabilityClient.Measurement?
+            if nativePhysics != nil {
+                if let proof=nativeMovementProof,proof.runID==run.requestID,proof.index==run.nextPointIndex,
+                   proof.layout==state.layoutRevision,proof.collision==collisionWorld.revision,
+                   proof.generation==capabilityGeneration,proof.from==position {
+                    destination=proof.target
+                }
+                guard let measured = try nativeMovementMeasurement(run: run, from: position, target: destination) else { break }
+                nativeMeasurement = measured
+            } else { nativeMeasurement = nil }
+            let sampledGround = nativePhysics != nil ? nativeMeasurement?.grounded?.y : collisionWorld.groundHeight(at: destination.simd)
+            guard let ground = sampledGround,
                   ground.isFinite
             else {
                 try handleBlockedMovement(run, position: position, yaw: yaw)
@@ -1406,20 +1472,21 @@ final class WorldAgentContext {
                 y: ground,
                 z: destination.z
             )
-            guard collisionWorld.canOccupy(capsule, at: groundedDestination.simd),
-                  collisionWorld.canTraverse(
+            let nativeClear = nativeMeasurement?.canTraverse == true && nativeMeasurement?.grounded != nil
+            guard nativePhysics != nil ? nativeClear : (collisionWorld.canOccupy(capsule, at: groundedDestination.simd)
+                && collisionWorld.canTraverse(
                       capsule,
                       from: position.simd,
                       to: groundedDestination.simd,
                       maximumStepHeight: maximumStepHeight
-                  )
+                  ))
             else {
                 try handleBlockedMovement(run, position: position, yaw: yaw)
                 return
             }
 
             position = groundedDestination
-            if horizontalDistance <= remaining || horizontalDistance <= 0.0001 {
+            if destination.x == target.x && destination.z == target.z {
                 remaining -= horizontalDistance
                 run.nextPointIndex += 1
             } else {
@@ -1436,9 +1503,44 @@ final class WorldAgentContext {
             try updateTransform(position: position, yaw: yaw, notify: false)
         }
         if movement == nil {
-            try simulation.recordMovementOutcome(requestID: run.requestID, destinationID: run.path.destinationID,
-                expectedRevision: state.revision)
+            if let authorityRun = rustWorldActivity?.movement {
+                do { try applyRustActivityReceipt(run: authorityRun, kind: "arrived") }
+                catch { rustActivityReceiptFault = error; throw error }
+                return
+            }
+            throw WorldAuthorityError.noAuthorityRecord
         }
+    }
+    /// One actual leg probe at a time. Awaiting physics never becomes a blocked receipt.
+    private func nativeMovementMeasurement(run: MovementRun, from: WorldVector3,
+                                           target: WorldVector3) throws -> RustPropCapabilityClient.Measurement? {
+        guard let nativePhysics, let rustWorldActivity else { throw WorldAuthorityError.noAuthorityRecord }
+        let layout=state.layoutRevision, collision=collisionWorld.revision, generation=capabilityGeneration
+        if let proof=nativeMovementProof, proof.runID==run.requestID,proof.index==run.nextPointIndex,
+           proof.layout==layout,proof.collision==collision,proof.generation==generation,proof.target==target,proof.from==from {
+            if let result=proof.result {return try result.get()}
+            return nil
+        }
+        nativeMovementProbeTask?.cancel()
+        nativeMovementProof = .init(runID:run.requestID,index:run.nextPointIndex,layout:layout,collision:collision,generation:generation,from:from,target:target,result:nil)
+        let request=NativePhysicsRequest(worldID:manifest.worldID,hostSessionID:rustWorldActivity.hostSessionID,
+            layoutRevision:layout,physicsGeneration:generation,
+            probes:[.init(key:"movement.leg",position:target,from:from)],capsuleRadius:capsule.radius,capsuleHeight:capsule.height)
+        nativeMovementProbeTask=Task { @MainActor [weak self] in
+            let result: Result<RustPropCapabilityClient.Measurement,Error>
+            do {
+                let facts=try await nativePhysics(request)
+                guard facts.count==1,facts[0].key=="movement.leg",facts[0].position==target else {throw RustPropCapabilityClient.Failure.invalidReceipt}
+                result = .success(facts[0])
+            } catch { result = .failure(error) }
+            guard let self,!Task.isCancelled,self.state.layoutRevision==layout,self.collisionWorld.revision==collision,
+                  self.capabilityGeneration==generation,
+                  self.movement?.requestID==run.requestID,self.movement?.nextPointIndex==run.nextPointIndex,
+                  self.state.agentTransform.position==from else {return}
+            self.nativeMovementProof?.result=result
+            if case .failure(let error)=result {self.rustActivityReceiptFault=error;self.onSnapshotChanged?(self.snapshot)}
+        }
+        return nil
     }
 
     private func handleBlockedMovement(_ run: MovementRun, position: WorldVector3, yaw: Float) throws {
@@ -1446,20 +1548,13 @@ final class WorldAgentContext {
         if position != state.agentTransform.position {
             try updateTransform(position: position, yaw: yaw, notify: false)
         }
-        let replacement = run.coordinateTarget.map { try? coordinateRoute(to: $0, destinationID: run.path.destinationID) }
-            ?? (try? planRoute(to: run.path.destinationID))
-        if run.replansRemaining > 0, let path = replacement, !path.points.isEmpty {
-            var retry = run
-            retry.path = path
-            retry.nextPointIndex = 0
-            retry.replansRemaining -= 1
-            movement = retry
+        if let authorityRun = rustWorldActivity?.movement {
+            movement = nil
+            do { try applyRustActivityReceipt(run: authorityRun, kind: "blocked") }
+            catch { rustActivityReceiptFault = error; throw error }
             return
         }
-        movement = nil
-        try simulation.recordMovementOutcome(requestID: run.requestID, destinationID: run.path.destinationID,
-            failure: ActivityExecutionFailure.blocked.rawValue, expectedRevision: state.revision)
-        throw WorldAgentContextError.routeBlocked(run.path.destinationID)
+        throw WorldAuthorityError.noAuthorityRecord
     }
 
     private func groundedPosition(
@@ -1479,156 +1574,152 @@ final class WorldAgentContext {
         return world.canOccupy(capsule, at: resolved.simd) ? resolved : nil
     }
 
-    private func tickActivity(deltaTime: TimeInterval) throws {
-        let usageRequestID = currentActivityRequestID
-        let effects = activityExecutor.tick(deltaTime: deltaTime)
-        try applyActivityEffects(effects, usageRequestID: usageRequestID)
-
-        let status = activityExecutor.status
-        guard status.activityID != nil, status.phase != .approach else { return }
-        if patrol != nil {
-            try continuePatrol()
-            return
+    private func adoptRustActivity(_ receipt: RustWorldActivityClient.Mutation) throws {
+        guard let record = receipt.snapshot?.record,
+              let authority = persistence as? AuthorityWorldStatePersistence else {
+            throw WorldAuthorityError.noAuthorityRecord
         }
-        activityPhaseElapsed += deltaTime
-        // Unity's authored operation clips complete through a matching render
-        // receipt. Wall time cannot skip loading or finish a hand operation.
-        if waitsForRenderedActivityCompletion?() == true,
-           let id = status.activityID,
-           let contract = activityCatalog.definition(id: id)?.contract(for: status.phase),
-           !contract.motionIDs.isEmpty { return }
-        guard let definition = status.activityID.flatMap(activityCatalog.definition),
-              let duration = definition.contract(for: status.phase)?.durationSeconds,
-              activityPhaseElapsed >= duration
-        else {
-            return
+        try authority.acceptSnapshot(record.state)
+        simulation = WorldSimulation(restoring: record.state)
+        let events = (receipt.events ?? []).filter { $0.sequence > publishedRustFactSequence }
+        if let last = events.last, let onRustEventsPublished {
+            publishedRustFactSequence = last.sequence
+            onRustEventsPublished(events)
         }
-        activityPhaseElapsed = 0
-        try applyActivityEffects(activityExecutor.advancePhase(at: state.worldTime),
-            usageRequestID: usageRequestID)
-    }
-
-    /// Bounded local selection: no model calls, no graph scan on every frame.
-    /// Eight attempted destinations per completed leg is also the failure budget.
-    private func continuePatrol() throws {
-        guard var run = patrol, state.activeActivity?.activityID == "home.walk" else { patrol = nil; return }
-        run.visits[run.targetID, default: 0] += 1
-        let position = state.agentTransform.position
-        let candidates = manifest.waypoints.filter {
-            let distance = hypot($0.position.x-position.x, $0.position.z-position.z)
-            return $0.enabled && $0.id != run.targetID && distance >= 1 && distance <= 6
-        }.sorted {
-            let lhs = (run.visits[$0.id, default: 0], abs(hypot($0.position.x-position.x, $0.position.z-position.z)-3), $0.id)
-            let rhs = (run.visits[$1.id, default: 0], abs(hypot($1.position.x-position.x, $1.position.z-position.z)-3), $1.id)
-            return lhs < rhs
-        }
-        for candidate in candidates.prefix(8) {
-            guard let path = try? planRoute(to: candidate.id), !path.points.isEmpty else { continue }
-            var executor = activityExecutor
-            let effects = try executor.continueApproach(ActivityApproachPlan(waypoints: path.points))
-            guard !effects.contains(where: \.isRejectedOrFailed) else { continue }
-            activityExecutor = executor
-            run.targetID = candidate.id
-            patrol = run
-            try applyActivityEffects(effects, usageRequestID: executor.currentRequestID)
-            return
-        }
-        patrol = nil
-        try applyActivityEffects(activityExecutor.fail(.pathUnavailable, at: state.worldTime))
-    }
-
-    /// Usage receipts are recorded only for prop activities, only at real
-    /// lifecycle transitions, and anchored to the request that actually drove
-    /// the run. A lost binding makes the write fail, so a stale in-flight
-    /// activity can never complete a withdrawn or rebound object.
-    private func syncPropUsage(_ activityID: String, status: WorldPropUsageState.Status,
-                               requestID: String, reason: String? = nil) {
-        guard !requestID.isEmpty, let propActivity = propActivities[activityID] else { return }
-        guard propActivity.origin != .seatCalibration else { return }
-        // 使用状态只能写在**生成物件**的库存记录上（`recordPropUsage` 要求
-        // `objectStates[objectID].generatedProp`）。世界包声明的设备（点唱机）没有
-        // 生成物件记录，于是过去这里对每一次点唱机开始/结束都抛 `invalidObject`，
-        // 被压成一行"生活空间推进失败"——既把"没有可写的记录"说成"世界推进失败"，
-        // 也没有任何出口。明确跳过并说明原因，而不是制造一条假故障。
-        guard simulation.state.objectStates[propActivity.objectID]?.generatedProp != nil else {
-            Self.log.info(
-                "设备活动的使用状态无处可写：activity=\(activityID, privacy: .public)，objectID=\(propActivity.objectID, privacy: .public) 是**世界包声明的设备**，没有生成物件库存记录；跳过（不是故障）。"
-            )
-            return
-        }
-        // Reasons are bounded to the persisted metadata limit, so an over-long
-        // stop reason can never fail the write and leave a "running" usage.
-        let boundedReason = reason.map { $0.count <= 256 ? $0 : String($0.prefix(256)) }
-        do {
-            try simulation.recordPropUsage(objectID: propActivity.objectID,
-                usage: WorldPropUsageState(templateID: propActivity.templateID, status: status,
-                    activityRequestID: requestID, updatedAt: state.worldTime, reason: boundedReason),
-                expectedRevision: state.revision)
-        } catch {
-            // A failed terminal write must never be swallowed: the usage state
-            // would stay stale (running) while nothing runs. Surface it through
-            // the context's error channel instead of hiding it.
-            onTickError?(error)
-        }
-    }
-
-    private func applyActivityEffects(
-        _ effects: [ActivityExecutionEffect],
-        usageRequestID: String? = nil
-    ) throws {
-        if let position = effects.compactMap(\.movedPosition).last {
-            try updateTransform(
-                position: position,
-                yaw: activityExecutor.status.yaw,
-                notify: false
-            )
-        } else if let yaw = effects.compactMap(\.alignedYaw).last {
-            try updateTransform(position: state.agentTransform.position, yaw: yaw, notify: false)
-        }
-
-        for effect in effects {
-            switch effect {
-            case .phaseChanged:
-                activityPhaseElapsed = 0
-            case let .completed(activityID):
-                patrol = nil
-                if state.activeActivity != nil {
-                    _ = try simulation.completeActivity(expectedRevision: state.revision)
+        activityExecutor.synchronizePlacement(position: state.agentTransform.position,
+            yaw: Self.yaw(of: state.agentTransform.rotation))
+        rustActivityDeadlineTask?.cancel(); rustActivityDeadlineTask = nil
+        rustActivityReceiptFault = nil
+        rustApproach = nil
+        movement = nil; patrol = nil
+        if let run = rustWorldActivity?.movement, let rustWorldActivity {
+            if run.status == "replanRequired" {
+                let path: WorldPath
+                do {
+                    if let target = run.coordinateTarget { path = try coordinateRoute(to: target, destinationID: run.path.destinationID) }
+                    else { path = try planRoute(to: run.path.destinationID) }
+                } catch {
+                    try applyRustActivityReceipt(run: run, kind: "failed")
+                    return
                 }
-                syncPropUsage(activityID, status: .completed, requestID: usageRequestID ?? "")
-            case let .cancelled(activityID):
-                patrol = nil
-                if state.activeActivity != nil {
-                    _ = try simulation.cancelActivity(expectedRevision: state.revision)
+                try adoptRustActivity(rustWorldActivity.replan(world: state, expectedRevision: authority.lastAppliedRevision,
+                    run: run, path: path))
+                return
+            }
+            movement = MovementRun(requestID: run.requestID, path: run.path, nextPointIndex: 0,
+                coordinateTarget: run.coordinateTarget)
+        }
+        if let run = rustWorldActivity?.running {
+            if let yaw = run.alignmentYaw {
+                try updateTransform(position: state.agentTransform.position, yaw: yaw, notify: false)
+                try authority.save(state)
+            }
+            if let targets = run.patrolCandidates, let rustWorldActivity {
+                var rejected: [String] = []
+                for target in targets {
+                    let route: WorldPath
+                    do { route = try waypointRoute(to: target) }
+                    catch WorldAuthorityError.daemon(let code) where code == "world_activity_unreachable" {
+                        rejected.append(target); continue
+                    }
+                    let receipt = try rustWorldActivity.continuePatrol(world: state,
+                        expectedRevision: authority.lastAppliedRevision, run: run,
+                        targetID: target, path: route, rejectedTargets: rejected)
+                    try adoptRustActivity(receipt)
+                    return
                 }
-                syncPropUsage(activityID, status: .stopped, requestID: usageRequestID ?? "",
-                    reason: "使用已停止")
-            case let .failed(activityID, reason):
-                patrol = nil
-                if reason == .blocked || reason == .pathUnavailable {
-                    navigationTraversalCache.removeAll(keepingCapacity: true)
+                try applyRustActivityReceipt(run: run, kind: "failed")
+                return
+            }
+            if run.phase == .approach {
+                rustApproach = MovementRun(requestID: run.requestID, path: run.path, nextPointIndex: 0)
+            }
+            if run.deadlineEligible, let deadline = run.deadlineMs {
+                // Rust issues the deadline/eligibility; the host only schedules
+                // one delivery. It never advances a phase during a frame tick.
+                let delay = max(0, Double(deadline) / 1000 - Date().timeIntervalSince1970)
+                rustActivityDeadlineTask = Task { @MainActor [weak self] in
+                    do { try await Task.sleep(for: .seconds(delay)) }
+                    catch { return }
+                    guard !Task.isCancelled, let self,
+                          let current = self.rustWorldActivity?.running,
+                          current.requestID == run.requestID, current.generation == run.generation,
+                          current.phaseGeneration == run.phaseGeneration else { return }
+                    do { try self.applyRustActivityReceipt(run: current, kind: "deadline") }
+                    catch { self.rustActivityReceiptFault = error; self.onTickError?(error) }
                 }
-                if state.activeActivity != nil {
-                    _ = try simulation.failActivity(
-                        reason: reason.rawValue,
-                        expectedRevision: state.revision
-                    )
-                }
-                syncPropUsage(activityID, status: .failed, requestID: usageRequestID ?? "",
-                    reason: reason.rawValue)
-            case let .resumed(activityID, _):
-                if state.activeActivity != nil {
-                    _ = try simulation.cancelActivity(expectedRevision: state.revision)
-                }
-                _ = try simulation.startActivity(
-                    activityID,
-                    expectedRevision: state.revision
-                )
-            default:
-                break
             }
         }
+        onSnapshotChanged?(snapshot)
     }
+
+    private func applyRustActivityReceipt(run: RustWorldActivityClient.Run, kind: String, stop: Bool = false) throws {
+        guard let rustWorldActivity, let authority = persistence as? AuthorityWorldStatePersistence else {
+            throw WorldAuthorityError.noAuthorityRecord
+        }
+        let receipt = try rustWorldActivity.receipt(world: state, expectedRevision: authority.lastAppliedRevision,
+            run: run, kind: kind, stop: stop)
+        try adoptRustActivity(receipt)
+    }
+
+    private func tickRustActivityApproach(deltaTime: TimeInterval) throws {
+        guard rustActivityReceiptFault == nil,
+              let run = rustWorldActivity?.running, run.phase == .approach,
+              var approach = rustApproach else { return }
+        var position = state.agentTransform.position
+        var yaw = Self.yaw(of: state.agentTransform.rotation)
+        var remaining = walkingSpeed * Float(deltaTime)
+        var faced = false
+        while remaining > 0, approach.nextPointIndex < approach.path.points.count {
+            let target = approach.path.points[approach.nextPointIndex]
+            let delta = target.subtracting(position)
+            let horizontal = hypot(delta.x, delta.z)
+            if !faced, horizontal > 0.0001 {
+                let targetYaw = atan2(delta.x, delta.z)
+                let difference = atan2(sin(targetYaw-yaw), cos(targetYaw-yaw))
+                yaw += max(-4.5 * Float(deltaTime), min(4.5 * Float(deltaTime), difference))
+                faced = true
+            }
+            let reached = horizontal <= remaining || horizontal <= 0.0001
+            let candidate = reached ? target : WorldVector3(x: position.x + delta.x * remaining / horizontal,
+                y: position.y, z: position.z + delta.z * remaining / horizontal)
+            guard let ground = collisionWorld.groundHeight(at: candidate.simd), ground.isFinite else {
+                rustApproach = nil
+                do { try applyRustActivityReceipt(run: run, kind: "failed") }
+                catch { rustActivityReceiptFault = error; throw error }
+                return
+            }
+            let next = WorldVector3(x: candidate.x, y: ground, z: candidate.z)
+            guard collisionWorld.canOccupy(capsule, at: next.simd), canTraverse(from: position.simd, to: next.simd) else {
+                rustApproach = nil
+                do { try applyRustActivityReceipt(run: run, kind: "failed") }
+                catch { rustActivityReceiptFault = error; throw error }
+                return
+            }
+            position = next
+            if reached { remaining -= horizontal; approach.nextPointIndex += 1 }
+            else { remaining = 0 }
+        }
+        rustApproach = approach
+        if approach.nextPointIndex >= approach.path.points.count {
+            if let targetYaw = run.targetYaw { yaw = targetYaw }
+            try updateTransform(position: position, yaw: yaw, notify: false)
+            // Consume once even if RPC fails. An error freezes this request;
+            // idle frames must not hammer the authority or revive an old run.
+            rustApproach = nil
+            do { try applyRustActivityReceipt(run: run, kind: "arrived") }
+            catch { rustActivityReceiptFault = error; throw error }
+        } else {
+            try updateTransform(position: position, yaw: yaw, notify: false)
+        }
+    }
+
+    private func tickActivity(deltaTime: TimeInterval) throws {
+        guard rustWorldActivity != nil else { throw WorldAuthorityError.noAuthorityRecord }
+        try tickRustActivityApproach(deltaTime: deltaTime)
+    }
+
+
 
     private func updateTransform(
         position: WorldVector3,

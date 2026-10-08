@@ -1,0 +1,18 @@
+[package]
+name = "gmgn-gpui-overlay-probe"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f46266991a230ae94f749af496af2a", features = ["gpui-fast"] }
+gpui_macos = { package = "gpui-fast-macos", version = "=0.1.2" }
+anyhow = "1"
+futures = "0.3"
+raw-window-handle = "0.6"
+gmgn-gpui-ui = { path = "../../../apps/gpui-ui" }
+serde_json = "=1.0.151"

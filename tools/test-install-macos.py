@@ -149,6 +149,7 @@ class InstallTests(unittest.TestCase):
                 p = app / relative
                 p.write_text(marker)
                 p.chmod(0o755)
+            self.write_helper_manifests(app)
         self.runtime = Runtime()
         # 注册表替身：整套测试都不许调用真机 lsregister（见 LSREGISTER_STUB）。
         self.bin = base / 'bin'
@@ -178,6 +179,127 @@ class InstallTests(unittest.TestCase):
         return module.install(self.source, self.dest, self.root, runtime=self.runtime,
                               lsregister=self.lsregister)
 
+    def write_helper_manifests(self, app):
+        for name in ('gmgn-taskd', 'gmgn-mcpd'):
+            helper = app / 'Contents/Helpers' / name
+            helper.with_name(name + '.sha256').write_text(hashlib.sha256(helper.read_bytes()).hexdigest() + '  ' + name + '\n')
+
+    def use_gpui_entry(self, app):
+        (app / 'Contents/MacOS/gmgn radio').rename(app / 'Contents/MacOS/gmgn-gpui-app')
+        path = app / 'Contents/Info.plist'
+        info = plistlib.loads(path.read_bytes())
+        info['CFBundleExecutable'] = 'gmgn-gpui-app'
+        path.write_bytes(plistlib.dumps(info))
+
+    def use_unity_entry(self, app):
+        (app / 'Contents/MacOS/gmgn radio').rename(app / 'Contents/MacOS/GMGN Unity Sample')
+        info = {'CFBundleIdentifier': 'ai.gmgn.unity-sample.player', 'CFBundleExecutable': 'GMGN Unity Sample',
+                'CFBundleVersion': '1', 'CFBundleShortVersionString': '0.1.0',
+                **{key: 'usage' for key in ('NSMicrophoneUsageDescription', 'NSAppleMusicUsageDescription', 'NSLocalNetworkUsageDescription')}}
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+        components = ('Contents/Plugins/UnityMediaHost.dylib', 'Contents/Plugins/libgmgn_gpui_overlay_probe.dylib', 'Contents/Helpers/gmgn-taskd')
+        for relative in components[:2]:
+            path = app / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'actual-private-component')
+        resources = app / 'Contents/Resources'; resources.mkdir(exist_ok=True)
+        (resources / 'unity-product-manifest.json').write_text(json.dumps({p: hashlib.sha256((app / p).read_bytes()).hexdigest() for p in components}))
+        (app / 'Contents/Helpers/gmgn-mcpd').unlink()
+        return components
+
+    def test_unity_exact_entry_and_actual_manifest_without_mcpd(self):
+        components = self.use_unity_entry(self.source)
+        with mock.patch.object(module.subprocess, 'run') as screen:
+            self.assertEqual(module.validate(self.source), 'GMGN Unity Sample')
+            self.assertIn('--verify-only', screen.call_args.args[0])
+            for relative in components:
+                path = self.source / relative; old = path.read_bytes(); path.write_bytes(b'tampered')
+                with self.assertRaises(RuntimeError): module.validate(self.source)
+                path.write_bytes(old)
+
+    def test_unity_identity_executable_pair_is_exact(self):
+        self.use_unity_entry(self.source)
+        path = self.source / 'Contents/Info.plist'
+        original = plistlib.loads(path.read_bytes())
+        for key, value in (('CFBundleIdentifier', 'ai.gmgn.unity-sample.other'), ('CFBundleExecutable', 'gmgn-gpui-app'), ('CFBundleExecutable', '../GMGN Unity Sample')):
+            info = dict(original); info[key] = value; path.write_bytes(plistlib.dumps(info))
+            with self.assertRaises(RuntimeError): module.validate(self.source)
+
+    def test_gpui_plist_entry_is_validated_without_legacy_binary(self):
+        self.use_gpui_entry(self.source)
+        self.assertEqual(module.validate(self.source), 'gmgn-gpui-app')
+
+    def test_gpui_process_selection_is_exact_to_each_validated_bundle(self):
+        self.use_gpui_entry(self.source)
+        actual = str(self.source / 'Contents/MacOS/gmgn-gpui-app')
+        old = str(self.dest / 'Contents/MacOS/gmgn radio')
+        self.runtime.rows = [(1, actual), (2, old), (3, actual + ' --other'),
+                             (4, str(self.dest / 'Contents/MacOS/gmgn-gpui-app')),
+                             (5, str(self.source / 'Contents/MacOS/gmgn radio')),
+                             (6, '/elsewhere/Contents/MacOS/gmgn-gpui-app')]
+        with mock.patch.object(module, 'ensure_signature', return_value=False):
+            self.run_install()
+        self.assertEqual([event for event in self.runtime.events if event[0] == 'stop'], [('stop', 1), ('stop', 2)])
+
+    def test_invalid_plist_entry_never_stops_any_process(self):
+        for executable in ('../Helpers/gmgn-taskd', '/bin/echo', 'other-app', '', None, ['gmgn-gpui-app']):
+            with self.subTest(executable=executable):
+                path = self.source / 'Contents/Info.plist'
+                info = {'CFBundleIdentifier': module.BUNDLE_IDENTIFIER}
+                if executable is not None:
+                    info['CFBundleExecutable'] = executable
+                path.write_bytes(plistlib.dumps(info))
+                with self.assertRaisesRegex(RuntimeError, 'identity'):
+                    self.run_install()
+                self.assertEqual(self.runtime.events, [])
+
+    def test_gpui_wrong_identity_is_rejected(self):
+        self.use_gpui_entry(self.source)
+        path = self.source / 'Contents/Info.plist'
+        info = plistlib.loads(path.read_bytes()); info['CFBundleIdentifier'] = 'ai.gmgn.radio.e2e'
+        path.write_bytes(plistlib.dumps(info))
+        with self.assertRaisesRegex(RuntimeError, 'identity'):
+            self.run_install()
+        self.assertEqual(self.runtime.events, [])
+
+    def test_gpui_plist_cannot_fall_back_to_the_legacy_executable(self):
+        path = self.source / 'Contents/Info.plist'
+        info = plistlib.loads(path.read_bytes()); info['CFBundleExecutable'] = 'gmgn-gpui-app'
+        path.write_bytes(plistlib.dumps(info))
+        with self.assertRaisesRegex(RuntimeError, 'executable'):
+            self.run_install()
+        self.assertEqual(self.runtime.events, [])
+
+    def test_helper_manifest_cannot_point_outside_bundle(self):
+        manifest = self.source / 'Contents/Helpers/gmgn-taskd.sha256'
+        outside = Path(self.temp.name) / 'outside.sha256'
+        outside.write_bytes(manifest.read_bytes())
+        manifest.unlink(); manifest.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, 'manifest'):
+            self.run_install()
+        self.assertEqual(self.runtime.events, [])
+
+    def test_gpui_entry_requires_regular_executable_inside_bundle(self):
+        self.use_gpui_entry(self.source)
+        entry = self.source / 'Contents/MacOS/gmgn-gpui-app'
+        entry.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, 'executable'):
+            module.validate(self.source)
+        entry.unlink(); entry.symlink_to('/bin/echo')
+        with self.assertRaisesRegex(RuntimeError, 'executable'):
+            module.validate(self.source)
+        self.assertEqual(self.runtime.events, [])
+
+    def test_helper_manifest_tamper_never_stops(self):
+        for kind in ('binary', 'manifest', 'missing'):
+            with self.subTest(kind=kind):
+                helper = self.source / 'Contents/Helpers/gmgn-taskd'
+                helper.write_text('new'); self.write_helper_manifests(self.source)
+                if kind == 'binary': helper.write_text('tampered')
+                elif kind == 'manifest': helper.with_name('gmgn-taskd.sha256').write_text('0' * 64 + '  gmgn-taskd\n')
+                else: helper.with_name('gmgn-taskd.sha256').unlink()
+                with self.assertRaisesRegex(RuntimeError, 'manifest'):
+                    self.run_install()
+                self.assertEqual(self.runtime.events, [])
+
     def test_missing_helper_never_stops(self):
         (self.source / 'Contents/Helpers/gmgn-taskd').unlink()
         with self.assertRaisesRegex(RuntimeError, 'helper'):
@@ -194,6 +316,64 @@ class InstallTests(unittest.TestCase):
         self.runtime.after_stop = [(2, f'{self.dest}/Contents/Helpers/gmgn-taskd --root {self.root} --endpoint-file {self.root}/taskd.endpoint.json --concurrency 2')]
         self.run_install()
         self.assertEqual(self.runtime.events[:2], [('stop', 1), ('stop', 2)])
+
+    def private_media_helpers(self, app):
+        lock = json.loads(module.SCREEN_LINK_HELPER_LOCK.read_text())
+        for entry in lock['helpers']:
+            name = entry['name']
+            target = app / 'Contents/Helpers' / name
+            target.write_bytes(('private-fixture-' + name).encode())
+            target.chmod(0o755)
+            entry['sha256'] = hashlib.sha256(target.read_bytes()).hexdigest()
+            target.with_name(name + '.sha256').write_text(entry['sha256'] + '  ' + name + '\n')
+        path = Path(self.temp.name) / 'private-screen-helper-lock.json'
+        path.write_text(json.dumps(lock))
+        return path
+
+    def test_pinned_media_daemon_exact_scope_and_start_arguments(self):
+        lock = self.private_media_helpers(self.dest)
+        helper = self.dest / 'Contents/Helpers/gmgn-taskd'
+        sock = self.root / 'taskd.endpoint.json'
+        with mock.patch.object(module, 'SCREEN_LINK_HELPER_LOCK', lock):
+            media = module._bundled_media_arguments(helper)
+            actual = f'{helper} --root {self.root} --endpoint-file {sock} --concurrency 2 ' + ' '.join(media)
+            commands = module._daemon_commands(helper, self.root, sock)
+            self.assertIn(actual, commands)
+            self.assertIn(actual + f' --legacy-root {self.root.parent / "PropGeneration"}', commands)
+            self.assertNotIn(actual + ' --media-helper /foreign', commands)
+            self.assertNotIn(actual.replace(media[3], 'f' * 64), commands)
+            self.assertNotIn(f'{helper} --root {self.root} --endpoint-file {sock} --concurrency 2'
+                             + f' --legacy-root {self.root.parent / "PropGeneration"} '
+                             + ' '.join(media), commands)
+            self.runtime.rows = [(1, actual), (2, actual + ' --root /foreign'),
+                                 (3, actual + ' --concurrency 2'), (4, actual + ' --other')]
+            self.run_install()
+            self.assertIn(('stop', 1), self.runtime.events)
+            for pid in (2, 3, 4):
+                self.assertNotIn(('stop', pid), self.runtime.events)
+        # The new launch uses source-bundle helpers, with legacy-root last.
+        lock = self.private_media_helpers(self.dest)
+        with mock.patch.object(module, 'SCREEN_LINK_HELPER_LOCK', lock), \
+                mock.patch.object(module.subprocess, 'Popen') as launch:
+            media = module._bundled_media_arguments(helper)
+            module.Runtime().start(helper, self.root, sock)
+            self.assertEqual(launch.call_args.args[0],
+                [str(helper), '--root', str(self.root), '--endpoint-file', str(sock),
+                 '--concurrency', '2', *media, '--legacy-root', str(self.root.parent / 'PropGeneration')])
+
+    def test_media_helper_pin_and_manifest_tampering_are_rejected(self):
+        lock = self.private_media_helpers(self.dest)
+        helper = self.dest / 'Contents/Helpers/gmgn-taskd'
+        target = self.dest / 'Contents/Helpers/yt-dlp'
+        original = target.read_bytes()
+        with mock.patch.object(module, 'SCREEN_LINK_HELPER_LOCK', lock):
+            target.write_bytes(b'tampered')
+            with self.assertRaises(Exception):
+                module._daemon_commands(helper, self.root, self.root / 'taskd.endpoint.json')
+            target.write_bytes(original)
+            target.with_name('yt-dlp.sha256').write_text(hashlib.sha256(original).hexdigest() + '  deno\n')
+            with self.assertRaisesRegex(RuntimeError, 'manifest'):
+                module._bundled_media_arguments(helper)
 
     def test_old_bundle_without_helper_is_upgradable(self):
         (self.dest / 'Contents/Helpers/gmgn-taskd').unlink()
@@ -369,6 +549,9 @@ class InstallTests(unittest.TestCase):
             target.chmod(0o755)
         subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(self.source)],
                        check=True, capture_output=True)
+        self.write_helper_manifests(self.source)
+        signed = subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(self.source)], capture_output=True)
+        self.assertEqual(signed.returncode, 0, signed.stderr.decode())
         verified = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(self.source)],
                                   capture_output=True)
         self.assertEqual(verified.returncode, 0, verified.stderr.decode())
@@ -438,7 +621,7 @@ class InstallTests(unittest.TestCase):
 
         这里同时注入三种"另一个 gmgn radio"：构建产物、装机留下的回滚备份，
         以及一条文件已经消失的死注册（删产物之后留下的那种）。前两条 `-u` 能清掉，
-        死注册只能靠重建数据库 —— 判据是收敛完之后注册表里只剩正规安装。
+        死注册如实报告，安装器不得重建整个系统注册库。
         """
         product = self.bin / 'Products' / 'Release' / 'gmgn radio.app'
         (product / 'Contents').mkdir(parents=True)
@@ -458,21 +641,50 @@ class InstallTests(unittest.TestCase):
         unregistered = [line for line in self.journal() if line.startswith('-u ')]
         self.assertEqual(set(unregistered),
                          {f'-u {product}', f'-u {backup}', f'-u {dead}'})
-        # 顺序：先把能注销的注销掉，再重建数据库清死注册，最后把正规安装注册回来。
-        self.assertLess(self.journal().index('kill'), len(self.journal()) - 1)
+        self.assertNotIn('kill', self.journal())
+        self.assertFalse(any('-r' in line.split() for line in self.journal()))
         self.assertEqual(self.journal()[-1], f'-f {self.dest}')
-        self.assertEqual(remaining, [])
-        self.assertEqual(self.registrations(), [str(self.dest)])
+        self.assertEqual(remaining, [dead])
+        self.assertEqual(self.registrations(), [str(self.dest), str(dead)])
         ok, others = module.audit_single_registration(self.dest, self.lsregister)
-        self.assertTrue(ok, others)
+        self.assertFalse(ok)
+        self.assertEqual(others, [dead])
 
-    def test_dead_registration_survives_unregister_and_needs_a_rebuild(self):
+    def test_dead_registration_is_reported_without_global_rebuild(self):
         """文件已消失的注册 `-u` 清不掉（真机是 "Bundle node not found on disk"）。"""
         dead = self.bin / 'gone' / 'gmgn radio.app'
         self.registered(self.dest, dead)
-        module.ensure_single_registration(self.dest, lsregister=self.lsregister)
-        self.assertIn('kill', self.journal())
-        self.assertEqual(self.registrations(), [str(self.dest)])
+        remaining = module.ensure_single_registration(self.dest, lsregister=self.lsregister)
+        self.assertNotIn('kill', self.journal())
+        self.assertEqual(remaining, [dead])
+        self.assertEqual(self.registrations(), [str(self.dest), str(dead)])
+
+    def test_registration_readback_failure_does_not_claim_clean(self):
+        failed = subprocess.CompletedProcess([], 1, '', 'read failed')
+        with mock.patch.object(module, '_lsregister', return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, 'readback failed'):
+                module.ensure_single_registration(self.dest, lsregister=self.lsregister)
+            self.assertEqual(module.audit_single_registration(self.dest, self.lsregister),
+                             (False, []))
+
+    def test_registration_readback_exception_does_not_claim_clean(self):
+        with mock.patch.object(module, '_lsregister', side_effect=OSError('unavailable')):
+            with self.assertRaises(OSError):
+                module.ensure_single_registration(self.dest, lsregister=self.lsregister)
+
+    def test_final_registration_readback_failure_does_not_claim_clean(self):
+        successful = subprocess.CompletedProcess([], 0, '', '')
+        failed = subprocess.CompletedProcess([], 1, '', 'read failed')
+        with mock.patch.object(module, '_lsregister',
+                               side_effect=[successful, successful, failed]):
+            with self.assertRaisesRegex(RuntimeError, 'readback failed'):
+                module.ensure_single_registration(self.dest, lsregister=self.lsregister)
+
+    def test_registration_parser_requires_exact_bundle_identifier(self):
+        dump = subprocess.CompletedProcess([], 0,
+            '----------\npath: /other.app\nidentifier: ai.gmgn.radio.other\n', '')
+        with mock.patch.object(module, '_lsregister', return_value=dump):
+            self.assertEqual(module.registered_paths(self.dest, self.lsregister), [])
 
     def test_audit_catches_injected_duplicate_with_a_fail_message(self):
         """注入一份同 id 的副本 ⇒ 判据必须抓住，并且 FAIL 原话要能指名道姓。"""

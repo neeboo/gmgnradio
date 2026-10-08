@@ -518,7 +518,7 @@ try harness.write(to: program, atomically: true, encoding: .utf8)
 let binary = temporary.appendingPathComponent("restore-retry-tests")
 let compiler = Process()
 compiler.executableURL = URL(fileURLWithPath: "/usr/bin/swiftc")
-compiler.arguments = ["-j1", "-parse-as-library", deliverySource.path, loopSource.path,
+compiler.arguments = ["-j1", "-parse-as-library", "apps/macos/Sources/GMGNRadio/Presence/RustResidentSchedulerClient.swift", deliverySource.path, loopSource.path,
                       storeSource.path, stateSource.path, program.path, "-o", binary.path]
 try compiler.run(); compiler.waitUntilExit()
 guard compiler.terminationStatus == 0 else { exit(compiler.terminationStatus) }

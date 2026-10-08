@@ -6,11 +6,19 @@ import Foundation
         defer { try? FileManager.default.removeItem(at: root) }
         var selected = "luminous"
         var mutations = 0
+        var backend = "dsh", backendChanges = 0, denyBackend = false
         let bridge = try UnitySettingsBridge(root: root, command: { command in
+            if command["op"] as? String == "agent.backend" {
+                guard let id = command["id"] as? String, ["dsh","codex"].contains(id) else { return false }
+                if backend == id { return true }
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !denyBackend else { return false }
+                backend = id; backendChanges += 1; return true
+            }
             guard command["op"] as? String == "stage.player.lyrics", let id = command["id"] as? String,
                   ["luminous", "monet_poster"].contains(id) else { return false }
             selected = id; mutations += 1; return true
-        }, snapshot: { ["version": 1, "lyricVisual": ["configuredMode": selected], "revision": mutations] })
+        }, snapshot: { ["version": 1, "lyricVisual": ["configuredMode": selected], "revision": mutations, "backendID":backend] })
         defer { bridge.close() }
         let marker = root.appendingPathComponent("unity-settings-endpoint.json")
         let deadline = Date().addingTimeInterval(5)
@@ -37,6 +45,15 @@ import Foundation
         let rejected = try call("command", token: token, command: ["op": "world.commit"]); precondition(rejected.0 == 422 && mutations == 0)
         let accepted = try call("command", token: token, command: ["op": "stage.player.lyrics", "id": "monet_poster"]); precondition(accepted.0 == 200 && mutations == 1)
         let snapshot = try call("snapshot", token: token); precondition((snapshot.1["lyricVisual"] as! [String: Any])["configuredMode"] as? String == "monet_poster")
+        let start = Date()
+        let backendReceipt = try call("command", token:token, command:["op":"agent.backend","id":"codex"])
+        precondition(backendReceipt.0==200 && backendReceipt.1["accepted"] as? Bool==true && backend=="codex" && backendChanges==1)
+        precondition(Date().timeIntervalSince(start)>=0.09)
+        let same = try call("command", token:token, command:["op":"agent.backend","id":"codex"])
+        precondition(same.0==200 && backendChanges==1)
+        denyBackend = true
+        let failed = try call("command", token:token, command:["op":"agent.backend","id":"dsh"])
+        precondition(failed.0==422 && failed.1["accepted"] as? Bool==false && backend=="codex" && backendChanges==1)
         print("PASS loopback-only endpoint, private marker, authorization, command allowlist, live mutation and readback")
     }
 }

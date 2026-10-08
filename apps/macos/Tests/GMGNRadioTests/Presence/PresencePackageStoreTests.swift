@@ -1,6 +1,75 @@
 import Foundation
+import Darwin
 import Testing
 @testable import GMGNRadio
+
+/// Each authority-dependent case owns actual private HTTP/SQLite state and its child.
+final class PrivatePresenceAuthorityFixture: @unchecked Sendable {
+    let root: URL
+    let process: Process
+    let client: RustPresenceSelectionClient
+    var packageRoot: URL { root.appendingPathComponent("PresencePackages") }
+    var motionRoot: URL { root.appendingPathComponent("MotionPackages") }
+    var motionStore: MotionPackageStore { .init(rootURL: motionRoot, builtInMotions: [], selectionAuthority: client) }
+    private init(root: URL, process: Process) {
+        self.root = root; self.process = process
+        let transport = TaskdHTTPAuthorityClient(endpointFile: root.appendingPathComponent("TaskService/taskd.endpoint.json").path,
+            helperPath: "", allowsLaunching: false, timeout: 5)
+        client = RustPresenceSelectionClient(scope: root.path, call: { method, data in
+            let params = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            return try JSONSerialization.data(withJSONObject: transport.call(method: method, params: params))
+        })
+    }
+    static func start() async throws -> PrivatePresenceAuthorityFixture {
+        let env = ProcessInfo.processInfo.environment
+        guard let binary = env["GMGN_TASKD_TEST_BINARY"] ?? env["TASKD_BIN"],
+              FileManager.default.isExecutableFile(atPath: binary) else { throw PropTaskDaemonError.helperMissing }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("gmgn-presence-authority-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        guard let canonical = realpath(temporary.path, nil) else { throw PropTaskDaemonError.unavailable }
+        let root = URL(fileURLWithPath: String(cString: canonical)); free(canonical)
+        let service = root.appendingPathComponent("TaskService")
+        try FileManager.default.createDirectory(at: service, withIntermediateDirectories: true)
+        let child = Process(); child.executableURL = URL(fileURLWithPath: binary)
+        child.arguments = ["--root",service.path,"--endpoint-file",service.appendingPathComponent("taskd.endpoint.json").path,"--concurrency","1"]
+        child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
+        let fixture = PrivatePresenceAuthorityFixture(root: root, process: child)
+        try child.run()
+        for _ in 0..<500 {
+            if FileManager.default.fileExists(atPath: service.appendingPathComponent("taskd.endpoint.json").path) { return fixture }
+            guard child.isRunning else { throw PropTaskDaemonError.unavailable }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw PropTaskDaemonError.unavailable
+    }
+    func bind(store: PresencePackageStore, motions: MotionPackageStore) async throws {
+        // This package unit suite uses a controlled native renderer leaf. Only
+        // its availability/ACK is simulated; selection/removal receipts are
+        // produced by the actual private Rust daemon, never by this fixture.
+        let observed = try store.listPackages().map { package in
+            PresencePackage(manifest: package.manifest, installPath: package.installPath,
+                thumbnailPath: package.thumbnailPath, isActive: package.isActive,
+                isBuiltIn: package.isBuiltIn, rendererAvailable: true)
+        }
+        _ = try await client.bind(packages: observed, motions: motions.listMotions(),
+            packageRoot: store.rootURL, motionRoot: motions.rootURL, policy: "native",
+            supportedEngines: ["orb","pmx","vrm","live2d"],
+            builtInMotionIDs: Set(motions.builtInMotions.map(\.id)).union([MotionPackageStore.naturalIdleID]))
+    }
+    func pmxStore() throws -> PresencePackageStore {
+        let model = root.appendingPathComponent("native-fixture.pmx")
+        try Data("private native PMX fixture".utf8).write(to: model)
+        return PresencePackageStore(rootURL: packageRoot,
+            builtInVRMs: [.init(id: "private.pmx", name: "Private PMX", url: model, engine: .pmx)], selectionAuthority: client)
+    }
+    func acknowledge() async throws {
+        if client.confirmed?.pendingRenderer == true { _ = try await client.event("renderer_ack", success: true) }
+    }
+    deinit {
+        if process.isRunning { process.terminate(); process.waitUntilExit() }
+        try? FileManager.default.removeItem(at: root)
+    }
+}
 
 @Suite
 struct PresencePackageStoreTests {
@@ -37,8 +106,9 @@ struct PresencePackageStoreTests {
     }
 
     @Test
-    func firstInstallSelectsTheFirstBundledVRM() throws {
-        let fixture = try Fixture()
+    func firstInstallSelectsTheFirstBundledVRM() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try Fixture(rootURL: authority.packageRoot, selectionAuthority: authority.client)
         let arisuURL = try fixture.makeVRMFile(name: "ArisuMaid")
         let fireflyURL = try fixture.makeVRMFile(name: "fireflyMaid")
         let store = PresencePackageStore(
@@ -46,9 +116,10 @@ struct PresencePackageStoreTests {
             builtInVRMs: [
                 .init(id: "builtin.vrm.arisu", name: "Arisu Maid", url: arisuURL),
                 .init(id: "builtin.vrm.firefly", name: "Firefly Maid", url: fireflyURL),
-            ]
+            ], selectionAuthority: authority.client
         )
-
+        try await authority.bind(store: store, motions: authority.motionStore)
+        try await authority.acknowledge()
         let packages = try store.listPackages()
 
         #expect(packages.map(\.manifest.id) == [
@@ -63,8 +134,9 @@ struct PresencePackageStoreTests {
     }
 
     @Test
-    func bundledPMXAvatarUsesItsOwnEngineAndReplacesTheRetiredCatgirlSelection() throws {
-        let fixture = try Fixture()
+    func bundledPMXAvatarUsesItsOwnEngineAndReplacesTheRetiredCatgirlSelection() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try Fixture(rootURL: authority.packageRoot, selectionAuthority: authority.client)
         let modelRoot = try fixture.makePMXDirectory(
             name: "23",
             texturePaths: ["textures/body.png"]
@@ -83,9 +155,11 @@ struct PresencePackageStoreTests {
                     url: modelURL,
                     engine: .pmx
                 ),
-            ]
+            ], selectionAuthority: authority.client
         )
-
+        try await authority.bind(store: store, motions: authority.motionStore)
+        try await authority.acknowledge()
+        #expect(try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json")) == selection)
         let packages = try store.listPackages()
         let activeAvatar = try store.activeAvatar()
         let avatar = try #require(activeAvatar)
@@ -100,17 +174,19 @@ struct PresencePackageStoreTests {
     }
 
     @Test
-    func addingBundledVRMsPreservesAnExistingSelection() throws {
-        let fixture = try Fixture()
-        try fixture.store.activate(id: PresencePackageStore.builtInOrbID)
+    func addingBundledVRMsPreservesAnExistingSelection() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try Fixture(rootURL: authority.packageRoot, selectionAuthority: authority.client)
+        try await authority.bind(store: fixture.store, motions: authority.motionStore)
+        try await fixture.store.activateAsync(id: PresencePackageStore.builtInOrbID)
         let arisuURL = try fixture.makeVRMFile(name: "ArisuMaid")
         let store = PresencePackageStore(
             rootURL: fixture.rootURL,
             builtInVRMs: [
                 .init(id: "builtin.vrm.arisu", name: "Arisu Maid", url: arisuURL),
-            ]
+            ], selectionAuthority: authority.client
         )
-
+        try await authority.bind(store: store, motions: authority.motionStore)
         let packages = try store.listPackages()
 
         #expect(packages.first(where: { $0.manifest.id == PresencePackageStore.builtInOrbID })?.isActive == true)
@@ -269,11 +345,14 @@ struct PresencePackageStoreTests {
     }
 
     @Test
-    func aBrokenSelectedAvatarReportsFailureInsteadOfClearingTheSelection() throws {
-        let fixture = try Fixture()
+    func aBrokenSelectedAvatarReportsFailureInsteadOfClearingTheSelection() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try Fixture(rootURL: authority.packageRoot, selectionAuthority: authority.client)
         let source = try fixture.makePMXDirectory(name: "Miku")
         let installed = try fixture.store.installPackage(from: source)
-        try fixture.store.activate(id: installed.manifest.id)
+        try await authority.bind(store: fixture.store, motions: authority.motionStore)
+        try await fixture.store.activateAsync(id: installed.manifest.id)
+        try await authority.acknowledge()
         let installedRoot = URL(filePath: try #require(installed.installPath))
         try FileManager.default.removeItem(
             at: installedRoot.appending(path: installed.manifest.entry)
@@ -308,12 +387,15 @@ struct PresencePackageStoreTests {
     }
 
     @Test
-    func remembersTheSelectedPresence() throws {
-        let fixture = try Fixture()
+    func remembersTheSelectedPresence() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try Fixture(rootURL: authority.packageRoot, selectionAuthority: authority.client)
         let source = try fixture.makeLive2DPackage(id: "mori.blue")
         _ = try fixture.store.installPackage(from: source)
 
-        try fixture.store.activate(id: "mori.blue")
+        try await authority.bind(store: fixture.store, motions: authority.motionStore)
+        try await fixture.store.activateAsync(id: "mori.blue")
+        try await authority.acknowledge()
 
         let packages = try fixture.store.listPackages()
         #expect(packages.first(where: { $0.manifest.id == "mori.blue" })?.isActive == true)
@@ -323,13 +405,16 @@ struct PresencePackageStoreTests {
     }
 
     @Test
-    func removingTheSelectedPresenceFallsBackToTheOrb() throws {
-        let fixture = try Fixture()
+    func removingTheSelectedPresenceFallsBackToTheOrb() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try Fixture(rootURL: authority.packageRoot, selectionAuthority: authority.client)
         let source = try fixture.makeLive2DPackage(id: "mori.blue")
         _ = try fixture.store.installPackage(from: source)
-        try fixture.store.activate(id: "mori.blue")
+        try await authority.bind(store: fixture.store, motions: authority.motionStore)
+        try await fixture.store.activateAsync(id: "mori.blue")
+        _ = try await authority.client.event("renderer_ack", success: true)
 
-        try fixture.store.remove(id: "mori.blue")
+        try await fixture.store.removeAsync(id: "mori.blue")
 
         let packages = try fixture.store.listPackages()
         #expect(packages.count == 1)
@@ -342,14 +427,15 @@ private struct Fixture {
     let rootURL: URL
     let store: PresencePackageStore
 
-    init() throws {
-        rootURL = FileManager.default.temporaryDirectory
+    init(rootURL injectedRoot: URL? = nil, selectionAuthority: RustPresenceSelectionClient? = nil) throws {
+        rootURL = injectedRoot ?? FileManager.default.temporaryDirectory
             .appending(path: "gmgn-presence-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(
             at: rootURL,
             withIntermediateDirectories: true
         )
-        store = PresencePackageStore(rootURL: rootURL, builtInVRMs: [])
+        let isolated = selectionAuthority ?? RustPresenceSelectionClient(scope: rootURL.deletingLastPathComponent().path, call: { _,_ in throw RustPresenceSelectionClient.SelectionError.unavailable })
+        store = PresencePackageStore(rootURL: rootURL, builtInVRMs: [], selectionAuthority: isolated)
     }
 
     func makeLive2DPackage(

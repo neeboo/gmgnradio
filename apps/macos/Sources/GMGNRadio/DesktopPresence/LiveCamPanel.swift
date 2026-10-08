@@ -1090,14 +1090,20 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
     @objc
     private func chooseImages() { images.chooseImages() }
 
+    private var admittingImageSubmission = false
+    func finishResidentAttachments(ids: [UUID]) {
+        Task { [self] in for id in ids {await images.finishSubmission(id:id)} }
+    }
     func restoreSubmission(_ submission: ResidentChatSubmission) {
+        Task { [self] in
+        guard await images.restoreSubmission(submission) else {applyStatusNotice("图片恢复状态待确认。",kind:.failure);return}
         let recovered = recovery.restore(submission, text: messageField.stringValue, attachments: images.attachments)
         messageField.stringValue = recovered.text
-        images.restore(recovered.attachments)
         composer.isHidden = false
         updateReplyDisclosure()
         onComposerVisibilityChanged(true)
         updateComposerActions()
+        }
     }
 
     @objc
@@ -1107,13 +1113,20 @@ final class LiveCamInteractionView: NSView, NSTextFieldDelegate, NSGestureRecogn
         ) else { return }
         let message = messageField.stringValue
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard images.canSubmit, !message.isEmpty || !images.attachments.isEmpty else { return }
-        let submission = ResidentChatSubmission(text: message, attachments: images.takeAttachments())
-        messageField.stringValue = ""
+        guard !admittingImageSubmission, images.canSubmit, !message.isEmpty || !images.attachments.isEmpty else { return }
+        admittingImageSubmission = true
+        let originalDraft = messageField.stringValue
+        Task { [self] in
+        defer {admittingImageSubmission = false}
+        let submission: ResidentChatSubmission
+        do {submission = try await images.takeSubmission(text:message)}
+        catch {applyStatusNotice(error.localizedDescription,kind:.failure);return}
+        if messageField.stringValue == originalDraft {messageField.stringValue = ""}
         recovery = ResidentDraftRecovery()
         setResidentThinking(true)
         closeComposer()
         onSendMessage(submission)
+        }
     }
 
     @objc

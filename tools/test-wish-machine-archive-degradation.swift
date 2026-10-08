@@ -70,6 +70,7 @@ print("PASS[source]: 逐条降级入口、坏记录落脚点、写回、共享�
 
 let program = #"""
 import Foundation
+import CryptoKit
 struct ResidentImageAttachment: Identifiable, Codable, Sendable, Equatable { let id: UUID; let url: URL; let displayName: String }
 struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isError: Bool }
 @MainActor final class ResidentWorldToolSession {
@@ -111,7 +112,8 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
             "jobs": [jobJSON(goodJobID, "good-prop", "ready"),
                      jobJSON(brokenJobID, "broken-prop", "exploded")]] as [String: Any])
             .write(to: corruptDirectory.appendingPathComponent("wishes.json"))
-        let corrupted = WishMachineCoordinator(store: try store("corrupt-props"),
+        let corruptStore = try store("corrupt-props")
+        let corrupted = try await fixtureWishCoordinator(store: corruptStore,
                                                directory: corruptDirectory, canClaim: { _ in nil })
         check(corrupted.isReadable, "一条坏 job 不许让整份 wishes.json 读不出来（那正是「列表整个消失」）")
         check(corrupted.jobs.count == 1 && corrupted.jobs.first?.id == goodJobID,
@@ -123,7 +125,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
               "「为什么读不出来」必须是具名原因，不是一句空话")
         check(corrupted.unreadableJobNotice?.contains("1") == true,
               "「有几条坏了、已跳过」必须有可见说明")
-        let persisted = try String(contentsOf: corruptDirectory.appendingPathComponent("wishes.json"), encoding: .utf8)
+        let persisted = String(decoding: try fixtureWishArchive(directory: corruptDirectory), as: UTF8.self)
         check(persisted.contains("unreadableJobs") && persisted.contains("broken-prop"),
               "坏记录的原始 JSON 必须留在档案里（下一次 persist 不许把它抹掉）")
         check(persisted.contains("good-prop"), "好记录当然还在")
@@ -133,7 +135,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
         try FileManager.default.createDirectory(at: brokenSectionDirectory, withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: ["authorizations": "not-an-array", "events": [], "jobs": []] as [String: Any])
             .write(to: brokenSectionDirectory.appendingPathComponent("wishes.json"))
-        let brokenSection = WishMachineCoordinator(store: try store("broken-section-props"),
+        let brokenSection = try await fixtureWishCoordinator(store: try store("broken-section-props"),
                                                    directory: brokenSectionDirectory, canClaim: { _ in nil })
         check(!brokenSection.isReadable && brokenSection.errorMessage != nil,
               "别的段落坏了 ⇒ 仍然是「整份读不出来」（fail-closed，不猜）")
@@ -152,7 +154,7 @@ struct RealtimeDJToolResult { let callID: String; let resultJSON: Data; let isEr
             availabilityMessage = error.localizedDescription
         }
         var thrownMessage: String?
-        do { _ = try corrupted.claim(id: readyJob.id, worldID: "world", residentScope: "resident") }
+        do { _ = try await corrupted.claim(id: readyJob.id, worldID: "world", residentScope: "resident") }
         catch { thrownMessage = error.localizedDescription }
         check(availabilityMessage != nil && availabilityMessage == thrownMessage,
               "「领取」按钮与 claim() 必须读同一份判据（同一份事实 ⇒ 同一句话）")

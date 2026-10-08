@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.88"
 
 [dependencies]
+aes = "0.8"
+num-bigint = "0.4"
+gmgn-agent-runtime = { path = "../gmgn-agent-runtime" }
 gmgn-protocol = { path = "../gmgn-protocol" }
 gmgn-voice-core = { path = "../gmgn-voice-core" }
 base64 = "0.22"

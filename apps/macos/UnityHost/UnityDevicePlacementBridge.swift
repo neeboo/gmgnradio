@@ -2,160 +2,160 @@ import Foundation
 import CoreFoundation
 import WorldRuntime
 
-/// Human-confirmed catalog placement. The authority evaluates geometry, commits
-/// by CAS and supplies a separate readback before a device becomes functional.
+/// Rust owns catalog dimensions, protected IDs, support, pose and durable commit.
+/// Native supplies its actual loaded mesh evidence and the original pointer pose.
 final class UnityDevicePlacementBridge: @unchecked Sendable {
     typealias Call = (String, [String: Any]) throws -> [String: Any]
+    typealias Geometry = @Sendable (UInt64, UInt64) async throws -> RustWorldPropClient.Observation
     private let call: Call
-    private let templates: [[String: Any]]
+    private let client: RustWorldPropClient?
+    private let identity: RustWorldPropClient.Identity?
+    private let geometry: Geometry?
+    private let templates: Data
     private let worldID: String
-    private let prepareGeometry: ([String: Any]) throws -> [String: Any]
-    private let queue = DispatchQueue(label: "ai.gmgn.unity.device-placement")
     private let lock = NSLock()
-    private var busy = false, closed = false
+    private var busy = false, closed = false, installed = false
     private var generation: UInt64 = 0
     private var response: [String: Any] = [:]
     var onCommitted: (@Sendable (WorldState) -> Void)?
-
-    init(root: URL, worldID: String, templates: [[String: Any]]) {
-        self.worldID = worldID; self.templates = templates
+    init(root: URL, worldID: String, templates: [[String: Any]], worldBridge: UnityWorldBridge? = nil) {
+        self.worldID = worldID; self.templates = (try? JSONSerialization.data(withJSONObject: templates)) ?? Data("[]".utf8)
         let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
-        let geometry = UnityWorldBridge(root: root)
-        prepareGeometry = { try geometry.preparePlacementGeometry($0) }
+        client = RustWorldPropClient(endpointFile: URL(fileURLWithPath: endpoint.endpointFile))
+        identity = worldBridge?.nativeUIIdentity(worldID: worldID)
+        if let bridge = worldBridge {
+            geometry = { @Sendable (revision: UInt64, layout: UInt64) async throws -> RustWorldPropClient.Observation in
+                try await bridge.nativeDeviceObservation(worldID: worldID, expectedRevision: revision, layoutRevision: layout)
+            }
+        } else { geometry = nil }
         call = { method, params in
             try TaskdHTTPAuthorityClient(endpointFile: endpoint.endpointFile, helperPath: endpoint.helperPath,
                 allowsLaunching: false, timeout: 10).call(method: method, params: params)
         }
     }
     init(worldID: String, templates: [[String: Any]], call: @escaping Call,
-         prepareGeometry: @escaping ([String: Any]) throws -> [String: Any] = { $0 }) {
-        self.worldID = worldID; self.templates = templates; self.call = call
-        self.prepareGeometry = prepareGeometry
+         identity: RustWorldPropClient.Identity? = nil, geometry: Geometry? = nil) {
+        self.worldID = worldID; self.templates = (try? JSONSerialization.data(withJSONObject: templates)) ?? Data("[]".utf8)
+        self.call = call; self.identity = identity; self.geometry = geometry; client = nil
+    }
+    enum Failure: String, Error { case invalid_request, template_unavailable, revision_conflict, already_placed, cannot_place, readback_unconfirmed, cancelled, native_not_ready }
+    private func requireOpen() throws {
+        lock.lock(); defer { lock.unlock() }; if closed { throw Failure.cancelled }
+    }
+    private func rpc(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+        let input = try JSONSerialization.data(withJSONObject: params)
+        let data: Data
+        if let client, let identity, method != "world_device_refresh" {
+            let p = try JSONSerialization.jsonObject(with: input) as! [String: Any]
+            let revision = (p["expectedRevision"] as? NSNumber)?.uint64Value ?? 0
+            let layout = (p["expectedLayoutRevision"] as? NSNumber)?.uint64Value ?? 0
+            switch method {
+            case "world_snapshot": data = try await client.snapshot(identity)
+            case "world_device_catalog_install": data = try await client.deviceCatalog(identity, templates: templates)
+            case "world_device_ui_intent":
+                let lease = try await client.deviceIntent(identity, expectedRevision: revision, layoutRevision: layout,
+                    command: JSONSerialization.data(withJSONObject: p["command"]!))
+                data = try JSONSerialization.data(withJSONObject: ["intentID":lease.intentID,"capability":lease.capability,"expiresAtMS":lease.expiresAtMS])
+            case "world_device_preview": data = try await client.devicePreview(identity, expectedRevision: revision, layoutRevision: layout,
+                geometryID: p["geometryID"] as! String, command: JSONSerialization.data(withJSONObject: p["command"]!))
+            case "world_device_command":
+                let a = p["authority"] as! [String: Any]
+                let lease = RustWorldPropClient.UIIntent(intentID: a["intentID"] as! String, capability: a["capability"] as! String, expiresAtMS: 0)
+                data = try await client.deviceCommand(identity, intent: lease, expectedRevision: revision, layoutRevision: layout,
+                    geometryID: p["geometryID"] as! String, requestID: p["requestID"] as! String)
+            default: throw Failure.invalid_request
+            }
+        } else {
+            data = try await Task.detached(priority: .utility) { [self] in
+                let p = try JSONSerialization.jsonObject(with: input) as! [String: Any]
+                return try JSONSerialization.data(withJSONObject: call(method, p))
+            }.value
+        }
+        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw Failure.readback_unconfirmed }
+        return result
+    }
+    private func common() throws -> [String: Any] {
+        guard let identity, identity.worldID == worldID else { throw Failure.native_not_ready }
+        return ["worldID":worldID,"residentScope":identity.residentScope,"hostSessionID":identity.hostSessionID]
+    }
+    private func installCatalog() async throws {
+        try requireOpen(); if installed { return }
+        var p = try common(); p["templates"] = try JSONSerialization.jsonObject(with: templates)
+        _ = try await rpc("world_device_catalog_install", p); installed = true
     }
     func command(_ request: [String: Any]) -> Bool {
-        guard request["op"] as? String == "world.device.place", request["worldID"] as? String == worldID,
-              JSONSerialization.isValidJSONObject(request) else { return false }
-        lock.lock(); guard !busy, !closed else { lock.unlock(); return false }; busy = true; lock.unlock()
-        queue.async { [self] in
-            var result: [String: Any] = ["operation": "world.device.place", "worldID": worldID,
-                "requestID": request["requestID"] as? String ?? ""]
-            do { result["result"] = try place(request); result["status"] = "completed" }
-            catch {
-                result["status"] = "failed"; result["code"] = (error as? Failure)?.rawValue ?? "authority_unavailable"
-                NSLog("[UnityDevicePlacement] failed code=%@", result["code"] as? String ?? "authority_unavailable")
-            }
-            lock.lock(); if !closed { response = result; generation &+= 1 }; busy = false; lock.unlock()
-        }
-        return true
+        guard JSONSerialization.isValidJSONObject(request), let data = try? JSONSerialization.data(withJSONObject: request) else { return false }
+        return enqueue(data)
     }
     func enqueue(_ data: Data) -> Bool {
         lock.lock(); guard !busy, !closed else { lock.unlock(); return false }; busy = true; lock.unlock()
-        queue.async { [self] in
-            var result: [String: Any] = ["operation": "world.device.place", "worldID": worldID]
+        Task { [self] in
+            var result: [String: Any] = ["worldID":worldID]
             do {
-                guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      request["op"] as? String == "world.device.place", request["worldID"] as? String == worldID else { throw Failure.invalid_request }
-                result["requestID"] = request["requestID"] as? String ?? ""
-                result["result"] = try place(request); result["status"] = "completed"
+                guard let request = try JSONSerialization.jsonObject(with: data) as? [String: Any], request["worldID"] as? String == worldID,
+                      ["world.device.place","world.device.preview"].contains(request["op"] as? String ?? "") else { throw Failure.invalid_request }
+                result["operation"] = request["op"]; result["requestID"] = request["requestID"]
+                result["result"] = try await place(request); result["status"] = "completed"
             } catch {
-                result["status"] = "failed"; result["code"] = (error as? Failure)?.rawValue ?? "authority_unavailable"
-                NSLog("[UnityDevicePlacement] failed code=%@", result["code"] as? String ?? "authority_unavailable")
+                result["status"] = "failed"
+                if case let RustWorldPropError.rejected(code) = error { result["code"] = code }
+                else if case let WorldAuthorityError.daemon(code) = error { result["code"] = code }
+                else { result["code"] = (error as? Failure)?.rawValue ?? "world_device_unavailable" }
             }
-            lock.lock(); if !closed { response = result; generation &+= 1 }; busy = false; lock.unlock()
+            publish(result)
         }
         return true
     }
+    private func publish(_ value: [String: Any]) {
+        lock.lock(); defer { lock.unlock() }; if !closed { response = value; generation &+= 1 }; busy = false
+    }
     func snapshot() -> [String: Any] {
-        lock.lock(); defer { lock.unlock() }
-        var value = response; value["pending"] = busy; value["generation"] = generation; return value
+        lock.lock(); defer { lock.unlock() }; var value = response; value["pending"] = busy; value["generation"] = generation; return value
     }
     func close() { lock.lock(); closed = true; lock.unlock() }
-    enum Failure: String, Error { case invalid_request, template_unavailable, revision_conflict, already_placed, cannot_place, readback_unconfirmed, cancelled }
-    /// Explicit upgrade of an already placed device's functional declaration.
-    /// Pose, enabled state, other metadata and every other object remain intact.
-    struct JukeboxFunctionRefresh: Sendable {
-        let state: WorldState
-        let didCommit: Bool
+    struct JukeboxFunctionRefresh: Sendable { let state: WorldState; let didCommit: Bool }
+    func refreshJukeboxFunctions(requestID: String) async throws -> JukeboxFunctionRefresh {
+        try await installCatalog()
+        let catalog = try JSONSerialization.jsonObject(with: templates) as! [[String: Any]]
+        guard let templateID = catalog.first(where: { $0["renderer"] as? String == "builtin.jukebox" })?["id"] as? String else { throw Failure.template_unavailable }
+        let before = try await rpc("world_snapshot", ["worldID":worldID,"includeState":true])
+        guard let record = before["record"] as? [String: Any], let state = record["state"] as? [String: Any] else { throw Failure.readback_unconfirmed }
+        var p = try common(); p["requestID"] = requestID; p["templateID"] = templateID
+        p["expectedRevision"] = record["recordRevision"]; p["expectedLayoutRevision"] = state["layoutRevision"]
+        try requireOpen()
+        let reply = try await rpc("world_device_refresh", p)
+        guard let persisted = reply["snapshot"] as? [String: Any], let durable = (persisted["record"] as? [String: Any])?["state"] as? [String: Any],
+              let didCommit = reply["didCommit"] as? Bool else { throw Failure.readback_unconfirmed }
+        return .init(state: try WorldAuthorityClient.decodeState(durable), didCommit: didCommit)
     }
-    func refreshJukeboxFunctions(requestID: String) throws -> JukeboxFunctionRefresh {
-        guard !requestID.isEmpty, requestID.utf8.count <= 256,
-              let template = templates.first(where: { $0["renderer"] as? String == "builtin.jukebox" }),
-              let id = template["id"] as? String else { throw Failure.template_unavailable }
-        let before = try call("world_snapshot", ["worldID":worldID,"includeState":true])
-        guard let record=before["record"] as? [String:Any],let expected=record["recordRevision"] as? NSNumber,
-              var state=record["state"] as? [String:Any],state["worldID"] as? String == worldID,
-              var objects=state["objectStates"] as? [String:Any],var object=objects[id] as? [String:Any],
-              object["isEnabled"] as? Bool == true else { throw Failure.template_unavailable }
-        var metadata=object["metadata"] as? [String:String] ?? [:]
-        let encoded=String(data:try JSONSerialization.data(withJSONObject:template,options:.sortedKeys),encoding:.utf8)!
-        if metadata["gmgn.builtin-device.v1"] == encoded {
-            return JukeboxFunctionRefresh(state: try WorldAuthorityClient.decodeState(state), didCommit: false)
+    func place(_ request: [String: Any]) async throws -> [String: Any] {
+        guard let requestID = request["requestID"] as? String, let templateID = request["templateID"] as? String,
+              let revision = request["expectedRevision"] as? NSNumber, let layout = request["expectedLayoutRevision"] as? NSNumber,
+              let position = request["position"], let yaw = request["yaw"], let geometry else { throw Failure.native_not_ready }
+        for value in [revision, layout] {
+            let number = value.doubleValue
+            guard CFGetTypeID(value) != CFBooleanGetTypeID(), number.isFinite, number >= 0,
+                  number <= 9_007_199_254_740_991, number.rounded(.towardZero) == number else { throw Failure.invalid_request }
         }
-        metadata["gmgn.builtin-device.v1"]=encoded;object["metadata"]=metadata
-        objects[id]=object;state["objectStates"]=objects
-        state["revision"]=((state["revision"] as? NSNumber)?.uint64Value ?? 0)+1
-        _=try WorldAuthorityClient.decodeState(state)
-        lock.lock();let cancelled=closed;lock.unlock();if cancelled { throw Failure.cancelled }
-        _=try call("world_commit",["worldID":worldID,"requestID":requestID,"expectedRevision":expected,
-            "producer":"unity","intent":["kind":"refresh-builtin-device-functions","objectID":id],
-            "ops":[["op":"replaceState","state":state]]])
-        let readback=try call("world_snapshot",["worldID":worldID,"includeState":true])
-        guard let persisted=readback["record"] as? [String:Any],let durable=persisted["state"] as? [String:Any],
-              let saved=(durable["objectStates"] as? [String:Any])?[id] as? [String:Any],
-              NSDictionary(dictionary:saved).isEqual(to:object) else { throw Failure.readback_unconfirmed }
-        // The awaited preparation caller owns exactly one context-owner reload.
-        // Only generic placement uses onCommitted; triggering it here would race
-        // a second adoption against that caller's newly started activity.
-        return JukeboxFunctionRefresh(state: try WorldAuthorityClient.decodeState(durable), didCommit: true)
-    }
-    func place(_ request: [String: Any]) throws -> [String: Any] {
-        guard let templateID = request["templateID"] as? String,
-              let template = templates.first(where: { $0["id"] as? String == templateID }),
-              let size = template["size"] as? [NSNumber], size.count == 3, size.allSatisfy({ $0.doubleValue.isFinite && $0.doubleValue > 0 }),
-              let requestID = request["requestID"] as? String, !requestID.isEmpty, requestID.utf8.count <= 256,
-              let expected = request["expectedRevision"] as? NSNumber,
-              CFGetTypeID(expected) != CFBooleanGetTypeID(), expected.doubleValue >= 0,
-              expected.doubleValue <= 9_007_199_254_740_991, expected.doubleValue.rounded() == expected.doubleValue,
-              var payload = request["placementPayload"] as? [String: Any] else { throw Failure.invalid_request }
-        let before = try call("world_snapshot", ["worldID": worldID, "includeState": true])
-        guard let record = before["record"] as? [String: Any],
-              let actual = record["recordRevision"] as? NSNumber, actual == expected,
-              var state = record["state"] as? [String: Any],
-              state["worldID"] as? String == worldID,
-              var objects = state["objectStates"] as? [String: Any] else { throw Failure.revision_conflict }
-        if let existing = objects[templateID] as? [String: Any], existing["isEnabled"] as? Bool == true,
-           (existing["metadata"] as? [String: String])?["gmgn.builtin-device.v1"] != nil { throw Failure.already_placed }
-        // Dimensions are authored, never trusted from the renderer's template.
-        var footprint = payload["footprint"] as? [String: Any] ?? [:]
-        footprint["size"] = [size[0], size[2]]; payload["footprint"] = footprint; payload["height"] = size[1]
-        payload = try prepareGeometry(payload)
-        guard try JSONSerialization.data(withJSONObject: payload).count <= TaskdHTTPAuthorityClient.maximumFrame - 4096 else { throw Failure.invalid_request }
-        let verdict = try call("placement_evaluate", payload)
-        let reasonCode = (verdict["reason"] as? [String: Any])?["code"] as? String ?? "none"
-        NSLog("[UnityDevicePlacement] template=%@ canPlace=%@ reason=%@", templateID,
-            String(describing: verdict["canPlace"] ?? "unknown"), reasonCode)
-        guard verdict["canPlace"] as? Bool == true,
-              let volume = verdict["volume"] as? [String: Any],
-              let center = volume["center"] as? [NSNumber], center.count == 3,
-              let yaw = volume["yaw"] as? NSNumber,
-              center.allSatisfy({ $0.doubleValue.isFinite }), yaw.doubleValue.isFinite else { throw Failure.cannot_place }
-        let halfYaw = yaw.doubleValue / 2
-        let transform: [String: Any] = ["position": ["x": center[0], "y": center[1].doubleValue - size[1].doubleValue / 2, "z": center[2]],
-            "rotation": ["x": 0, "y": sin(halfYaw), "z": 0, "w": cos(halfYaw)], "scale": ["x": 1, "y": 1, "z": 1]]
-        let encoded = String(data: try JSONSerialization.data(withJSONObject: template, options: .sortedKeys), encoding: .utf8)!
-        let object: [String: Any] = ["isEnabled": true, "transform": transform, "metadata": ["gmgn.builtin-device.v1": encoded]]
-        objects[templateID] = object; state["objectStates"] = objects
-        state["revision"] = ((state["revision"] as? NSNumber)?.uint64Value ?? 0) + 1
-        _ = try WorldAuthorityClient.decodeState(state)
-        lock.lock(); let cancelled = closed; lock.unlock(); if cancelled { throw Failure.cancelled }
-        _ = try call("world_commit", ["worldID": worldID, "requestID": requestID, "expectedRevision": expected,
-            "producer": "unity", "intent": ["kind": "place-builtin-device", "objectID": templateID],
-            "ops": [["op": "replaceState", "state": state]]])
-        let readback = try call("world_snapshot", ["worldID": worldID, "includeState": true])
-        guard let persisted = readback["record"] as? [String: Any], let durable = persisted["state"] as? [String: Any],
-              let saved = (durable["objectStates"] as? [String: Any])?[templateID] as? [String: Any],
-              NSDictionary(dictionary: saved).isEqual(to: object) else { throw Failure.readback_unconfirmed }
-        onCommitted?(try WorldAuthorityClient.decodeState(durable))
-        return ["record": persisted, "objectID": templateID]
+        try await installCatalog()
+        let observed = try await geometry(revision.uint64Value, layout.uint64Value)
+        var p = try common(); p["expectedRevision"] = revision; p["expectedLayoutRevision"] = layout; p["geometryID"] = observed.geometryID
+        p["command"] = ["op":"place","templateID":templateID,"position":position,"yaw":yaw]
+        try requireOpen()
+        if request["op"] as? String == "world.device.preview" { return try await rpc("world_device_preview", p) }
+        let lease = try await rpc("world_device_ui_intent", p)
+        guard let intentID = lease["intentID"] as? String, let capability = lease["capability"] as? String else { throw Failure.readback_unconfirmed }
+        p.removeValue(forKey: "command"); p["requestID"] = requestID
+        p["authority"] = ["kind":"ui","intentID":intentID,"capability":capability]
+        try requireOpen()
+        let reply = try await rpc("world_device_command", p)
+        guard reply["objectID"] as? String == templateID, let snapshot = reply["snapshot"] as? [String: Any],
+              let record = snapshot["record"] as? [String: Any], let state = record["state"] as? [String: Any], state["worldID"] as? String == worldID,
+              let commit = reply["commit"] as? [String: Any], let committedRevision = commit["revision"] as? NSNumber,
+              let persistedRevision = record["recordRevision"] as? NSNumber, committedRevision == persistedRevision,
+              persistedRevision.uint64Value == revision.uint64Value + 1,
+              let persistedLayout = state["layoutRevision"] as? NSNumber, persistedLayout.uint64Value == layout.uint64Value + 1 else { throw Failure.readback_unconfirmed }
+        onCommitted?(try WorldAuthorityClient.decodeState(state))
+        return ["record":record,"objectID":templateID]
     }
 }

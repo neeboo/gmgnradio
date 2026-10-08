@@ -38,23 +38,36 @@ let submit = declaration("func send(\n        requestID: UInt64,\n        submis
 
 guard legacy.contains("send(requestID: requestID"),
       legacy.contains("ResidentChatSubmission(text:"),
-      submit.contains("authorizeImages: (@MainActor (UUID, @escaping @MainActor () -> Bool) throws -> Void)? = nil"),
+      submit.contains("authorizeImages: (@MainActor (UUID, @escaping @MainActor () -> Bool) async throws -> Void)? = nil"),
       submit.contains("submission.attachments.map(\\.url)"),
-      submit.contains("let scope = submission.id"),
+      submit.contains("let scope = executionRunID ?? submission.id"),
       submit.contains("if !submission.attachments.isEmpty, let authorizeImages"),
-      submit.contains("try authorizeImages(scope, isCurrent)"),
+      submit.contains("try await authorizeImages(scope, isCurrent)"),
       submit.contains("imageURLs: imageURLs") else {
     print("FAIL: production image-submit contract changed")
     exit(1)
 }
 
+guard submit.contains("actualCompletion?(.success(response))"),
+      submit.contains("actualCompletion?(.failure(error))"),
+      submit.contains("actualCompletion?(.success(response))\n                guard lease == generation, !Task.isCancelled"),
+      index("actualCompletion?(.failure(error))", in: submit) < index("guard lease == generation else", in: submit) else {
+    print("FAIL: durable claim must receive actual late provider result before UI-generation filtering")
+    exit(1)
+}
+
 let validateAt = index("try service.validateImageSupport(imageURLs: imageURLs)", in: submit)
 let generationAt = index("generation &+= 1", in: submit)
-let authorizeAt = index("try authorizeImages(scope, isCurrent)", in: submit)
+let authorizeAt = index("try await authorizeImages(scope, isCurrent)", in: submit)
 let toolsAt = index("let tools = ResidentWorldToolSession", in: submit)
 let taskAt = index("task = Task", in: submit)
 guard validateAt < generationAt, generationAt < authorizeAt, authorizeAt < toolsAt, toolsAt < taskAt else {
     print("FAIL: validation, authorization, tool installation and model turn are out of order")
+    exit(1)
+}
+guard index("try await imageAuthorization?()", in: submit) < index("try await turnService.send", in: submit),
+      submit.contains("guard isCurrent() else { throw CancellationError() }") else {
+    print("FAIL: async durable image authorization must settle and recheck scope before provider send")
     exit(1)
 }
 

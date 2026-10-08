@@ -51,6 +51,16 @@ struct RustVoiceEvent: Decodable, Sendable {
     let encoding: String?
     let text: String?
     let code: String?
+    let delivery: RustSpeechDeliveryClient.Identity?
+    let sequence: UInt64?
+    let frameCount: Int?
+    init(sessionID: String, type: String, audioBase64: String? = nil, sampleRate: Int? = nil,
+         channels: Int? = nil, encoding: String? = nil, text: String? = nil, code: String? = nil,
+         delivery: RustSpeechDeliveryClient.Identity? = nil, sequence: UInt64? = nil, frameCount: Int? = nil) {
+        self.sessionID = sessionID; self.type = type; self.audioBase64 = audioBase64; self.sampleRate = sampleRate
+        self.channels = channels; self.encoding = encoding; self.text = text; self.code = code
+        self.delivery = delivery; self.sequence = sequence; self.frameCount = frameCount
+    }
 }
 
 /// Cloud protocols live in Rust. This macOS adapter reads one bounded HTTP SSE frame
@@ -61,6 +71,7 @@ struct RustVoiceEvent: Decodable, Sendable {
     private let helperURL: URL
     private let allowsLaunching: Bool
     private var helper: Process?
+    private var deliveryControlSession: RustVoiceSession?
 
     init(root: URL? = nil, endpointURL: URL? = nil, helperURL: URL? = nil, allowsLaunching: Bool = true) {
         let serviceRoot = root ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -73,6 +84,16 @@ struct RustVoiceEvent: Decodable, Sendable {
 
     func startTTS(text: String, configuration: RustVoiceConfiguration) async throws -> RustVoiceSession {
         try await start(method: "voice_tts_start", text: text, configuration: configuration)
+    }
+    func startDeliveryTTS(text: String, configuration: RustVoiceConfiguration,
+                          ticket: RustSpeechDeliveryClient.Ticket) async throws -> RustVoiceSession {
+        try await start(method: "voice_tts_start", text: text, configuration: configuration, delivery: ticket.identity)
+    }
+    func speechDeliveryRequest(method: String, input: Data) async throws -> Data {
+        if deliveryControlSession == nil { deliveryControlSession = try await connect() }
+        guard let session = deliveryControlSession,
+              let params = try JSONSerialization.jsonObject(with: input) as? [String: Any] else { throw RustVoiceError.invalidFrame }
+        return try await session.deliveryRequest(method: method, params: params)
     }
 
     func listVoices(configuration: RustVoiceConfiguration) async throws -> [RustVoiceOption] {
@@ -111,7 +132,8 @@ struct RustVoiceEvent: Decodable, Sendable {
         } catch { session.close(); throw error }
     }
 
-    private func start(method: String, text: String?, configuration: RustVoiceConfiguration) async throws -> RustVoiceSession {
+    private func start(method: String, text: String?, configuration: RustVoiceConfiguration,
+                       delivery: RustSpeechDeliveryClient.Identity? = nil) async throws -> RustVoiceSession {
         guard !configuration.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RustVoiceError.rejected("missing_key")
         }
@@ -121,6 +143,7 @@ struct RustVoiceEvent: Decodable, Sendable {
                                       "apiKey": configuration.apiKey, "voiceID": configuration.voiceID]
             if let text { params["text"] = text }
             if let model = configuration.model { params["model"] = model }
+            if let delivery { params["delivery"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(delivery)) }
             try await session.start(method: method, params: params)
             return session
         } catch { session.close(); throw error }
@@ -284,6 +307,12 @@ struct RustVoiceEvent: Decodable, Sendable {
             return decoded
         }
     }
+    fileprivate func deliveryRequest(method: String, params: [String: Any]) async throws -> Data {
+        let reply = try await rpc(id: UUID().uuidString, method: method, params: params)
+        try checkError(reply)
+        guard let result = reply["result"] as? [String: Any] else { throw RustVoiceError.invalidFrame }
+        return try JSONSerialization.data(withJSONObject: result)
+    }
 
     func sendAudio(_ pcm16LE: Data) async throws {
         guard !pcm16LE.isEmpty, pcm16LE.count <= 32_768, pcm16LE.count % 2 == 0 else { throw RustVoiceError.invalidFrame }
@@ -301,7 +330,8 @@ struct RustVoiceEvent: Decodable, Sendable {
         guard !closed else { throw CancellationError() }
         let body = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": params])
         guard body.count < Self.frameLimit else { throw RustVoiceError.invalidFrame }
-        var request = URLRequest(url: endpoint.appendingPathComponent(path), timeoutInterval: 10)
+        let timeout: TimeInterval = method == "speech_delivery_wait" ? 35 : 10
+        var request = URLRequest(url: endpoint.appendingPathComponent(path), timeoutInterval: timeout)
         request.httpMethod = "POST"; request.httpBody = body
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

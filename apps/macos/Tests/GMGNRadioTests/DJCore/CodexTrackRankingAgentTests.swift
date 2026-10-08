@@ -3,13 +3,15 @@ import Testing
 @testable import GMGNRadio
 
 @Test
+@MainActor
 func codexAgentRanksOnlyKnownTracksAndSendsNoAccountSecrets() async throws {
-    let executor = CodexPlanningExecutorStub(
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let executor = PrivateCodexOutput(
         output: #"{"track_ids":["3","unknown","1","3","2"]}"#
     )
+    try fixture.mockOutput(executor.output)
     let agent = CodexTrackRankingAgent(
-        executor: executor,
-        hostPrompt: "少说一点，留意当前时间。"
+        hostPrompt: "少说一点，留意当前时间。", client: fixture.client
     )
     let candidates = (1 ... 5).map {
         MusicCandidate.fixture(
@@ -31,7 +33,7 @@ func codexAgentRanksOnlyKnownTracksAndSendsNoAccountSecrets() async throws {
     )
 
     #expect(result == ["3", "1", "2"])
-    let prompt = try #require(await executor.lastPrompt())
+    let prompt = try #require(fixture.prompt)
     #expect(prompt.contains("少说一点，留意当前时间。"))
     #expect(prompt.contains("Track 3"))
     #expect(!prompt.lowercased().contains("cookie"))
@@ -39,8 +41,10 @@ func codexAgentRanksOnlyKnownTracksAndSendsNoAccountSecrets() async throws {
 }
 
 @Test
+@MainActor
 func codexAgentBuildsACompleteShowProposal() async throws {
-    let executor = CodexPlanningExecutorStub(
+    let fixture = try await PrivateMusicAuthorityFixture.start()
+    let executor = PrivateCodexOutput(
         output: """
         {
           "title": "午夜缓行",
@@ -86,9 +90,9 @@ func codexAgentBuildsACompleteShowProposal() async throws {
         }
         """
     )
+    try fixture.mockOutput(executor.output)
     let agent = CodexTrackRankingAgent(
-        executor: executor,
-        hostPrompt: "像深夜电台主持人一样策划。"
+        hostPrompt: "像深夜电台主持人一样策划。", client: fixture.client
     )
     let candidates = (1 ... 5).map {
         MusicCandidate.fixture(
@@ -134,23 +138,7 @@ private let proposalBrief = ProgramBrief(
     conversationMode: .ambient
 )
 
-private actor CodexPlanningExecutorStub: CodexPlanningExecuting {
-    private let output: String
-    private var prompt: String?
-
-    init(output: String) {
-        self.output = output
-    }
-
-    func execute(prompt: String) async throws -> String {
-        self.prompt = prompt
-        return output
-    }
-
-    func lastPrompt() -> String? {
-        prompt
-    }
-}
+private struct PrivateCodexOutput { let output: String }
 
 private extension MusicCandidate {
     static func fixture(id: String, title: String) -> MusicCandidate {

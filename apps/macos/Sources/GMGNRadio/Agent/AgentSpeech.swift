@@ -254,25 +254,54 @@ final class AgentSpeechAnnouncer {
     private var generation = UUID()
     private var operation: Task<Void, Never>?
     private var completion: AgentSpeechCompletion?
+    private var deliveryPlayback: RustSpeechDeliveryPlayback?
+    private var deliveryMode = "replace"
     private(set) var isSpeaking = false { didSet { statusStore.isSpeaking = isSpeaking } }
 
     init(configuration: @escaping @MainActor () -> RustVoiceConfiguration,
          statusStore: AgentSpeechStatusStore = .shared,
          client: RustVoiceClient = RustVoiceClient(),
          player: any StreamingPCMPlaying = StreamingPCMPlayer(),
+         scopeID: String = "product.reply",
+         hostSessionID: String = UUID().uuidString,
+         deliveryMode: String = "replace",
          onPlaybackChanged: @escaping @MainActor (AgentSpeechPlaybackState) -> Void = { _ in },
          start: (@MainActor (String, RustVoiceConfiguration) async throws -> any RustVoiceStreaming)? = nil) {
         self.configuration = configuration; self.statusStore = statusStore
         self.start = start ?? { text, settings in try await client.startTTS(text: text, configuration: settings) }
         self.player = player; self.onPlaybackChanged = onPlaybackChanged
+        self.deliveryMode = deliveryMode
+        if start == nil {
+            deliveryPlayback = RustSpeechDeliveryPlayback(
+                authority: RustSpeechDeliveryClient(scopeID: scopeID, hostSessionID: hostSessionID, voiceClient: client),
+                player: player,
+                start: { text, configuration, ticket in try await client.startDeliveryTTS(text: text, configuration: configuration, ticket: ticket) },
+                onPlaybackChanged: onPlaybackChanged,
+                onPendingChanged: { [weak self] pending in self?.isSpeaking = pending },
+                onFailure: { [weak self] _ in self?.statusStore.lastErrorMessage = "语音朗读失败，请检查语音设置；文字回复不受影响。" })
+        }
     }
 
     @discardableResult func speak(_ text: String) -> Bool { begin(text, completion: nil) }
+    func speakIssued(_ dispatch: RustSpeechDeliveryClient.ChatDispatch) async {
+        guard let deliveryPlayback else { return }
+        let settings = configuration()
+        guard !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            statusStore.lastErrorMessage = "请先在语音设置中填写服务密钥；文字回复不受影响。"
+            deliveryPlayback.cancel(); return
+        }
+        statusStore.lastErrorMessage = nil
+        await deliveryPlayback.submitIssued(utteranceID: dispatch.utteranceID, text: dispatch.text,
+            configuration: settings, view: dispatch.delivery)
+    }
+    func applyIssuedSpeechView(_ view: RustSpeechDeliveryClient.View) async {
+        await deliveryPlayback?.applyIssued(view)
+    }
     @discardableResult func speak(_ text: String, completion: @escaping AgentSpeechCompletion) -> Bool {
         begin(text, completion: completion)
     }
     private func begin(_ text: String, completion: AgentSpeechCompletion?) -> Bool {
-        stopSpeaking()
+        if deliveryPlayback == nil { stopSpeaking() }
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { completion?(.cancelled); return false }
         let settings = configuration()
@@ -281,6 +310,10 @@ final class AgentSpeechAnnouncer {
             completion?(.failed); return false
         }
         statusStore.lastErrorMessage = nil
+        if let deliveryPlayback {
+            deliveryPlayback.submit(text: text, configuration: settings, mode: deliveryMode, completion: completion)
+            return true
+        }
         self.completion = completion; isSpeaking = true
         let identity = generation
         operation = Task { [weak self] in
@@ -360,6 +393,7 @@ final class AgentSpeechAnnouncer {
         }
     }
     func stopSpeaking() {
+        if let deliveryPlayback { deliveryPlayback.cancel(); return }
         generation = UUID()
         session?.cancel(); session = nil
         operation?.cancel(); operation = nil

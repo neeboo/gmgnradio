@@ -20,13 +20,23 @@ final class GPUIRenderHost {
     init(dataRoot: URL, defaults: UserDefaults) {
         self.dataRoot = dataRoot
         self.defaults = defaults
-        let stage = SpatialStageStore(defaults: defaults)
+        let settings = RustProductSettingsClient(
+            root: WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: dataRoot),
+            allowsLaunching: false)
+        let stage = SpatialStageStore(defaults: defaults, settings: settings)
         // A local selection prevents catalog prewarming/network downloads.
         stage.selectWorld(id: LivingPodScene.worldID)
         stage.requestWorldPresentation()
         let library = MarbleWorldLibrary(
+            client: MarbleWorldClient(apiKeyProvider: MarbleAPIKeyProvider(
+                fileURL: dataRoot.appendingPathComponent("secrets/world-labs-api-key"))),
             cache: MarbleWorldCache(rootURL: dataRoot.appendingPathComponent("cache/marble")),
-            spatialStage: stage
+            spatialStage: stage,
+            authority: RustMarbleControlClient(
+                root: WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: dataRoot),
+                helperPath: "", allowsLaunching: false,
+                owner: "marble.worlds", hostSessionID: UUID().uuidString),
+            preparePackage: { _ in throw RustMarbleControlError.unavailable }
         )
         let avatar = StageAvatarRuntimeStore(
             packageStore: PresencePackageStore(rootURL: dataRoot.appendingPathComponent("avatars")),

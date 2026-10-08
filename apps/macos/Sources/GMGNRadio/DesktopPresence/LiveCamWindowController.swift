@@ -312,6 +312,9 @@ final class LiveCamWindowController: NSWindowController, NSWindowDelegate {
         // 失败回填是失败提示，不能被下一条普通应用信息（点唱机/语音等）盖掉。
         panel.showFailureStatus(notice + "\n文字和图片已保留。")
     }
+    func finishResidentAttachments(ids: [UUID]) {
+        (window as? LiveCamPanel)?.interactionView.finishResidentAttachments(ids:ids)
+    }
 
     private func rotateCamera(by translation: CGSize) {
         let sensitivity: Float = 0.008

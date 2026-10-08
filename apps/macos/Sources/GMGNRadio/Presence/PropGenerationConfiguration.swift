@@ -37,15 +37,6 @@ struct PropGenerationConfigurationStore: Sendable {
         return try PropGenerationConfiguration(endpoint: value.endpoint, token: value.token)
     }
 
-    func save(_ configuration: PropGenerationConfiguration) throws {
-        let directory = fileURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-        let data = try JSONEncoder().encode(StoredValue(endpoint: configuration.endpoint, token: configuration.token))
-        try data.write(to: fileURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-    }
 }
 
 extension Notification.Name {

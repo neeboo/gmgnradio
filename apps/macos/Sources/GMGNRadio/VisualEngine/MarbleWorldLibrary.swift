@@ -13,7 +13,7 @@ final class MarbleWorldLibrary {
         category: "MarbleWorldLibrary"
     )
 
-    private(set) var worlds: [MarbleWorld] = MarblePublicWorldCatalog.worlds
+    private(set) var worlds: [MarbleWorld] = []
     private(set) var selectedWorld: MarbleWorld?
     private(set) var localSplatURL: URL?
     private(set) var isPreparing = false
@@ -28,6 +28,11 @@ final class MarbleWorldLibrary {
         worlds.filter(\.isPublicExample)
     }
 
+    private let authority: RustMarbleControlClient
+    private let preparePackage: @MainActor @Sendable (MarbleWorld) async throws -> String
+    private var controlBusy = false
+    private var importedLegacySelection = false
+    private var presetWorldIDs: [String: String] = [:]
     private let client: MarbleWorldClient
     private let cache: MarbleWorldCache
     private let spatialStage: SpatialStageStore
@@ -39,8 +44,12 @@ final class MarbleWorldLibrary {
     init(
         client: MarbleWorldClient = MarbleWorldClient(),
         cache: MarbleWorldCache = MarbleWorldCache(),
-        spatialStage: SpatialStageStore
+        spatialStage: SpatialStageStore,
+        authority: RustMarbleControlClient,
+        preparePackage: @escaping @MainActor @Sendable (MarbleWorld) async throws -> String
     ) {
+        self.authority = authority
+        self.preparePackage = preparePackage
         self.client = client
         self.cache = cache
         self.spatialStage = spatialStage
@@ -73,19 +82,14 @@ final class MarbleWorldLibrary {
     }
 
     func select(worldID: String) async -> URL? {
-        guard let world = worlds.first(where: { $0.id == worldID }) else {
-            return nil
-        }
-        selectionRevision &+= 1
-        selectedLocalWorldID = nil
-        selectedWorld = world
-        spatialStage.selectScene(
-            .inferred(worldID: world.id, name: world.name)
-        )
-        spatialStage.selectWorld(id: world.id)
-        localSplatURL = nil
-        errorMessage = nil
-        return await cacheSelectedWorld()
+        guard !controlBusy else { return nil }
+        controlBusy = true
+        defer { controlBusy = false }
+        do {
+            let current = try await authority.read()
+            try await consume(try await authority.command("select", expectedRevision: current.revision, worldID: worldID))
+            return await cacheSelectedWorld()
+        } catch { errorMessage = error.localizedDescription; return nil }
     }
 
     func selectLocalWorld(id: String, scene: SpatialScenePreset) {
@@ -147,82 +151,116 @@ final class MarbleWorldLibrary {
     }
 
     func hasWorld(for preset: SpatialScenePreset) -> Bool {
-        worlds.contains { world in
-            world.name.compare(
-                preset.worldDisplayName,
-                options: [.caseInsensitive, .diacriticInsensitive]
-            ) == .orderedSame
-        }
+        presetWorldIDs[preset.rawValue] != nil
     }
 
     func activate(preset: SpatialScenePreset) async {
-        guard generatingPreset == nil else {
-            return
-        }
-
-        errorMessage = nil
-        if worlds.isEmpty {
-            await reloadWorlds()
-        }
-
-        if let world = world(for: preset) {
-            spatialStage.selectScene(preset)
-            _ = await select(worldID: world.id)
-            return
-        }
-
-        await generateAndActivate(preset)
+        guard !controlBusy else { return }
+        controlBusy = true
+        generatingPreset = preset
+        defer { controlBusy = false; generatingPreset = nil }
+        do {
+            let current = try await authority.read()
+            try await consume(authority.command("activate_preset", expectedRevision: current.revision, presetID: preset.rawValue))
+            _ = await cacheSelectedWorld()
+        } catch { errorMessage = error.localizedDescription }
     }
 
-    private func performPreparation(
-        expectedSelectionRevision: UInt64
-    ) async -> URL? {
+    private func performPreparation(expectedSelectionRevision: UInt64) async -> URL? {
+        guard !controlBusy else { return localSplatURL }
+        controlBusy = true
         isPreparing = true
-        errorMessage = nil
-        defer { isPreparing = false }
-
+        defer { controlBusy = false; isPreparing = false }
         do {
-            let accountWorlds = try await client.listWorlds(pageSize: 50)
-            guard selectionRevision == expectedSelectionRevision else {
-                return localSplatURL
-            }
-            worlds = mergedWithPublicExamples(accountWorlds)
+            let current = try await authority.read()
+            let saved = importedLegacySelection ? nil : UserDefaults.standard.string(forKey: "marble.selected-world-id")
+            let confirmed = try await authority.command("refresh", expectedRevision: current.revision,
+                pageSize: 50, savedSelectedWorldID: saved)
+            importedLegacySelection = true
+            try await consume(confirmed)
+            return await cacheSelectedWorld()
+        } catch { errorMessage = error.localizedDescription; return nil }
+    }
 
-            let savedID = UserDefaults.standard.string(
-                forKey: "marble.selected-world-id"
-            )
-            selectedWorld = worlds.first { $0.id == savedID }
-                ?? world(for: .djHouse)
-                ?? worlds.first { $0.id == Self.preferredInitialWorldID }
-                ?? worlds.first
-            if let selectedWorld {
-                spatialStage.selectScene(
-                    .inferred(
-                        worldID: selectedWorld.id,
-                        name: selectedWorld.name
-                    )
-                )
-            }
-            spatialStage.selectWorld(id: selectedWorld?.id)
-            return await cacheSelectedWorld()
-        } catch {
-            worlds = MarblePublicWorldCatalog.worlds
-            guard selectionRevision == expectedSelectionRevision else {
-                return localSplatURL
-            }
-            selectedWorld = restoredOrInitialWorld()
-            if let selectedWorld {
-                spatialStage.selectScene(
-                    .inferred(
-                        worldID: selectedWorld.id,
-                        name: selectedWorld.name
-                    )
-                )
-            }
-            spatialStage.selectWorld(id: selectedWorld?.id)
-            Self.log.notice("Marble account unavailable; using official public SPZ examples: \(error.localizedDescription, privacy: .public)")
-            return await cacheSelectedWorld()
+    private func nativeWorld(_ world: RustMarbleControlClient.World) throws -> MarbleWorld {
+        guard ["glTF", "worldLabsOpenCV"].contains(world.colliderCoordinates) else { throw RustMarbleControlError.invalidResponse }
+        let assets = try world.splatFallbacks.map { asset -> MarbleSplatAsset in
+            guard let quality = MarbleSplatQuality(rawValue: asset.quality) else { throw RustMarbleControlError.invalidResponse }
+            return MarbleSplatAsset(quality: quality, url: asset.url)
         }
+        return MarbleWorld(id: world.id, name: world.name, model: world.model,
+            thumbnailURL: world.thumbnailURL, colliderURL: world.colliderURL,
+            colliderSourceCoordinates: world.colliderCoordinates == "glTF" ? .glTF : .worldLabsOpenCV,
+            semantics: MarbleWorldSemantics(metricScale: world.semantics.metricScale,
+                groundPlaneOffset: world.semantics.groundPlaneOffset), splatFallbacks: assets)
+    }
+
+    private func project(_ value: RustMarbleControlClient.Snapshot) throws {
+        worlds = try value.worlds.map(nativeWorld)
+        presetWorldIDs = value.presetWorldIDs
+        generationProgress = value.task?.progress
+        generationMessage = value.task?.phase
+        errorMessage = value.task?.errorMessage ?? value.task?.errorCode
+        if selectedWorld?.id != value.selectedWorldID {
+            selectionRevision &+= 1
+            selectedLocalWorldID = nil
+            localSplatURL = nil
+            selectedWorld = worlds.first { $0.id == value.selectedWorldID }
+            if let world = selectedWorld { spatialStage.selectScene(.inferred(worldID: world.id, name: world.name)) }
+            spatialStage.selectWorld(id: value.selectedWorldID)
+        } else if let selectedID = value.selectedWorldID {
+            selectedWorld = worlds.first { $0.id == selectedID }
+        }
+    }
+
+    private func consume(_ initial: RustMarbleControlClient.Snapshot) async throws {
+        var value = initial
+        while true {
+            try project(value)
+            guard let task = value.task, task.status == "pending" else { return }
+            if let delay = value.waitMS, delay > 0 {
+                try await Task.sleep(for: .milliseconds(delay))
+                value = try await authority.read()
+                continue
+            }
+            value = try await authority.claim(taskID: task.taskID, expectedRevision: value.revision)
+            if value.action == nil, let delay = value.waitMS, delay > 0 {
+                try await Task.sleep(for: .milliseconds(delay))
+                value = try await authority.read()
+                continue
+            }
+            guard let action = value.action, action.taskID == task.taskID,
+                  action.hostSessionID == task.hostSessionID,
+                  action.generation == task.generation,
+                  action.status == "inflight" else { throw RustMarbleControlError.executionUnknown }
+            if action.kind == "prepare_package" {
+                guard let world = action.world else { throw RustMarbleControlError.invalidResponse }
+                let digest: String
+                do { digest = try await preparePackage(nativeWorld(world)) }
+                catch {
+                    value = try await record(action, fact: RustMarbleControlClient.PackageFailureFact(
+                        preparationErrorCode: error is CancellationError ? "native_cancelled" : "native_preparation_failed"))
+                    continue
+                }
+                value = try await record(action, fact: RustMarbleControlClient.PackageFact(manifestSHA256: digest))
+            } else {
+                guard let method = action.method, let path = action.path else { throw RustMarbleControlError.invalidResponse }
+                let observed = await client.executePlannedHTTP(method: method, path: path, body: try action.bodyData)
+                let fact: RustMarbleControlClient.HTTPFact
+                if let code = observed.transportErrorCode { fact = .init(transportErrorCode: code) }
+                else if let status = observed.statusCode, let body = observed.body { fact = .init(statusCode: status, body: body) }
+                else { throw RustMarbleControlError.executionUnknown }
+                value = try await record(action, fact: fact)
+            }
+        }
+    }
+
+    private func record<F: Encodable & Sendable>(_ action: RustMarbleControlClient.Action,
+                                                 fact: F) async throws -> RustMarbleControlClient.Snapshot {
+        // Only the identical observed receipt is retried. The native action is never replayed.
+        let requestID = UUID().uuidString
+        do { return try await authority.receipt(action, fact: fact, requestID: requestID) }
+        catch { return try await authority.receipt(action, fact: fact, requestID: requestID) }
     }
 
     private func cacheSelectedWorld() async -> URL? {
@@ -244,10 +282,6 @@ final class MarbleWorldLibrary {
                 return localSplatURL
             }
             localSplatURL = url
-            UserDefaults.standard.set(
-                selectedWorld.id,
-                forKey: "marble.selected-world-id"
-            )
             onLocalSplatChange?(url)
             return url
         } catch {
@@ -258,93 +292,4 @@ final class MarbleWorldLibrary {
         }
     }
 
-    private func world(for preset: SpatialScenePreset) -> MarbleWorld? {
-        worlds.first { world in
-            world.name.compare(
-                preset.worldDisplayName,
-                options: [.caseInsensitive, .diacriticInsensitive]
-            ) == .orderedSame
-        }
-    }
-
-    private func reloadWorlds() async {
-        do {
-            worlds = mergedWithPublicExamples(
-                try await client.listWorlds(pageSize: 100)
-            )
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    private func mergedWithPublicExamples(
-        _ accountWorlds: [MarbleWorld]
-    ) -> [MarbleWorld] {
-        let accountIDs = Set(accountWorlds.map(\.id))
-        return accountWorlds + MarblePublicWorldCatalog.worlds.filter {
-            !accountIDs.contains($0.id)
-        }
-    }
-
-    private func restoredOrInitialWorld() -> MarbleWorld? {
-        let savedID = UserDefaults.standard.string(
-            forKey: "marble.selected-world-id"
-        )
-        return worlds.first { $0.id == savedID }
-            ?? world(for: .djHouse)
-            ?? worlds.first { $0.id == Self.preferredInitialWorldID }
-            ?? worlds.first
-    }
-
-    private func generateAndActivate(_ preset: SpatialScenePreset) async {
-        generatingPreset = preset
-        generationProgress = nil
-        generationMessage = "正在生成 \(preset.displayName)…"
-        defer {
-            generatingPreset = nil
-            generationProgress = nil
-        }
-
-        do {
-            var operation = try await client.generateWorld(preset: preset)
-            for _ in 0 ..< 120 {
-                try Task.checkCancellation()
-                if operation.isDone {
-                    break
-                }
-                generationProgress = operation.progressPercentage
-                if let percentage = operation.progressPercentage {
-                    generationMessage = "正在生成 \(preset.displayName) · \(percentage)%"
-                }
-                try await Task.sleep(for: .seconds(3))
-                operation = try await client.operation(id: operation.id)
-            }
-
-            if let message = operation.errorMessage {
-                throw MarbleWorldClientError.generationFailed(message)
-            }
-            guard operation.isDone else {
-                throw MarbleWorldClientError.generationTimedOut
-            }
-
-            generationMessage = "空间完成，正在下载…"
-            for _ in 0 ..< 10 {
-                await reloadWorlds()
-                if let generatedWorld = world(for: preset) {
-                    spatialStage.selectScene(preset)
-                    _ = await select(worldID: generatedWorld.id)
-                    generationMessage = "已进入 \(preset.displayName)"
-                    return
-                }
-                try await Task.sleep(for: .seconds(2))
-            }
-            throw MarbleWorldClientError.generatedWorldMissing
-        } catch is CancellationError {
-            generationMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
-            generationMessage = nil
-            Self.log.error("Unable to generate Marble world: \(error.localizedDescription, privacy: .public)")
-        }
-    }
 }

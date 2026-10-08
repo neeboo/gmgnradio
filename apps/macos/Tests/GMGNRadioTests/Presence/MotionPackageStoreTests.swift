@@ -18,7 +18,7 @@ struct MotionPackageStoreTests {
                     format: .vmd,
                     url: slapBass
                 ),
-            ]
+            ], selectionAuthority: fixture.store.selectionAuthority
         )
 
         let motions = try store.listMotions()
@@ -36,7 +36,8 @@ struct MotionPackageStoreTests {
         let studioURL = try fixture.makeVRMAFile(name: "StudioGroove")
         let store = MotionPackageStore(
             rootURL: fixture.rootURL,
-            bundledStudioGrooveURL: studioURL
+            builtInMotions: [.init(id: MotionPackageStore.studioGrooveID, name: "Studio Groove", format: .vrma, url: studioURL)],
+            selectionAuthority: fixture.store.selectionAuthority
         )
 
         let motions = try store.listMotions()
@@ -50,11 +51,16 @@ struct MotionPackageStoreTests {
     }
 
     @Test
-    func retiredStudioSelectionMigratesToNaturalIdle() throws {
-        let fixture = try MotionFixture()
+    func retiredStudioSelectionMigratesToNaturalIdle() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try MotionFixture(rootURL: authority.motionRoot, selectionAuthority: authority.client)
         try Data(
             #"{"activeID":"builtin.motion.studio-groove"}"#.utf8
         ).write(to: fixture.rootURL.appending(path: ".selection.json"))
+        let legacy = try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json"))
+        try await authority.bind(store: authority.pmxStore(), motions: fixture.store)
+        try await authority.acknowledge()
+        #expect(try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json")) == legacy)
 
         #expect(
             try fixture.store.activeMotion().id
@@ -63,11 +69,16 @@ struct MotionPackageStoreTests {
     }
 
     @Test
-    func legacyAutomaticFullSelectionMigratesToNaturalIdle() throws {
-        let fixture = try MotionFixture()
+    func legacyAutomaticFullSelectionMigratesToNaturalIdle() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try MotionFixture(rootURL: authority.motionRoot, selectionAuthority: authority.client)
         try Data(
             #"{"activeID":"builtin.motion.2b-full"}"#.utf8
         ).write(to: fixture.rootURL.appending(path: ".selection.json"))
+        let legacy = try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json"))
+        try await authority.bind(store: authority.pmxStore(), motions: fixture.store)
+        try await authority.acknowledge()
+        #expect(try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json")) == legacy)
 
         #expect(
             try fixture.store.activeMotion().id
@@ -76,11 +87,16 @@ struct MotionPackageStoreTests {
     }
 
     @Test
-    func aVersionedRetiredFullSelectionAlsoMigratesToNaturalIdle() throws {
-        let fixture = try MotionFixture()
+    func aVersionedRetiredFullSelectionAlsoMigratesToNaturalIdle() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try MotionFixture(rootURL: authority.motionRoot, selectionAuthority: authority.client)
         try Data(
             #"{"activeID":"builtin.motion.2b-full","version":2}"#.utf8
         ).write(to: fixture.rootURL.appending(path: ".selection.json"))
+        let legacy = try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json"))
+        try await authority.bind(store: authority.pmxStore(), motions: fixture.store)
+        try await authority.acknowledge()
+        #expect(try Data(contentsOf: fixture.rootURL.appendingPathComponent(".selection.json")) == legacy)
 
         #expect(
             try fixture.store.activeMotion().id
@@ -118,38 +134,61 @@ struct MotionPackageStoreTests {
     }
 
     @Test
-    func motionSelectionPersistsIndependentlyFromAvatarSelection() throws {
-        let fixture = try MotionFixture()
+    func motionSelectionPersistsIndependentlyFromAvatarSelection() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try MotionFixture(rootURL: authority.motionRoot, selectionAuthority: authority.client)
         let vmdURL = try fixture.makeVMDFile(name: "Dance")
         let installed = try fixture.store.installMotion(from: vmdURL)
 
-        try fixture.store.activate(id: installed.id)
+        try await authority.bind(store: authority.pmxStore(), motions: fixture.store)
+        try await authority.acknowledge()
+        try await fixture.store.activateAsync(id: installed.id)
+        try await authority.acknowledge()
+        let transport = TaskdHTTPAuthorityClient(endpointFile: authority.root.appendingPathComponent("TaskService/taskd.endpoint.json").path, helperPath: "", allowsLaunching: false, timeout: 5)
+        let bytes = try JSONSerialization.data(withJSONObject: transport.call(method: "presence_selection_read", params: ["scope": authority.root.path]))
+        let persisted = try JSONDecoder().decode(RustPresenceSelectionClient.Snapshot.self, from: bytes)
+        #expect(persisted.motionID == installed.id)
         let reopened = MotionPackageStore(
             rootURL: fixture.rootURL,
-            bundledStudioGrooveURL: nil
+            builtInMotions: [], selectionAuthority: authority.client
         )
 
         #expect(try reopened.activeMotion().id == installed.id)
     }
 
     @Test
-    func removingTheActiveMotionFallsBackToNaturalIdle() throws {
-        let fixture = try MotionFixture()
+    func removingTheActiveMotionFallsBackToNaturalIdle() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try MotionFixture(rootURL: authority.motionRoot, selectionAuthority: authority.client)
         let vmdURL = try fixture.makeVMDFile(name: "Dance")
         let installed = try fixture.store.installMotion(from: vmdURL)
-        try fixture.store.activate(id: installed.id)
+        let model = authority.root.appendingPathComponent("native-fixture.pmx")
+        try Data("private native PMX fixture".utf8).write(to: model)
+        let avatars = PresencePackageStore(rootURL: authority.packageRoot,
+            builtInVRMs: [.init(id: "private.pmx", name: "Private PMX", url: model, engine: .pmx)],
+            selectionAuthority: authority.client)
+        try await authority.bind(store: avatars, motions: fixture.store)
+        if authority.client.confirmed?.pendingRenderer == true {
+            _ = try await authority.client.event("renderer_ack", success: true)
+        }
+        try await fixture.store.activateAsync(id: installed.id)
+        _ = try await authority.client.event("renderer_ack", success: true)
 
-        try fixture.store.remove(id: installed.id)
+        try await fixture.store.removeAsync(id: installed.id)
 
         #expect(try fixture.store.activeMotion().id == MotionPackageStore.naturalIdleID)
     }
 
     @Test
-    func aBrokenSelectedMotionReportsFailureInsteadOfReplacingTheSelection() throws {
-        let fixture = try MotionFixture()
+    func aBrokenSelectedMotionReportsFailureInsteadOfReplacingTheSelection() async throws {
+        let authority = try await PrivatePresenceAuthorityFixture.start()
+        let fixture = try MotionFixture(rootURL: authority.motionRoot, selectionAuthority: authority.client)
         let vmdURL = try fixture.makeVMDFile(name: "Dance")
         let installed = try fixture.store.installMotion(from: vmdURL)
-        try fixture.store.activate(id: installed.id)
+        try await authority.bind(store: authority.pmxStore(), motions: fixture.store)
+        try await authority.acknowledge()
+        try await fixture.store.activateAsync(id: installed.id)
+        try await authority.acknowledge()
         let installedURL = try #require(installed.url)
         try FileManager.default.removeItem(at: installedURL)
 
@@ -263,14 +302,15 @@ private struct MotionFixture {
     let rootURL: URL
     let store: MotionPackageStore
 
-    init() throws {
-        rootURL = FileManager.default.temporaryDirectory
+    init(rootURL injectedRoot: URL? = nil, selectionAuthority: RustPresenceSelectionClient? = nil) throws {
+        rootURL = injectedRoot ?? FileManager.default.temporaryDirectory
             .appending(path: "gmgn-motion-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(
             at: rootURL,
             withIntermediateDirectories: true
         )
-        store = MotionPackageStore(rootURL: rootURL, bundledStudioGrooveURL: nil)
+        let isolated = selectionAuthority ?? RustPresenceSelectionClient(scope: rootURL.deletingLastPathComponent().path, call: { _,_ in throw RustPresenceSelectionClient.SelectionError.unavailable })
+        store = MotionPackageStore(rootURL: rootURL, builtInMotions: [], selectionAuthority: isolated)
     }
 
     func makeVRMAFile(name: String, valid: Bool = true) throws -> URL {

@@ -1,0 +1,25 @@
+[package]
+workspace = "../.."
+name = "rutis"
+description = "Cordis core paradigms in idiomatic Rust: plugin assembly, fiber lifecycle, typed service registry, dependency-driven reload"
+edition.workspace = true
+version = "0.6.1"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["cordis", "plugin", "fiber", "event-bus", "async"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+
+[[bench]]
+name = "events"
+harness = false
+
+[[bench]]
+name = "runtime"
+harness = false

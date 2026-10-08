@@ -6,6 +6,9 @@ enum UnityBuiltinDevicesBridge {
         guard let worldID,
               let package = try? LivingWorldBootstrap.loadBundledCanary(bundle: bundle),
               package.manifest.worldID == worldID else { return [] }
+        return snapshot(package: package)
+    }
+    static func snapshot(package: BundledLivingWorldPackage) -> [[String:Any]] {
         return package.manifest.resources.compactMap { resource in
             guard resource.kind == "prop.procedural",
                   LivingWorldBootstrap.proceduralDeclaration(id: resource.id, in: package) != nil,
@@ -13,8 +16,12 @@ enum UnityBuiltinDevicesBridge {
                   let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   ["builtin.jukebox", "builtin.wish_machine"].contains(value["renderer"] as? String ?? "") else { return nil }
             var template = value
+            // Provenance is the authored resource's exact manifest collision ID.
+            // No nearest-volume or coordinate matching is permitted.
+            guard let sourceID = template["collisionSourceID"] as? String,
+                  let collision = package.manifest.collisionVolumes.first(where: { $0.id == sourceID }) else { return nil }
             if template["size"] == nil,
-               let collision = package.manifest.collisionVolumes.first(where: { $0.id == "collision." + resource.id.replacingOccurrences(of: "prop.", with: "") }) {
+               !sourceID.isEmpty {
                 template["size"] = [collision.halfExtents.x * 2, collision.halfExtents.y * 2, collision.halfExtents.z * 2]
             }
             return template

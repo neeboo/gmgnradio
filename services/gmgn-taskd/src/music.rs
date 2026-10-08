@@ -190,7 +190,7 @@ pub fn request(c: &mut Connection, method: &str, input: Value) -> Result<Value> 
             let (id, date) = program(value)?;
             let pending = input["pending"].as_bool().ok_or("invalid_music_input")?;
             let tx = c.transaction().map_err(|_| "storage_unavailable")?;
-            tx.execute("INSERT INTO music_programs VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,pending=excluded.pending,payload=excluded.payload", params![id,date,pending,value.to_string()]).map_err(|_| "storage_unavailable")?;
+            tx.execute("INSERT INTO music_programs VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,pending=excluded.pending,payload=excluded.payload", params![id,date,pending,crate::canonical_json::to_string(&value).map_err(|_| "invalid_music_input")?]).map_err(|_| "storage_unavailable")?;
             capacity(&tx)?;
             tx.commit().map_err(|_| "storage_unavailable")?;
             Ok(json!({"saved":true}))
@@ -229,7 +229,7 @@ pub fn request(c: &mut Connection, method: &str, input: Value) -> Result<Value> 
             for (index, p) in list.iter().enumerate() {
                 tx.execute(
                     "INSERT INTO music_playlists VALUES(?1,?2,?3)",
-                    params![p["id"].as_str(), index as i64, p.to_string()],
+                    params![p["id"].as_str(), index as i64, crate::canonical_json::to_string(p).map_err(|_| "invalid_music_input")?],
                 )
                 .map_err(|_| "storage_unavailable")?;
             }
@@ -276,7 +276,7 @@ pub fn request(c: &mut Connection, method: &str, input: Value) -> Result<Value> 
                 pc += tx
                     .execute(
                         "INSERT OR IGNORE INTO music_programs VALUES(?1,?2,0,?3)",
-                        params![id, date, p.to_string()],
+                        params![id, date, crate::canonical_json::to_string(p).map_err(|_| "invalid_music_input")?],
                     )
                     .map_err(|_| "storage_unavailable")?;
             }
@@ -291,7 +291,7 @@ pub fn request(c: &mut Connection, method: &str, input: Value) -> Result<Value> 
                 lc += tx
                     .execute(
                         "INSERT OR IGNORE INTO music_playlists VALUES(?1,?2,?3)",
-                        params![p["id"].as_str(), position + index as i64, p.to_string()],
+                        params![p["id"].as_str(), position + index as i64, crate::canonical_json::to_string(p).map_err(|_| "invalid_music_input")?],
                     )
                     .map_err(|_| "storage_unavailable")?;
             }

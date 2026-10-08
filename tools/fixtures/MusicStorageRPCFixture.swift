@@ -1,6 +1,10 @@
 import Foundation
 #if GMGN_STORAGE_FULL_MODULE
+#if GMGN_STORAGE_RELEASE_TYPECHECK
+import UnityMediaHost
+#else
 @testable import UnityMediaHost
+#endif
 #else
 enum PropTaskJSON: Codable, Equatable {
     case string(String), number(Double), bool(Bool), object([String: Self]), array([Self]), null
@@ -27,7 +31,7 @@ enum PropTaskJSON: Codable, Equatable {
 }
 enum PropTaskDaemonError: Error { case invalidFrame }
 @MainActor final class PropTaskDaemonClient {
-    init(root: URL? = nil, helperURL: URL? = nil) { }
+    init(root: URL? = nil, helperURL: URL? = nil, requestTimeout: TimeInterval = 10) { }
     func call(method: String, params: [String: PropTaskJSON]) async throws -> [String: PropTaskJSON] { fatalError("Fixture must not access a live daemon") }
 }
 #endif
@@ -49,21 +53,27 @@ enum MusicStorageFixtureError: Error { case unavailable, revisionConflict }
     }
     func call(_ method: String, _ params: [String: PropTaskJSON]) async throws -> [String: PropTaskJSON] {
         if rejected { throw MusicStorageFixtureError.unavailable }
-        switch method {
-        case "music_program_save":
-            let item = try decode(params["program"]!, as: SavedDJProgram.self)
-            programs.removeAll { $0.plan.brief.id == item.plan.brief.id }; programs.insert(item, at: 0)
-            pending.removeAll { $0 == item.plan.brief.id }
-            if params["pending"] == .bool(true) { pending.append(item.plan.brief.id) }
-            return ["saved": .bool(true)]
-        case "music_program_list": return ["programs": try encode(programs), "pendingIDs": try encode(pending)]
-        case "music_library_read": return ["playlists": try encode(playlists), "revision": .number(Double(revision))]
-        case "music_library_commit":
-            guard params["baseRevision"] == .number(Double(revision)) else { throw MusicStorageFixtureError.revisionConflict }
-            playlists = try decode(params["playlists"]!, as: [MusicPlaylistSnapshot].self); revision += 1
-            return ["playlists": try encode(playlists), "revision": .number(Double(revision))]
-        case "music_import": fatalError("Fixtures must not import production legacy files")
-        default: fatalError("Unexpected music RPC")
+        if method.hasPrefix("music_library_") || method.hasPrefix("music_dj_") || method.hasPrefix("music_program_") || method == "music_import" {
+            guard let endpoint = ProcessInfo.processInfo.environment["GMGN_MUSIC_LIBRARY_FIXTURE_URL"],
+                  let url = URL(string: endpoint), ["127.0.0.1", "localhost"].contains(url.host ?? ""),
+                  let token = ProcessInfo.processInfo.environment["GMGN_MUSIC_LIBRARY_FIXTURE_TOKEN"] else {
+                throw MusicStorageFixtureError.unavailable
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.httpBody = try JSONEncoder().encode(PropTaskJSON.object([
+                "jsonrpc": .string("2.0"), "id": .string(UUID().uuidString),
+                "method": .string(method), "params": .object(params)]))
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  case .object(let envelope) = try JSONDecoder().decode(PropTaskJSON.self, from: data),
+                  envelope["error"] == nil, case .object(let result) = envelope["result"] else {
+                throw MusicStorageFixtureError.unavailable
+            }
+            return result
         }
+        fatalError("Unexpected private music RPC")
     }
 }
