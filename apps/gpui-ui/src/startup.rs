@@ -31,6 +31,13 @@
 //! 3. 加载态有上限且失败具名：任何一项不可能无限等待——它有 `budget_ms`，整体还有
 //!    [`STARTUP_DEADLINE_MS`]；超时只会变成 `"<id>_timeout"` / `"<id>_deadline"`
 //!    这样的具名失败，不会静默。
+//! 4. **门只用于"还没就绪"的那段时间**：世界一旦 `phase=activate`（渲染侧
+//!    `[WorldMode] visible=True` ⇒ 快照 `stage.presentation.isWorldVisible`），
+//!    应用就已经可用，门必须**立刻**放行，不得再盖住整窗。
+//! 5. **门只等待这个壳真的会发布的东西**：每一项的信号必须在
+//!    [`PRODUCT_SHELL_SIGNAL_PRODUCERS`] 里有生产者；没有生产者的项不参与门
+//!    （[`StepPhase::NotApplicable`] / [`StepPhase::Deferred`]，具名说明读的是哪个键），
+//!    既不会在超时后把整门判失败，也不会连锁 `blocked_by_*` 把别的项拖下水。
 //!
 //! ## 不放宽任何校验
 //!
@@ -145,6 +152,184 @@ pub enum Signal {
     /// 生成服务健康：`PropGenerationHealth.isReady`
     /// （`apps/macos/Sources/GMGNRadio/Presence/PropGenerationClient.swift:14`）。
     GenerationService,
+}
+
+/// 一个信号在这个壳里**什么时候**能拿到。
+///
+/// 这是"门只能等待这个壳真的会发布的东西"的机械表达：`Never` 的项不参与门，
+/// `OnDemand` 的项只具名列出（进门后按需），只有 `Startup` 的项才可能挡住人。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SignalAvailability {
+    /// 这个壳**在启动阶段**就会发布它：可以参与门。
+    Startup,
+    /// 这个壳只在**用户进门后按需**发布它（例如打开音乐页才触发的歌单加载）：
+    /// 加载态只把它具名列出（[`StepPhase::Deferred`]），不挡人。
+    OnDemand,
+    /// 这个壳**根本不发布**这个信号：它不属于加载态，不参与门。
+    Never,
+}
+
+/// 一个信号在**产品壳**（Unity overlay 信封）里的生产者。
+///
+/// 三件事一起写下来，缺一条就说不清"门到底在等什么"：
+/// - `key`：产品壳信封里驱动它的键路径（从信封根开始）；
+/// - `source`：发布这个键的真实源码位置，`仓库相对路径:行`；
+/// - `availability`：这个壳在启动阶段能不能拿到它。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalProducer {
+    /// 被生产的信号。
+    pub signal: Signal,
+    /// 产品壳信封里驱动它的键路径。
+    pub key: &'static str,
+    /// 发布这个键的源码位置，`仓库相对路径:行`。
+    pub source: &'static str,
+    /// 这个壳在启动阶段能不能拿到它。
+    pub availability: SignalAvailability,
+}
+
+/// 产品壳里每个信号的**生产者**——这张表是"没有生产者的项不许挡人"的唯一来源。
+///
+/// [`StartupSignals::observe_product_shell_envelope`] 按它登记可用性；
+/// `tests/startup_readiness_gate.rs` 与 `tools/verify-product-shell-parity.py` 按它判红：
+/// **任何一个挡人项的信号必须在这里是 [`SignalAvailability::Startup`]**。
+///
+/// 产品壳的信封由 `UnityMediaHost.snapshot()`（`apps/macos/UnityHost/UnityMediaHost.swift:1662`）
+/// 加上 Unity 侧的 `GPUIProjectionPayload.Augment`
+/// （`apps/unity-player/Assets/GMGN/GPUIProjectionPayload.cs:35`）组成，
+/// 经 `retained_envelope` 收成 [`crate`] 那层壳读得到的那批键
+/// （`tools/fixtures/gpui-unity-overlay-probe/src/lib.rs:402` 的 `RETAINED_KEYS`）。
+pub const PRODUCT_SHELL_SIGNAL_PRODUCERS: &[SignalProducer] = &[
+    SignalProducer {
+        signal: Signal::HostCore,
+        key: "shell.mount（这一层壳自己的生命周期：dylib 已挂载、`start` 已过）",
+        source: "tools/fixtures/gpui-unity-overlay-probe/src/shell_ui.rs:586",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::HostSnapshot,
+        key: "envelope（一次可解析的产品壳信封）",
+        source: "tools/fixtures/gpui-unity-overlay-probe/src/shell_ui.rs:586",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::HostSurface,
+        key: "shell.mount（GPUI 面已经挂进 Unity 窗口；产品壳没有第二个形态）",
+        source: "tools/fixtures/gpui-unity-overlay-probe/src/shell_ui.rs:586",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::WorldRequested,
+        key: "settings.settings.stage.presentation.isWorldPresentationRequested + settings.settings.stage.space",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1105",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::WorldVisible,
+        key: "settings.settings.stage.presentation.isWorldVisible",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1106",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::ResidentSession,
+        key: "settings.settings.stage.presentation.chatAvailable + isWorldVisible",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1109",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::StageProjection,
+        key: "settings.settings.stage.mode",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1103",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::ActivityCatalog,
+        key: "settings.settings.stage.activities.canRun + items",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1120",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::SettingsProjection,
+        key: "settings.settings（各面板渲染的那本设置字典）",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1998",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::InboxProjection,
+        key: "inbox.entries",
+        source: "apps/macos/UnityHost/UnityInboxBridge.swift:169",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::WishProjection,
+        key: "wish.entries",
+        source: "apps/macos/UnityHost/UnityWishMachineBridge.swift:144",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::ScreenProjection,
+        key: "screenVideo.screens",
+        source: "apps/macos/UnityHost/UnityScreenVideoBridge.swift:369",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::PlayerMenu,
+        key: "music.canPrevious + music.canNext",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1668",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::PlacementSurface,
+        key: "settings.settings.stage.presentation.propsAvailable + unityInventory[]",
+        source: "apps/unity-player/Assets/GMGN/GPUIProjectionPayload.cs:38",
+        availability: SignalAvailability::Startup,
+    },
+    SignalProducer {
+        signal: Signal::MusicLibrary,
+        key: "musicLibrary.playlists（歌单）或 musicLibrary.programs（节目历史）——一次只发布一个",
+        source: "apps/macos/UnityHost/UnityMusicLibraryBridge.swift:371",
+        availability: SignalAvailability::OnDemand,
+    },
+    SignalProducer {
+        signal: Signal::PlacementGeometry,
+        key: "（产品壳不发布：`OnPlacementDerived` 的回执只到 Unity 内部，没有投影到信封）",
+        source: "apps/unity-player/Assets/GMGN/WorldRuntimeBridge.cs:811",
+        availability: SignalAvailability::Never,
+    },
+    SignalProducer {
+        signal: Signal::PhysicsProbe,
+        key: "（产品壳不发布：信封里的 `worldPhysicsProbes` 是**请求**，不是 `ready=true`）",
+        source: "apps/macos/UnityHost/UnityWorldPhysicsClient.swift:68",
+        availability: SignalAvailability::Never,
+    },
+    SignalProducer {
+        signal: Signal::GenerationService,
+        key: "（产品壳不发布：`GET /health` 由 AppKit 侧的 `PropGenerationClient` 拥有）",
+        source: "apps/macos/Sources/GMGNRadio/Presence/PropGenerationClient.swift:18",
+        availability: SignalAvailability::Never,
+    },
+];
+
+/// 按信号找它在产品壳里的生产者。
+pub fn product_shell_producer(signal: Signal) -> Option<&'static SignalProducer> {
+    PRODUCT_SHELL_SIGNAL_PRODUCERS.iter().find(|producer| producer.signal == signal)
+}
+
+/// **挡人却没有人替它说话**的项：它要在产品壳里挡人，但产品壳根本不发布它的信号。
+///
+/// 空 = 每个挡人项的信号在产品壳里都真的会发布。判据接受一份清单，所以负对照
+/// 可以给它一份"把某个没有生产者的项改回 Blocking"的副本，看它是否真的报出来。
+pub fn blocking_items_without_a_product_shell_producer(
+    items: &[ReadinessItem],
+) -> Vec<(&'static str, Signal)> {
+    items
+        .iter()
+        .filter(|item| item.role == GateRole::Blocking)
+        .filter(|item| {
+            product_shell_producer(item.signal).map(|producer| producer.availability)
+                != Some(SignalAvailability::Startup)
+        })
+        .map(|item| (item.id, item.signal))
+        .collect()
 }
 
 /// 清单里的一项。
@@ -613,6 +798,11 @@ pub fn readiness_item(id: &str) -> Option<&'static ReadinessItem> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StartupSignals {
     ready: BTreeSet<Signal>,
+    /// 这个壳**声明的**信号可用性（[`PRODUCT_SHELL_SIGNAL_PRODUCERS`]）。
+    ///
+    /// 缺省（没有声明）= [`SignalAvailability::Startup`]：独立应用的老路径不变，
+    /// 只有真的按产品壳信封观测过之后，才会出现 `Never` / `OnDemand`。
+    availability: std::collections::BTreeMap<Signal, SignalAvailability>,
 }
 
 impl StartupSignals {
@@ -629,6 +819,22 @@ impl StartupSignals {
     }
     pub fn has(&self, signal: Signal) -> bool {
         self.ready.contains(&signal)
+    }
+    /// 这个信号在这个壳里什么时候能拿到（缺省 = 启动阶段就发布）。
+    pub fn availability(&self, signal: Signal) -> SignalAvailability {
+        self.availability.get(&signal).copied().unwrap_or(SignalAvailability::Startup)
+    }
+    /// 声明"这是一次**产品壳**观测"：按 [`PRODUCT_SHELL_SIGNAL_PRODUCERS`] 登记每个
+    /// 信号的可用性。
+    ///
+    /// 这就是"没有生产者的项不许挡人"的落点：这个壳不发布的信号在这里被登记成
+    /// [`SignalAvailability::Never`]（不参与门），只在用户进门后按需发布的登记成
+    /// [`SignalAvailability::OnDemand`]（只具名列出）。
+    pub fn declare_product_shell(&mut self) -> &mut Self {
+        for producer in PRODUCT_SHELL_SIGNAL_PRODUCERS {
+            self.availability.insert(producer.signal, producer.availability);
+        }
+        self
     }
     /// 宿主自身的三个量（`ProductHost` 直接给的，不在快照里）。
     pub fn observe_host(&mut self, core: bool, snapshot: bool, surface: bool) -> &mut Self {
@@ -694,25 +900,37 @@ impl StartupSignals {
     /// `apps/gpui-app` 的 `ProductHost.snapshot()` **不是同一个形状**。差别只有两处，
     /// 都不是新事实：
     ///
-    /// 1. **路径**：Unity 宿主把舞台表面嵌在 `settings.stage`
-    ///    （`apps/macos/UnityHost/UnityMediaHost.swift:1995` 的
-    ///    `settings["stage"] = stageSnapshot(...)`），独立应用放在根上。这里只做一次
-    ///    搬运，判定仍然只有 [`observe_snapshot`](Self::observe_snapshot) 那一份。
+    /// 1. **路径**：Unity 宿主把舞台表面嵌在**内层设置字典**里：信封上的 `settings`
+    ///    是 `settingsSnapshot()` 的结果，它再套一层 `settings`
+    ///    （`apps/macos/UnityHost/UnityMediaHost.swift:1998` 的
+    ///    `return ["…", "settings": settings, …]`），舞台是
+    ///    `settings.settings.stage`（`:1995` 的 `settings["stage"] = stageSnapshot(...)`）。
+    ///    这层壳自己的 `settings_projection` 就是这么读的
+    ///    （`tools/fixtures/gpui-unity-overlay-probe/src/lib.rs:599`）。独立应用把舞台
+    ///    放在**根上**。这里只做一次搬运，判定仍然只有
+    ///    [`observe_snapshot`](Self::observe_snapshot) 那一份。
     /// 2. **同义键**：电视/播放器菜单/装修面在这层壳里由**别的投影**表达，而它们正是
     ///    这层壳真正渲染所用的键（下面逐条引到行）。凡是某个键在这层壳里根本不存在，
-    ///    就**不设**对应的信号——不发明真相，那一项会按清单自己的上界**具名**落地。
+    ///    就**不设**对应的信号，并按 [`PRODUCT_SHELL_SIGNAL_PRODUCERS`] 把那一项登记成
+    ///    "不参与门"——不发明真相，也不拿一个这个壳永远不会发的信号去挡人。
     ///
     /// 面板文案与门禁登记（[`STARTUP_ITEMS`] / [`RETIRED_COPY`]）不因壳而变：两个壳
     /// 加载的是同一份清单、同一台状态机、同一个 [`StartupGatePane`]。
     pub fn observe_product_shell_envelope(&mut self, envelope: &Value) -> &mut Self {
-        let settings = &envelope["settings"];
+        // 先声明"这是一次产品壳观测"：这一层壳不发布的信号从此不参与门。
+        self.declare_product_shell();
+        // `settings` = `settingsSnapshot()`；各面板渲染的那本设置字典是它的内层
+        // `settings`，舞台在 `settings.settings.stage`（见上面的路径说明）。
+        let settings = &envelope["settings"]["settings"];
         let stage = &settings["stage"];
         let mut canonical = serde_json::Map::new();
         canonical.insert("stage".to_owned(), stage.clone());
         canonical.insert("activities".to_owned(), stage["activities"].clone());
-        for key in ["settings", "inbox", "wish", "musicLibrary", "screenVideo"] {
+        for key in ["inbox", "wish", "musicLibrary", "screenVideo"] {
             canonical.insert(key.to_owned(), envelope[key].clone());
         }
+        // 设置投影就是那本内层设置字典（独立应用把它放在根上的 `settings`）。
+        canonical.insert("settings".to_owned(), settings.clone());
         self.observe_snapshot(&Value::Object(canonical));
         let presentation = &stage["presentation"];
         // 这层壳**没有** `screenOperation`（那是 AppKit/`ProductHost` 的投影，
@@ -733,11 +951,26 @@ impl StartupSignals {
         );
         // 这层壳**没有** `propEditor`（`ProductHost.swift:178`）。它的装修面读
         // `presentation.propsAvailable` 加自己的库存投影 `unityInventory`
-        // （`inventory_ui.rs`）。两个键都必须在，且 `propsAvailable` 必须为真。
+        // （`inventory_ui.rs:196`）。两个键都必须在，且 `propsAvailable` 必须为真。
+        //
+        // `unityInventory` 是**数组**：`GPUIProjectionPayload.cs:38` 把
+        // `GPUIChat2Probe` 的 `JArray inventory`（`GPUIChat2Probe.cs:33`）原样放进来。
+        // 曾经这里按**对象**判（`is_object()`），于是"库存投影已到达"这件事在真机
+        // 永远为假——`ui.props` / `prop.capability` 两项因此白等 15 秒判不可用。
         self.set(
             Signal::PlacementSurface,
             presentation["propsAvailable"].as_bool() == Some(true)
-                && envelope["unityInventory"].is_object(),
+                && envelope["unityInventory"].is_array(),
+        );
+        // 这层壳的 `musicLibrary` **一次只发布一个操作的结果**：歌单
+        // （`UnityMusicLibraryBridge.swift:371` 的 `"playlists"`）或节目历史
+        // （`UnityDJProgramBridge.swift:28` 的 `"programs"`），而且由用户打开音乐页
+        // 触发（`media_ui.rs` 的 `load_catalog`）。所以"投影到达"是**两者之一**是数组，
+        // 不是独立应用那一路的"两者同时给"。
+        let library = &envelope["musicLibrary"];
+        self.set(
+            Signal::MusicLibrary,
+            library["playlists"].is_array() || library["programs"].is_array(),
         );
         self
     }
@@ -762,6 +995,12 @@ pub enum StepPhase {
     Failed,
     /// 只能进门之后按需完成（[`GateRole::Deferred`]）。
     Deferred,
+    /// 这个壳**根本不发布**这一项的信号：它不参与门。
+    ///
+    /// 不是失败、不是"本轮不可用"，而是"这门清单上的这一项在这个壳里没有生产者"——
+    /// 属于**登记/配置**事实，所以既不给用户一个可重试的失败，也不连锁
+    /// `blocked_by_*` 把别的项拖下水（见 [`PRODUCT_SHELL_SIGNAL_PRODUCERS`]）。
+    NotApplicable,
 }
 
 /// 一台清单项的状态。
@@ -817,6 +1056,12 @@ pub struct StartupGate {
     attempt_started_ms: u64,
     now_ms: u64,
     steps: Vec<StepState>,
+    /// 硬规则（模块头第 4 条）：世界已经 `phase=activate`（快照
+    /// `stage.presentation.isWorldVisible`）——应用已经可用，门必须放行。
+    ///
+    /// 这是一个**单向闩**：一旦观测到世界可见，`phase()` 永远 `Ready`、
+    /// `failure()` 永远 `None`，剩下的项最多被**具名**成"进门后按需"。
+    released: bool,
 }
 
 impl Default for StartupGate {
@@ -847,6 +1092,7 @@ impl StartupGate {
                     finished_at_ms: None,
                 })
                 .collect(),
+            released: false,
         }
     }
     pub fn deadline_ms(&self) -> u64 {
@@ -876,7 +1122,19 @@ impl StartupGate {
     pub fn step(&self, id: &str) -> Option<&StepState> {
         self.steps.iter().find(|state| state.id == id)
     }
+    /// 硬规则（模块头第 4 条）：世界已经可见 ⇒ 门必须放行。
+    ///
+    /// 这是"应用已经可用"的机械判定：`isWorldVisible` 就是渲染侧
+    /// `[WorldMode] visible=True` / `world selection phase=activate` 之后快照里那个
+    /// 事实（`apps/macos/UnityHost/UnityMediaHost.swift:1106`）。
+    fn world_is_visible(signals: &StartupSignals) -> bool {
+        signals.has(Signal::WorldVisible)
+    }
     pub fn phase(&self) -> StartupPhase {
+        // 世界一激活，应用就已经可用：门只用于"还没就绪"的那段时间，立刻放行。
+        if self.released {
+            return StartupPhase::Ready;
+        }
         if self.steps.iter().any(|state| {
             state.phase == StepPhase::Failed
                 && readiness_item(state.id).is_some_and(|item| item.role == GateRole::Blocking)
@@ -899,7 +1157,10 @@ impl StartupGate {
                 continue;
             }
             total += 1;
-            if matches!(state.phase, StepPhase::Ready | StepPhase::Deferred) {
+            if matches!(
+                state.phase,
+                StepPhase::Ready | StepPhase::Deferred | StepPhase::NotApplicable
+            ) {
                 done += 1;
             }
         }
@@ -909,18 +1170,28 @@ impl StartupGate {
         let (done, total) = self.progress();
         if total == 0 { 1. } else { done as f32 / total as f32 }
     }
-    /// "本轮不可用"与"进门后按需"的具名清单——加载态**必须**把它们摆出来，
-    /// 而不是等用户点按钮时才说。
+    /// "本轮不可用"、"进门后按需"与"这个壳没有这一项"的具名清单——加载态**必须**
+    /// 把它们摆出来，而不是等用户点按钮时才说。
     pub fn named(&self) -> Vec<StepView> {
         self.steps()
             .into_iter()
             .filter(|view| {
-                matches!(view.phase, StepPhase::Unavailable | StepPhase::Deferred | StepPhase::Failed)
+                matches!(
+                    view.phase,
+                    StepPhase::Unavailable
+                        | StepPhase::Deferred
+                        | StepPhase::Failed
+                        | StepPhase::NotApplicable
+                )
             })
             .collect()
     }
     /// 挡人的失败（第一个），**具名**。
     pub fn failure(&self) -> Option<StartupFailure> {
+        // 门已经放行：没有"挡人的失败"这回事了（剩下的最多是具名的按需项）。
+        if self.released {
+            return None;
+        }
         self.steps.iter().find_map(|state| {
             let item = readiness_item(state.id)?;
             if state.phase != StepPhase::Failed || item.role != GateRole::Blocking {
@@ -942,12 +1213,21 @@ impl StartupGate {
     pub fn observe(&mut self, signals: &StartupSignals, now_ms: u64) -> StartupPhase {
         self.now_ms = now_ms;
         let elapsed_total = self.elapsed_ms();
+        // 硬规则（模块头第 4 条）：世界已经激活就是"应用可用"的证据。它一旦出现，
+        // 门必须立刻放行——不再陪任何一项等上界，也不把还没结论的项当失败。
+        if Self::world_is_visible(signals) {
+            self.released = true;
+        }
         for index in 0..self.steps.len() {
             let item = readiness_item(self.steps[index].id).expect("every step comes from the table");
             let state = self.steps[index].clone();
             if matches!(
                 state.phase,
-                StepPhase::Ready | StepPhase::Unavailable | StepPhase::Failed | StepPhase::Deferred
+                StepPhase::Ready
+                    | StepPhase::Unavailable
+                    | StepPhase::Failed
+                    | StepPhase::Deferred
+                    | StepPhase::NotApplicable
             ) {
                 continue;
             }
@@ -955,13 +1235,56 @@ impl StartupGate {
                 self.finish(index, StepPhase::Ready, None, None, now_ms);
                 continue;
             }
+            // 这个壳不发布这个信号：它**不参与门**——不设 `started_at`，所以不会超时；
+            // 也不判 `Failed`，所以不会连锁 `blocked_by_*`。
+            match signals.availability(item.signal) {
+                SignalAvailability::Startup => {}
+                SignalAvailability::OnDemand => {
+                    let detail = product_shell_producer(item.signal)
+                        .map(|producer| {
+                            format!(
+                                "这个壳进门后按需发布（{}，{}）——先具名，不挡人",
+                                producer.key, producer.source
+                            )
+                        })
+                        .unwrap_or_else(|| "这个壳进门后按需发布——先具名，不挡人".to_owned());
+                    self.finish(
+                        index,
+                        StepPhase::Deferred,
+                        Some(format!("{}_after_entry", item.id)),
+                        Some(detail),
+                        now_ms,
+                    );
+                    continue;
+                }
+                SignalAvailability::Never => {
+                    // 这不是用户可见的失败，而是**登记/配置**事实：这个壳里没有这一项的
+                    // 生产者。具名说清读的是哪个键、哪一行（module 头第 5 条）。
+                    let detail = product_shell_producer(item.signal)
+                        .map(|producer| {
+                            format!(
+                                "这个壳不发布这个信号（{}，{}）——不参与门",
+                                producer.key, producer.source
+                            )
+                        })
+                        .unwrap_or_else(|| "这个壳不发布这个信号——不参与门".to_owned());
+                    self.finish(
+                        index,
+                        StepPhase::NotApplicable,
+                        Some(format!("{}_signal_not_published", item.id)),
+                        Some(detail),
+                        now_ms,
+                    );
+                    continue;
+                }
+            }
             // 依赖先判：挡人的依赖**失败**时立刻具名，不陪着等满整个上界。
             let mut blocked_by = None;
             let mut waiting_for = None;
             for dep in item.depends_on {
                 let Some(dep_state) = self.steps.iter().find(|s| s.id == *dep) else { continue };
                 match dep_state.phase {
-                    StepPhase::Ready | StepPhase::Deferred => {}
+                    StepPhase::Ready | StepPhase::Deferred | StepPhase::NotApplicable => {}
                     StepPhase::Failed => blocked_by = Some(*dep),
                     StepPhase::Unavailable => blocked_by = Some(*dep),
                     _ => waiting_for = Some(*dep),
@@ -1021,7 +1344,37 @@ impl StartupGate {
                 self.finish(index, StepPhase::Failed, Some(code), detail, now_ms);
             }
         }
+        if self.released {
+            self.release_remaining(now_ms);
+        }
         self.phase()
+    }
+    /// 世界已经可见：把还没结论的项收尾，让门**立刻**放行。
+    ///
+    /// - 世界链自己那两项（[`Signal::WorldRequested`] / [`Signal::WorldVisible`]）
+    ///   断言的事实已经成立 ⇒ `Ready`；
+    /// - 别的还没结论的项不再是"挡住进门"的理由 ⇒ `Deferred`（具名、进门后按需）。
+    ///
+    /// 已经是终态的项（含 `Failed` / `Unavailable` / `NotApplicable`）不动：门放行不等于
+    /// 把已经发生的事说成没发生。
+    fn release_remaining(&mut self, now_ms: u64) {
+        for index in 0..self.steps.len() {
+            if !matches!(self.steps[index].phase, StepPhase::Waiting | StepPhase::Running) {
+                continue;
+            }
+            let item = readiness_item(self.steps[index].id).expect("every step comes from the table");
+            if matches!(item.signal, Signal::WorldRequested | Signal::WorldVisible) {
+                self.finish(index, StepPhase::Ready, None, None, now_ms);
+            } else {
+                self.finish(
+                    index,
+                    StepPhase::Deferred,
+                    Some(format!("{}_after_entry", item.id)),
+                    Some("世界已经激活（`phase=activate`），门已放行；这一项进入后按需完成".to_owned()),
+                    now_ms,
+                );
+            }
+        }
     }
     /// 重试：只在被挡住时有意义。失败项回到 `Waiting`，整体时钟重开，
     /// **已经就绪的项保持就绪**（重试不会把做好的事作废）。
@@ -1339,6 +1692,7 @@ pub const REGISTRY_CONST_NAMES: &[&str] = &[
     "ALLOWED_AFTER_READY",
     "NOT_READY_PATTERNS",
     "SILENT_BEFORE_THE_GATE",
+    "PRODUCT_SHELL_SIGNAL_PRODUCERS",
 ];
 
 /// 扫描器认的**"没 ready"句式**。凡是 `SCANNED_SOURCES` 里的字符串字面量命中
@@ -1878,6 +2232,7 @@ fn step_face(phase: StepPhase) -> (IconName, &'static str) {
         StepPhase::Unavailable => (IconName::CircleAlert, "本轮不可用"),
         StepPhase::Failed => (IconName::TriangleAlert, "失败"),
         StepPhase::Deferred => (IconName::Info, "进入后按需"),
+        StepPhase::NotApplicable => (IconName::Info, "这个壳没有"),
     }
 }
 
@@ -1990,7 +2345,7 @@ impl Render for StartupGatePane {
                 StepPhase::Running => s::SELECTED,
                 StepPhase::Unavailable | StepPhase::Failed => s::WARNING,
                 StepPhase::Ready => s::TEXT_MUTED,
-                StepPhase::Waiting | StepPhase::Deferred => s::TEXT_DIM,
+                StepPhase::Waiting | StepPhase::Deferred | StepPhase::NotApplicable => s::TEXT_DIM,
             };
             let mut row = div()
                 .flex()
@@ -2017,14 +2372,17 @@ impl Render for StartupGatePane {
             rows = rows.child(row);
         }
         middle = middle.child(rows);
-        // 具名：本轮不可用 / 进门后按需。加载态**必须**把它们摆出来。
+        // 具名：本轮不可用 / 进门后按需 / 这个壳没有这一项。加载态**必须**把它们摆出来。
         let named: Vec<StepView> = views
             .iter()
             .filter(|view| {
                 view.role != GateRole::Blocking
                     && matches!(
                         view.phase,
-                        StepPhase::Unavailable | StepPhase::Deferred | StepPhase::Failed
+                        StepPhase::Unavailable
+                            | StepPhase::Deferred
+                            | StepPhase::Failed
+                            | StepPhase::NotApplicable
                     )
             })
             .cloned()
@@ -2047,7 +2405,7 @@ impl Render for StartupGatePane {
                     StepPhase::Running => s::SELECTED,
                     StepPhase::Unavailable | StepPhase::Failed => s::WARNING,
                     StepPhase::Ready => s::TEXT_MUTED,
-                    StepPhase::Waiting | StepPhase::Deferred => s::TEXT_DIM,
+                    StepPhase::Waiting | StepPhase::Deferred | StepPhase::NotApplicable => s::TEXT_DIM,
                 };
                 block = block.child(
                     div()

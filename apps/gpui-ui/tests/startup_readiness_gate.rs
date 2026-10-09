@@ -48,9 +48,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gmgn_gpui_ui::startup::{
-    ALLOWED_AFTER_READY, Disposition, GateRole, NOT_READY_PATTERNS, REGISTRY_CONST_NAMES, RETIRED_COPY,
-    SCANNED_SOURCES, SILENT_BEFORE_THE_GATE, STARTUP_DEADLINE_MS, STARTUP_ITEMS, ScanLang, StartupGate,
-    StartupPhase, StartupSignals, StepPhase, readiness_item,
+    ALLOWED_AFTER_READY, Disposition, GateRole, NOT_READY_PATTERNS, PRODUCT_SHELL_SIGNAL_PRODUCERS,
+    REGISTRY_CONST_NAMES, RETIRED_COPY, SCANNED_SOURCES, SILENT_BEFORE_THE_GATE, STARTUP_DEADLINE_MS,
+    STARTUP_ITEMS, ScanLang, Signal, StartupGate, StartupPhase, StartupSignals, StepPhase,
+    blocking_items_without_a_product_shell_producer, readiness_item,
 };
 
 fn repo_root() -> PathBuf {
@@ -493,7 +494,8 @@ fn the_gate_is_bounded_and_never_fails_silently() {
                     || code.ends_with("_deadline")
                     || code.ends_with("_unavailable")
                     || code.contains("_blocked_by_")
-                    || code.ends_with("_after_entry"),
+                    || code.ends_with("_after_entry")
+                    || code.ends_with("_signal_not_published"),
                 "{} carries an unrecognised code {code}",
                 view.id
             );
@@ -519,8 +521,12 @@ fn the_gate_is_bounded_and_never_fails_silently() {
 
 #[test]
 fn a_named_unavailable_item_does_not_keep_anyone_out() {
-    // 关掉物理探针信号、其余全给：`world.physics` 是 Preflight，它只能变成
-    // 具名不可用，不能把整体判成 Blocked。
+    // 关掉物理探针信号、其余全给：`world.physics` 是 Preflight，它的缺失只能被**具名**，
+    // 绝不能把整体判成 `Blocked`。
+    //
+    // 世界已经可见 ⇒ 硬规则要求门放行（模块头第 4 条）：这一项在放行时被具名成
+    // "进门后按需"，而不是用户可见的失败。（世界还没进来时它会按自己的上界变成
+    // 具名不可用——见文件末尾的负对照。）
     let mut gate = StartupGate::with_deadline(STARTUP_DEADLINE_MS);
     let mut signals = StartupSignals::new();
     for item in STARTUP_ITEMS {
@@ -529,16 +535,42 @@ fn a_named_unavailable_item_does_not_keep_anyone_out() {
         }
         signals.set(item.signal, true);
     }
-    assert_eq!(gate.observe(&signals, 0), StartupPhase::Preparing);
-    let phase = gate.observe(&signals, 30_000);
-    assert_eq!(phase, StartupPhase::Ready, "a preflight miss must not block entry");
+    let phase = gate.observe(&signals, 0);
+    assert_ne!(phase, StartupPhase::Blocked, "a preflight miss must not block entry");
+    assert_eq!(phase, StartupPhase::Ready, "世界已经可见，门必须放行");
     let named = gate.named();
     let physics = named
         .iter()
         .find(|view| view.id == "world.physics")
         .expect("the miss must be named before entry");
-    assert_eq!(physics.phase, StepPhase::Unavailable);
+    assert!(
+        matches!(physics.phase, StepPhase::Unavailable | StepPhase::Deferred),
+        "缺的 Preflight 项必须被具名，实际 {:?}",
+        physics.phase
+    );
     assert!(physics.code.is_some());
+    // 世界还没进来（只有宿主自身三项）时也一样：Preflight 的缺项不许进挡人名单。
+    let mut cold = StartupGate::with_deadline(STARTUP_DEADLINE_MS);
+    let mut host_only = StartupSignals::new();
+    host_only.set(Signal::HostCore, true);
+    host_only.set(Signal::HostSnapshot, true);
+    host_only.set(Signal::HostSurface, true);
+    cold.observe(&host_only, 0);
+    cold.observe(&host_only, 30_000);
+    for view in cold.steps() {
+        let item = readiness_item(view.id).expect("every step comes from the table");
+        if item.signal == Signal::PhysicsProbe {
+            assert_ne!(
+                view.phase,
+                StepPhase::Failed,
+                "Preflight 的缺项不许变成挡人的失败"
+            );
+        }
+    }
+    assert!(
+        cold.failure().map(|failure| failure.step) != Some("world.physics"),
+        "Preflight 的缺项不许成为门的失败"
+    );
 }
 
 #[test]
@@ -564,6 +596,150 @@ fn the_gate_opens_the_moment_every_signal_is_observed() {
     for view in gate.steps() {
         assert!(readiness_item(view.id).is_some());
     }
+}
+
+// ---------------------------------------------------------------------------
+// 判据 5：门只等待这个壳真的会发布的东西，并且世界一激活就放行
+// ---------------------------------------------------------------------------
+
+/// 每个**挡人**项的信号必须在产品壳里有**启动期**生产者。
+///
+/// 这条判据的存在理由就是 2026-10-09 21:48 那次：`world.authority` 读的键在产品壳里
+/// 根本不存在（舞台在 `settings.settings.stage`，代码读的是 `settings.stage`），
+/// 30 s 超时把整门判失败、再连锁 `blocked_by_*` 把整窗盖住。没有生产者的项不许挡人。
+#[test]
+fn every_blocking_item_signal_has_a_startup_producer_in_the_product_shell() {
+    let missing = blocking_items_without_a_product_shell_producer(STARTUP_ITEMS);
+    assert!(
+        missing.is_empty(),
+        "这些挡人项的信号在产品壳里没有启动期生产者（它们会永久挡住人）：{missing:?}"
+    );
+    // 生产者表本身不许退化：覆盖够广、不重复、每条都指到真的键与真的行。
+    assert!(
+        PRODUCT_SHELL_SIGNAL_PRODUCERS.len() >= 15,
+        "生产者表只有 {} 条：它必须覆盖产品壳真的会发布的那批信号",
+        PRODUCT_SHELL_SIGNAL_PRODUCERS.len()
+    );
+    let unique: std::collections::BTreeSet<Signal> =
+        PRODUCT_SHELL_SIGNAL_PRODUCERS.iter().map(|producer| producer.signal).collect();
+    assert_eq!(
+        unique.len(),
+        PRODUCT_SHELL_SIGNAL_PRODUCERS.len(),
+        "生产者表里有重复的信号"
+    );
+    for producer in PRODUCT_SHELL_SIGNAL_PRODUCERS {
+        assert!(!producer.key.is_empty(), "{:?} 没有写它读哪个键", producer.signal);
+        assert!(
+            producer.source.contains(':') && producer.source.contains('/'),
+            "{:?} 的生产者出处不是 `仓库相对路径:行`：{}",
+            producer.signal,
+            producer.source
+        );
+    }
+    // 清单里用到的每一个信号都必须在表里有条目（否则"没有生产者"会被默认为 Startup，
+    // 判据就会漏掉整类项）。
+    for item in STARTUP_ITEMS {
+        assert!(
+            gmgn_gpui_ui::startup::product_shell_producer(item.signal).is_some(),
+            "{} 的信号 {:?} 不在 PRODUCT_SHELL_SIGNAL_PRODUCERS 里",
+            item.id,
+            item.signal
+        );
+    }
+}
+
+/// 负对照：把某个"没有生产者"的项改回 `Blocking`，判定**必须变红**。
+#[test]
+fn putting_a_no_producer_item_back_on_the_blocking_path_turns_the_check_red() {
+    assert!(
+        blocking_items_without_a_product_shell_producer(STARTUP_ITEMS).is_empty(),
+        "前提：真实清单现在是绿的"
+    );
+    let mut mutated = STARTUP_ITEMS.to_vec();
+    mutated
+        .iter_mut()
+        .find(|item| item.id == "generation.health")
+        .expect("generation.health is in the table")
+        .role = GateRole::Blocking;
+    let red = blocking_items_without_a_product_shell_producer(&mutated);
+    assert!(
+        red.iter().any(|(id, signal)| *id == "generation.health" && *signal == Signal::GenerationService),
+        "把没有生产者的项改回 Blocking 必须被判红，实际 {red:?}"
+    );
+    // 表里没有 `Never` 的信号也是同样的红。
+    let mut unknown = STARTUP_ITEMS.to_vec();
+    unknown
+        .iter_mut()
+        .find(|item| item.id == "placement.grid")
+        .expect("placement.grid is in the table")
+        .role = GateRole::Blocking;
+    assert!(
+        !blocking_items_without_a_product_shell_producer(&unknown).is_empty(),
+        "把 `placement.grid` 改回 Blocking 也必须红"
+    );
+}
+
+/// 硬规则（模块头第 4 条）：世界一旦 `phase=activate`（快照 `isWorldVisible=true`），
+/// 门必须**立刻**放行——不得再盖住整窗，也不得把还没结论的项判成用户可见的失败。
+#[test]
+fn the_gate_is_released_once_the_world_is_visible() {
+    // 世界可见，但居民会话那一组刻意没有信号（`ResidentSession` 不设）。
+    let mut gate = StartupGate::new();
+    let mut signals = StartupSignals::new();
+    signals.set(Signal::HostCore, true);
+    signals.set(Signal::HostSnapshot, true);
+    signals.set(Signal::HostSurface, true);
+    signals.set(Signal::WorldVisible, true);
+    assert_eq!(
+        gate.observe(&signals, 0),
+        StartupPhase::Ready,
+        "世界已经激活，门必须立刻放行；实际还在等 {:?}",
+        gate.steps()
+            .iter()
+            .filter(|view| matches!(view.phase, StepPhase::Waiting | StepPhase::Running))
+            .map(|view| view.id)
+            .collect::<Vec<_>>()
+    );
+    assert!(gate.failure().is_none(), "放行时不该有用户可见的挡人失败");
+    // 世界链自己那两项断言的**正是**世界可见这个事实 ⇒ Ready（不是"按需"）。
+    assert_eq!(gate.step("world.authority").unwrap().phase, StepPhase::Ready);
+    assert_eq!(gate.step("world.prepare").unwrap().phase, StepPhase::Ready);
+    assert_eq!(gate.step("world.activate").unwrap().phase, StepPhase::Ready);
+    // 别的还没结论的项：具名成"进门后按需"，绝不再把门盖住。
+    for id in ["resident.session", "resident.agent", "resident.queue"] {
+        assert_eq!(
+            gate.step(id).unwrap().phase,
+            StepPhase::Deferred,
+            "{id} 在世界可见之后不该继续挡人"
+        );
+    }
+    // 放行是一个**单向闩**：之后即使再观测也不回到 Preparing/Blocked。
+    assert_eq!(gate.observe(&signals, 150_000), StartupPhase::Ready);
+
+    // 真机那次的确切形状：世界链的一项先超时成了 `Failed`，**然后**世界才可见。
+    // 门必须仍然放行——否则一扇已经没用的门会永久盖在一个可用的应用上。
+    let mut late = StartupGate::with_deadline(STARTUP_DEADLINE_MS);
+    let mut late_signals = StartupSignals::new();
+    late_signals.set(Signal::HostCore, true);
+    late_signals.set(Signal::HostSnapshot, true);
+    late_signals.set(Signal::HostSurface, true);
+    assert_eq!(late.observe(&late_signals, 0), StartupPhase::Preparing);
+    assert_eq!(
+        late.observe(&late_signals, 31_000),
+        StartupPhase::Blocked,
+        "世界还没进来：`world.authority` 先按自己的上界具名失败"
+    );
+    assert!(late.failure().is_some());
+    late_signals.set(Signal::WorldVisible, true);
+    assert_eq!(
+        late.observe(&late_signals, 31_001),
+        StartupPhase::Ready,
+        "世界随后可见：门必须立刻放行，哪怕链上已经留下了具名失败"
+    );
+    assert!(
+        late.failure().is_none(),
+        "放行之后没有'挡人的失败'这回事（剩下的最多是具名项）"
+    );
 }
 
 // ---------------------------------------------------------------------------

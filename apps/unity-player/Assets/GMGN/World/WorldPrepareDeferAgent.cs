@@ -19,15 +19,15 @@ namespace GMGN.UnityPlayer.World
     /// GLB still open, every job worker idle).
     ///
     /// This agent owns its own clock, so it never depends on another
-    /// component's `Update()` being pumped, and it never defers twice in a row
-    /// inside one window: every `true` is followed by a `false` for the next
-    /// check of the same window. The gates therefore still yield frames (the
+    /// component's `Update()` being pumped. Every `true` is followed by a
+    /// `false`, even when the next check arrives several frames later.
+    /// Resuming starts a new work budget. The gates still yield frames (the
     /// pacing the library wants) but they cannot livelock. It changes only
     /// *when* load work runs — no package, hash or material check is relaxed.
     public sealed class WorldPrepareDeferAgent : GLTFast.IDeferAgent
     {
-        // One yield per window. Small enough to keep the import running,
-        // large enough that a frame is not dominated by the loader.
+        // Work budget between yields. Resuming a yield always permits work,
+        // irrespective of time spent waiting for the next frame.
         readonly double windowSeconds;
         double windowStarted;
         bool deferred;
@@ -39,16 +39,17 @@ namespace GMGN.UnityPlayer.World
             windowStarted = Time.realtimeSinceStartupAsDouble;
         }
 
-        /// Answers at most one `true` per window, then `false` until the next
-        /// window starts. Callers that loop on this answer always make
-        /// progress.
+        /// Once a caller yields, the next check permits work and starts a
+        /// fresh budget. Charging the wait to the budget would make every
+        /// frame longer than 4 ms defer again, starving glTFast's while gates.
         bool Consume()
         {
             var now = Time.realtimeSinceStartupAsDouble;
             if (deferred)
             {
-                if (now - windowStarted < windowSeconds) return false;
                 deferred = false;
+                windowStarted = now;
+                return false;
             }
             if (now - windowStarted < windowSeconds) return false;
             deferred = true;

@@ -331,6 +331,8 @@ e2e-acceptance:
 	$(PYTHON) tools/e2e-acceptance.py --ledger tmp/e2e-acceptance/ledger.json
 
 _test-harnesses:
+	bash tools/test-world-prepare-defer.sh
+	$(PYTHON) tools/test-world-prepare-retry.py
 	swift tools/test-first-use-guidance.swift
 	# 设置快照的**代价**门禁：每行 `selectable` 不许再用 `canSelectMotion`（它会给
 	# 每一行重建一次 `availableMotions`，一次快照 O(rows²) 拷贝，2026-10-09 真机上

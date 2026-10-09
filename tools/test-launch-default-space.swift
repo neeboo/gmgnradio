@@ -120,9 +120,14 @@ require(startup.contains("NSLog(\"[UnityMediaHost] space startup unavailable: %@
 guard let activateFailure = activate.range(of: "world_authority_activation_failed") else {
     fail("激活失败必须仍然具名")
 }
-let activateRetry = activate.range(of: "scheduleStartupSpaceRetry(failureCode: \"world_authority_activation_failed\")")
+let activateRetry = activate.range(of: "retryStartupSpaceOrPublishFailure(\"world_authority_activation_failed\")")
 require(activateRetry != nil, "载入期间状态前进时必须按启动竞态有界重试")
 require(activateRetry!.lowerBound > activateFailure.lowerBound, "重试必须挂在真实的激活失败分支上")
 require(activate.contains("if worldSession == nil {"), "显式切换世界（已有会话）不进入启动重试")
+let failureHandler = declaration("private func retryStartupSpaceOrPublishFailure(", in: source)
+require(failureHandler.contains("if scheduleStartupSpaceRetry(failureCode: failureCode) { return true }"),
+        "失败处理必须调用原有的有界重试")
+require(failureHandler.contains("publishStartupSpaceFailure(failureCode)"),
+        "重试耗尽后必须发布真实失败")
 
 print("PASS: launch default is the space (one-time default-space import + bounded startup retry, honest failure preserved)")

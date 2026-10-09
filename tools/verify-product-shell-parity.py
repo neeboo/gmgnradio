@@ -197,6 +197,139 @@ def marker_in_sources(marker: str, sources: dict[str, str]) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# 加载态的门：没有生产者的项不许挡人，世界一激活就放行
+# ---------------------------------------------------------------------------
+#
+# 这一节补的是 2026-10-09 21:48 真机那次的**根因**：门读的键在产品壳里根本不存在
+# （舞台在 `settings.settings.stage`，代码按 `settings.stage` 读），于是
+# `world.authority` 白等 30 s 判失败、再连锁 `blocked_by_*` 把整窗盖住，而同一时刻
+# 空间其实已经 `phase=activate`、55 帧、卡顿帧 0。
+#
+# 只有"名字证据"不够：所以这里解析 `STARTUP_ITEMS` / `PRODUCT_SHELL_SIGNAL_PRODUCERS`
+# 两张真实表，逐条判"每个挡人项的信号在产品壳里有没有启动期生产者"，并给一个
+# **可失败的负对照**（把没有生产者的信号当成挡人项，判定必须变红）。
+
+STARTUP_RS = "apps/gpui-ui/src/startup.rs"
+
+
+def _const_block(text: str, name: str) -> str:
+    """`pub const NAME … ];` 之间那段源码（找不到就是空串）。"""
+    start = text.find(f"pub const {name}")
+    if start < 0:
+        return ""
+    end = text.find("\n];", start)
+    if end < 0:
+        return ""
+    return text[start:end]
+
+
+def _readiness_items(text: str) -> list[dict]:
+    """`STARTUP_ITEMS` 里的每一项：id / role / signal。"""
+    items = []
+    for chunk in _const_block(text, "STARTUP_ITEMS").split("ReadinessItem {")[1:]:
+        ident = re.search(r'id:\s*"([^"]+)"', chunk)
+        role = re.search(r"role:\s*GateRole::(\w+)", chunk)
+        signal = re.search(r"signal:\s*Signal::(\w+)", chunk)
+        if ident and role and signal:
+            items.append({"id": ident.group(1), "role": role.group(1), "signal": signal.group(1)})
+    return items
+
+
+def _signal_producers(text: str) -> dict[str, dict]:
+    """`PRODUCT_SHELL_SIGNAL_PRODUCERS` 里的每一条：signal → key/source/availability。"""
+    producers: dict[str, dict] = {}
+    for chunk in _const_block(text, "PRODUCT_SHELL_SIGNAL_PRODUCERS").split("SignalProducer {")[1:]:
+        signal = re.search(r"signal:\s*Signal::(\w+)", chunk)
+        key = re.search(r'key:\s*"([^"]*)"', chunk)
+        source = re.search(r'source:\s*"([^"]+)"', chunk)
+        availability = re.search(r"availability:\s*SignalAvailability::(\w+)", chunk)
+        if signal and availability:
+            producers[signal.group(1)] = {
+                "key": key.group(1) if key else "",
+                "source": source.group(1) if source else "",
+                "availability": availability.group(1),
+            }
+    return producers
+
+
+def blocking_without_startup_producer(items: list[dict], producers: dict[str, dict]) -> list[tuple]:
+    """挡人却没有启动期生产者的项：`(id, signal, 实际可用性, 它读的键)`。
+
+    判据接受一份清单，所以负对照可以塞一个"把没有生产者的项改回 Blocking"的副本。
+    """
+    missing = []
+    for item in items:
+        if item["role"] != "Blocking":
+            continue
+        producer = producers.get(item["signal"])
+        if producer is None or producer["availability"] != "Startup":
+            missing.append((
+                item["id"],
+                item["signal"],
+                "no producer at all" if producer is None else producer["availability"],
+                "" if producer is None else producer["key"],
+            ))
+    return missing
+
+
+def run_startup_producer_gate(record: Recorder, root: Path) -> None:
+    path = root / STARTUP_RS
+    if not path.is_file():
+        record(f"{CHAIN}5.0", False, f"加载态源码可见（{STARTUP_RS}）",
+               where=STARTUP_RS, reason=f"{STARTUP_RS} 不存在：无从判定门在等什么")
+        return
+    text = path.read_text(encoding="utf-8", errors="replace")
+    items = _readiness_items(text)
+    producers = _signal_producers(text)
+    record(f"{CHAIN}5.0", len(items) >= 20 and len(producers) >= 15,
+           "加载态清单与产品壳生产者表都能从源码里读出来（否则下面的判定是空转）",
+           where=f"{STARTUP_RS}:STARTUP_ITEMS",
+           reason=f"解析出 {len(items)} 个清单项、{len(producers)} 个生产者",
+           evidence={"items": [(i["id"], i["role"], i["signal"]) for i in items],
+                     "producer_signals": sorted(producers)})
+    missing = blocking_without_startup_producer(items, producers)
+    blocking = [(i["id"], i["signal"]) for i in items if i["role"] == "Blocking"]
+    record(f"{CHAIN}5.1", not missing,
+           "每个**挡人**项的信号在产品壳里都有启动期生产者（没有就点名是哪一项/哪个键）",
+           where=f"{STARTUP_RS}:PRODUCT_SHELL_SIGNAL_PRODUCERS",
+           reason=("这些挡人项在产品壳里没有启动期生产者："
+                   + "; ".join(f"{i}({s}) → {a} {k}" for i, s, a, k in missing)),
+           evidence={"blocking": blocking})
+    # 负对照：把一个**没有生产者**的信号当成挡人项，判定必须变红——否则这条判据
+    # 恒真，证明不了任何事。
+    no_startup = [signal for signal, p in producers.items() if p["availability"] != "Startup"]
+    mutated = list(items) + [{"id": "negative-control", "role": "Blocking",
+                              "signal": no_startup[0]}] if no_startup else list(items)
+    record(f"{CHAIN}5.2",
+           bool(no_startup) and bool(blocking_without_startup_producer(mutated, producers)),
+           "负对照：把一个没有生产者的信号当成挡人项，判定确实变红（判据不是恒真）",
+           where=f"{CHAIN}:blocking_without_startup_producer",
+           reason=("生产者表里没有任何非 Startup 的信号，负对照无从构造"
+                   if not no_startup else "负对照没有变红：这条判据是恒真的"))
+    # 接线证据：舞台要按**真机**的嵌套读（`settings.settings.stage`）。上一版按
+    # `settings.stage` 读，真机永远是 Null——这就是那次事件的根因。
+    record(f"{CHAIN}5.3",
+           bool(re.search(r'let settings = &envelope\["settings"\]\["settings"\];', text)),
+           "产品壳的舞台按真实嵌套读：`settings.settings.stage`（不是 `settings.stage`）",
+           where=f"{STARTUP_RS}:observe_product_shell_envelope",
+           reason="找不到 `envelope[\"settings\"][\"settings\"]`：舞台又按一个不存在的路径读了")
+    record(f"{CHAIN}5.4",
+           'unityInventory"]' in text and ".is_array()" in text
+           and not re.search(r'unityInventory"\]\.is_object\(\)', text),
+           "装修面按产品壳真实形状读 `unityInventory`（数组，不是对象）",
+           where=f"{STARTUP_RS}:observe_product_shell_envelope",
+           reason="`unityInventory` 又按对象判了：产品壳发布的是数组，这个壳里永远为假")
+    record(f"{CHAIN}5.5",
+           bool(re.search(r"fn world_is_visible\(signals: &StartupSignals\)"
+                          r"[\s\S]{0,200}?Signal::WorldVisible", text))
+           and bool(re.search(r"self\.released = true", text))
+           and bool(re.search(r"if self\.released \{\s*return StartupPhase::Ready;", text)),
+           "硬规则：世界一激活（`isWorldVisible`）门就放行（`released` 闩 + `phase()` 直接 Ready）",
+           where=f"{STARTUP_RS}:StartupGate::observe",
+           reason="放行判定不在：世界已经可用时门仍可能盖住整窗")
+
+
 class Recorder:
     def __init__(self) -> None:
         self.records: list[dict] = []
@@ -280,6 +413,9 @@ def run(record: Recorder, root: Path, explicit_dylib: str | None) -> None:
                    where=str(dylib) if dylib else f"{PRODUCT_SHELL_TARGET_DIR}/release/{DYLIB_NAME}",
                    reason=(f"`strings` 里找不到 `{marker}`。构建：{BUILD_COMMAND}"
                            if dylib else f"没有 dylib 可查；先构建：{BUILD_COMMAND}"))
+
+    # 加载态的门：每个挡人项的信号必须在产品壳里有启动期生产者，且世界一激活就放行。
+    run_startup_producer_gate(record, root)
 
     # 自检负对照：这条门禁必须**能**判红。用一个不存在的标识跑一遍同一个判定函数，
     # 它必须被报成"找不到"。这样即使当前全绿，也能证明判据不是恒真。

@@ -2083,30 +2083,46 @@ mod tests {
     // 加载态进产品壳：最后一个槽位 + 进门时吃掉场景输入 + 就绪后不再绘制
     // -----------------------------------------------------------------------
 
-    /// 一份**产品壳**形状的信封（`UnityMediaHost.settingsSnapshot()`）：能发布的全发布。
-    /// 键与路径都是真实宿主的那一份，见 `unity_product_envelope`。
-    fn unity_product_envelope() -> Value {
+    /// 一份**真机形状**的产品壳信封（`UnityMediaHost.snapshot()` +
+    /// `GPUIProjectionPayload.Augment`）：键与路径逐条来自发布它们的代码，和
+    /// `apps/gpui-ui/tests/startup_product_shell.rs` 的同名 fixture 一致。
+    ///
+    /// * 舞台在**内层**设置字典里：`settings.settings.stage`
+    ///   （`UnityMediaHost.swift:1995`/`:1998`，产品壳自己的 `settings_projection`
+    ///   也是这么读的：`lib.rs:599`）。
+    /// * `unityInventory` 是**数组**（`GPUIProjectionPayload.cs:38`）。
+    ///
+    /// `world_visible=false` 是"空间已请求、画面还没确认"的那一段——门该盖着；
+    /// `true` 就是 `phase=activate` 之后（`[WorldMode] visible=True`）——硬规则要求
+    /// 门**立刻**让位，而不是陪着别的项等满上界。
+    fn unity_product_envelope(world_visible: bool) -> Value {
         json!({
             "settings": {
-                "settings": {"selectedWorldID": "w1"},
-                "stage": {
-                    "mode": "space",
-                    "presentation": {
-                        "isWorldPresentationRequested": true,
-                        "isWorldVisible": true,
-                        "chatAvailable": true,
-                        "propsAvailable": true,
+                "version": 1,
+                "revision": 7,
+                "settings": {
+                    "stage": {
+                        "mode": if world_visible { "space" } else { "player" },
+                        "presentation": {
+                            "isWorldPresentationRequested": true,
+                            "isWorldVisible": world_visible,
+                            "chatAvailable": true,
+                            "propsAvailable": true,
+                        },
+                        "space": {"worlds": [], "selectedWorldID": "w1",
+                                  "isVisible": world_visible, "isRequested": true},
+                        "activities": {"items": [], "canRun": world_visible},
                     },
-                    "space": {"worlds": [], "selectedWorldID": "w1", "isVisible": true},
-                    "activities": {"items": [], "canRun": true},
                 },
+                "runtimeDiagnostics": {},
+                "supportedCommands": [],
             },
+            "music": {"canPrevious": true, "canNext": false, "isPlaying": false, "volume": 0.5},
+            "musicLibrary": {"generation": 1, "pending": false, "currentTrackID": ""},
+            "screenVideo": {"screens": [], "frames": []},
             "inbox": {"entries": []},
             "wish": {"entries": []},
-            "musicLibrary": {"programs": [], "playlists": []},
-            "screenVideo": {"screens": [], "frames": []},
-            "music": {"canPrevious": true, "canNext": false, "isPlaying": false, "volume": 0.5},
-            "unityInventory": {"items": []},
+            "unityInventory": [],
         })
     }
 
@@ -2191,16 +2207,23 @@ mod tests {
             shell.read_with(&mut cx, |shell, _| shell.startup_covering()),
             "宿主自身那三项为真、别的都没有时，仍然不许开门"
         );
-        // 进了空间：到点之后必须让位（Preflight 的缺项只具名，不挡人）。
-        let envelope = unity_product_envelope();
+        // 空间已请求、画面还没确认：门必须还盖着。
+        let before_world = unity_product_envelope(false);
         cx.update(|cx| {
             shell.update(cx, |shell, cx| {
-                shell.observe_startup_at(&envelope, 0, cx);
-                assert!(shell.startup_covering(), "刚进空间时还在准备");
-                shell.observe_startup_at(&envelope, 30_000, cx);
+                shell.observe_startup_at(&before_world, 0, cx);
+                assert!(shell.startup_covering(), "空间还没确认可见时门该盖着");
+            });
+        });
+        // 世界 `phase=activate`（`isWorldVisible=true`）：硬规则要求门**立刻**让位，
+        // 不许再陪着别的项等满上界（2026-10-09 21:48 那次门就是在这里盖死了整窗）。
+        let world_visible = unity_product_envelope(true);
+        cx.update(|cx| {
+            shell.update(cx, |shell, cx| {
+                shell.observe_startup_at(&world_visible, 0, cx);
                 assert!(
                     !shell.startup_covering(),
-                    "清单能判定的项都判完了，加载态必须让位"
+                    "世界一激活（phase=activate）加载态必须立刻让位"
                 );
             });
         });
