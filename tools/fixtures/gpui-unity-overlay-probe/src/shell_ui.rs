@@ -1550,6 +1550,44 @@ mod tests {
     }
 
     /// 小窗 renders the column **instead of** the wide bar and the destination
+    #[test]
+    fn the_transport_width_counts_every_flex_child_the_bar_places() {
+        use gmgn_gpui_ui::shell::{self, TransportControl};
+
+        let rows = super::transport_rows(false, false);
+        let controls: Vec<TransportControl> = rows
+            .into_iter()
+            .map(|(id, icon, label)| {
+                TransportControl::new(id, id, icon, label)
+                    .ends_group(super::transport_group_ends_after(id))
+            })
+            .collect();
+
+        // 13 controls, two of them ending a group, so the bar places
+        // 13 slots + 2 hairlines = 15 flex children and gaps the 14 pairs
+        // between them. The reading is spelled out instead of derived so a
+        // wrong `transport_width` cannot make this agree with itself.
+        let slots = 12. * 44. + 68.;
+        let dividers = 2. * 1.;
+        let insets = 2. * 4.;
+        let gaps = 14. * 6.;
+        let width = slots + dividers + insets + gaps + 1.;
+        assert_eq!(controls.len(), 13);
+        assert_eq!(
+            shell::transport_width(&controls),
+            width,
+            "the derivation must count a gap between every neighbouring pair of \
+             the bar's real children, not two group gaps"
+        );
+        assert_eq!(width, 699.);
+        // Still wider than the probe's own 720 pt Unity sample canvas once the
+        // bar is pinned 22 pt from the right edge, which is why the leftmost
+        // 音乐与节目 entry is clipped there. Recorded, not hidden: the product
+        // window's 760 pt floor is what keeps it inside in the shipped app.
+        assert!(width > 720., "the probe sample canvas is narrower than the bar");
+    }
+
+    /// 小窗 renders the column **instead of** the wide bar and the destination
     /// pill: the original hides the toolbar in its compact window and draws
     /// `livecam-controls` in its place (`Player.uss:95-97`), and a 224 pt window
     /// cannot hold a horizontal bar anyway.

@@ -764,13 +764,35 @@ pub mod settings {
 /// Product shell: transport bar, destination button, task feedback, Live Cam.
 ///
 /// Sources: `StageOverlayView.swift:2683-2694` (`transportWidth` is derived from
-/// nine 44 pt buttons, the 68 pt settings button, two 4 pt side insets and two
-/// 6 pt group gaps, plus the extra control slot the stage view adds — 529 total),
-/// `StageWindowController.swift:1541-1542` (529×48), `:1533-1538` (22 from the
-/// right and bottom), `:1577-1590` (destination 112×38 at right 22 / top 28),
-/// `:1521` (task feedback 280 wide), `LiveCamPanel.swift:102` (224×336).
+/// nine 44 pt buttons, the 68 pt settings button, two 4 pt side insets and the
+/// extra control slot the stage view adds, plus a rounding term),
+/// `StageWindowController.swift:1541-1542` (the original's 529×48 bar),
+/// `:1533-1538` (22 from the right and bottom), `:1577-1590` (destination 112×38
+/// at right 22 / top 28), `:1521` (task feedback 280 wide), `LiveCamPanel.swift:102`
+/// (224×336).
+///
+/// The 529 in the original is the width of *its* control set under *its* spacing.
+/// The rework runs a flex row that gaps every neighbouring pair of children —
+/// the controls plus the 1 pt group hairlines — so the same eleven controls plus
+/// one divider lay out at [`TRANSPORT_WIDTH`](shell::TRANSPORT_WIDTH) = 584 here.
+/// The number that matters is that the derivation and the render agree; the
+/// pixel-level check is `tests/transport_popover_geometry.rs`.
 pub mod shell {
-    pub const TRANSPORT_WIDTH: f32 = 529.;
+    /// The bar's real laid-out width for the product's eleven-control set — ten
+    /// 44 pt slots + the 68 pt settings slot + the 1 pt group divider 下首 ends
+    /// its group with + two 4 pt side insets + eleven 6 pt flex gaps + the
+    /// original's rounding term = 584, which is exactly what
+    /// [`super::shell::transport_width`] returns for those controls.
+    ///
+    /// It is **not** independent of the control set, and it used to be wrong:
+    /// this constant held 529 while the bar it describes painted 584, because
+    /// `transport_width` summed only two group gaps instead of the `n - 1` gaps
+    /// a flex row really puts between its children. A host that places the bar by
+    /// the derivation put a 584 pt bar inside a 529 pt budget — 55 pt of it off
+    /// the canvas edge. The constant now agrees with the derivation, and
+    /// `tests/transport_popover_geometry.rs` ties the derivation to the bar's own
+    /// prepared-layout rect in pixels.
+    pub const TRANSPORT_WIDTH: f32 = 584.;
     pub const TRANSPORT_HEIGHT: f32 = 48.;
     pub const TRANSPORT_INSET: f32 = 22.;
     /// 9 regular buttons + settings + the extra control slot + insets + gaps.
@@ -935,13 +957,19 @@ mod tests {
         assert_eq!([shell::DESTINATION_WIDTH, shell::DESTINATION_HEIGHT], [112., 38.]);
         assert_eq!(shell::TASK_FEEDBACK_WIDTH, 280.);
 
-        // The transport width is a derivation, not an independent number: nine
-        // 44 pt buttons + the 68 pt settings slot + the extra control slot +
-        // two 4 pt insets + two 6 pt gaps.
+        // The transport width is a derivation, not an independent number, and
+        // the derivation counts the bar's **real flex children**: eleven control
+        // slots (nine regular + settings + the extra control slot), one 1 pt
+        // group divider, two 4 pt insets, one 6 pt gap between each neighbouring
+        // pair of those twelve children, and the rounding term.
+        let controls = shell::REGULAR_BUTTONS + 2;
+        let dividers = 1;
+        let children = controls + dividers;
         let derived = stage::CONTROL_SIZE * (shell::REGULAR_BUTTONS as f32 + 1.)
             + stage::SETTINGS_WIDTH
+            + shell::TRANSPORT_DIVIDER.0 * dividers as f32
             + 2. * stage::SIDE_INSET
-            + 2. * stage::GROUP_GAP
+            + (children - 1) as f32 * stage::GROUP_GAP
             + shell::TRANSPORT_ROUNDING;
         assert_eq!(derived, shell::TRANSPORT_WIDTH);
         assert_eq!(shell::TRANSPORT_HEIGHT, 48.);

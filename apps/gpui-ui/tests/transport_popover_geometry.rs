@@ -201,6 +201,166 @@ fn diff(before: &image::RgbaImage, after: &image::RgbaImage) -> Option<(u32, u32
     (count > 0).then_some((min_x, min_y, max_x, max_y, count))
 }
 
+/// The bar's **real** laid-out width for the product control set, read back off
+/// the prepared-layout rect GPUI hands the root — the same rectangle the overlay
+/// reports as the bar's hit region.
+///
+/// One window is opened for the whole check and re-rendered per control set:
+/// GPUI's `open_window` reuses the window it is handed, so opening three windows
+/// in a row would leave two of them rendering the first harness' empty control
+/// list (a 10 pt bar) and silently compare against the wrong rectangle.
+fn rendered_bar_widths(cx: &mut HeadlessAppContext, sets: Vec<Vec<TransportControl>>) -> Vec<f32> {
+    let facts = Rc::new(RefCell::new(Facts::default()));
+    let state = facts.clone();
+    let (width, height) = WINDOW;
+    let count = sets.len();
+    let (handle, entity) = cx
+        .update(|cx| {
+            let app = cx;
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(width), px(height)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                app,
+                move |_, cx| {
+                    cx.new(|_| WidthHarness {
+                        controls: sets,
+                        index: 0,
+                        facts: state,
+                    })
+                },
+            )
+        })
+        .expect("headless window");
+    let mut widths = Vec::with_capacity(count);
+    for index in 0..count {
+        entity.update(cx, |harness, cx| {
+            harness.index = index;
+            cx.notify();
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+        widths.push(f32::from(
+            facts
+                .borrow()
+                .bar
+                .expect("the transport bar must be laid out")
+                .size
+                .width,
+        ));
+    }
+    widths
+}
+
+/// Renders one control set and nothing else, so the only prepared child is the
+/// bar.
+struct WidthHarness {
+    controls: Vec<Vec<TransportControl>>,
+    index: usize,
+    facts: Rc<RefCell<Facts>>,
+}
+
+impl Render for WidthHarness {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().downgrade();
+        let controls = self.controls[self.index].clone();
+        div()
+            .relative()
+            .size_full()
+            .on_children_prepainted(move |bounds, _, cx| {
+                if let Some(bar) = bounds.first() {
+                    entity
+                        .update(cx, |harness, _| {
+                            harness.facts.borrow_mut().bar = Some(*bar);
+                        })
+                        .ok();
+                }
+            })
+            .child(shell::transport_bar_in(
+                controls,
+                window,
+                cx,
+                |_, _, _| {},
+                |_, _, _, _| {},
+            ))
+    }
+}
+
+/// **The derivation must equal what the bar really lays out at.**
+///
+/// This is the pixel-truth half of the 2026-10-09 栏宽 defect. `transport_width`
+/// summed the slot widths plus *two* `GROUP_GAP`s while [`shell::transport_bar_in`]
+/// is a flex row that gaps every neighbouring pair of its children — the control
+/// slots, plus the group divider a `.ends_group(true)` control paints after
+/// itself. For a real 14-control set with one divider that is 15 children and 14
+/// gaps, so the old derivation said 734 - 72 = 662 where the bar laid out at 735:
+/// a bar wider than the canvas placed as if it fit, so the leftmost 「节目」 entry
+/// was clipped (the product's 760 pt minimum window hid it on the 720 pt Unity
+/// sample).
+///
+/// Reading the bar's own prepared rect is what makes a wrong derivation fail — a
+/// bounds read cannot be satisfied by a second copy of the arithmetic.
+///
+/// The tolerance is `[0, 2)`: the derivation must never *understate* the bar (a
+/// bar placed by a smaller number runs off the canvas edge, which is the defect)
+/// and may not overstate it by a gap either. One point of overshoot is real and
+/// expected — `TRANSPORT_ROUNDING` is the original's 1 pt guard while GPUI's flex
+/// measurement comes out 1 pt wider than the summed children (measured: 1 control
+/// derives 53 / lays out at 54, 2 controls 103 / 104, the 14-control set 734 /
+/// 735). A derivation that miscounts *any* gap is off by a multiple of 6 pt, so
+/// it cannot hide inside this window.
+fn transport_width_matches_the_rendered_bar(cx: &mut HeadlessAppContext) {
+    let volume = cx.update(|cx| cx.new(|_| SliderState::new().min(0.).max(1.).step(0.01)));
+
+    let labeled: Vec<(&str, Vec<TransportControl>)> = vec![
+        ("the product's fourteen-control table", controls(volume.clone(), false)),
+        ("the 音量 panel's open bar", controls(volume.clone(), true)),
+        // A deliberately divider-heavy set: 音量 also ends a group there, so a
+        // derivation that ignores dividers is off by two of them here.
+        (
+            "a two-divider set",
+            {
+                let mut rows = controls(volume.clone(), false);
+                rows.iter_mut()
+                    .find(|row| row.id.as_ref() == "volume")
+                    .expect("the 音量 control")
+                    .ends_group = true;
+                rows
+            },
+        ),
+    ];
+    let derived: Vec<f32> = labeled
+        .iter()
+        .map(|(_, rows)| shell::transport_width(rows))
+        .collect();
+    let painted = rendered_bar_widths(cx, labeled.iter().map(|(_, rows)| rows.clone()).collect());
+    let mut failures: Vec<String> = Vec::new();
+    for ((label, _), (derived, painted)) in labeled.iter().zip(derived.iter().zip(painted.iter())) {
+        eprintln!("[width] {label}: derived={derived} painted={painted} ({WINDOW:?} canvas)");
+        if *painted < *derived || *painted - *derived >= 2. {
+            failures.push(format!(
+                "{label}: transport_width derived {derived} pt but the bar really lays \
+                 out at {painted} pt — the derivation and the render have drifted apart"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} transport width check(s) failed:\n  - {}",
+        failures.len(),
+        failures.join("\n  - ")
+    );
+    println!("PASS transport_width: the derivation equals the rendered bar's own rect");
+}
+
 /// GPUI's macOS platform must be created on the main thread, so this is a
 /// `harness = false` binary test (like `ui_shots`), not a `#[test]`.
 fn main() {
@@ -213,6 +373,11 @@ fn main() {
     );
     cx.update(gpui_kit::init);
     let volume = cx.update(|cx| cx.new(|_| SliderState::new().min(0.).max(1.).step(0.01)));
+
+    // The derivation-vs-paint check runs first and on its own: it is the
+    // assertion the defective derivation fails, and it must not be reachable
+    // only after the popover checks pass.
+    transport_width_matches_the_rendered_bar(&mut cx);
 
     let closed = frame(&mut cx, volume.clone(), false, 0.5);
     let open = frame(&mut cx, volume.clone(), true, 0.5);

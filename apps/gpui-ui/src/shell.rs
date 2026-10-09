@@ -223,12 +223,39 @@ impl TransportControl {
     }
 }
 
+/// Every flex child the bar really places, in order, as `(width, is_divider)`.
+///
+/// This is the **one list** both the layout and the width derivation read: the
+/// bar's children are each control's slot plus the group divider a control with
+/// [`TransportControl::ends_group`] paints after it, and the flex gap lies
+/// between *every* neighbouring pair of them. A derivation that counts only
+/// "group gaps" therefore disagrees with the bar the moment a control set has
+/// more than one group boundary — which is exactly what a 735 pt bar derived as
+/// 661 did, pushing the leftmost entry 37 pt off a 720 pt canvas.
+fn transport_children(controls: &[TransportControl]) -> Vec<(f32, bool)> {
+    let mut children = Vec::with_capacity(controls.len() + 1);
+    for control in controls {
+        children.push((control.slot_width(), false));
+        if control.ends_group {
+            children.push((m::TRANSPORT_DIVIDER.0, true));
+        }
+    }
+    children
+}
+
 /// Total bar width for a control list — the original derives it rather than
 /// hard-coding 529, so a change in the control set changes the bar with it.
+///
+/// Same source as the render: [`transport_children`] is the child sequence the
+/// bar builds, so the derivation is its summed widths plus the flex gaps
+/// *between those children* (`n - 1` of them), the bar's two side insets and the
+/// original's rounding term. [`transport_bar_slots`] must keep `.gap(px(
+/// stage::GROUP_GAP))` on the bar box for this to stay true.
 pub fn transport_width(controls: &[TransportControl]) -> f32 {
-    controls.iter().map(TransportControl::slot_width).sum::<f32>()
+    let children = transport_children(controls);
+    children.iter().map(|(width, _)| *width).sum::<f32>()
         + 2. * stage::SIDE_INSET
-        + 2. * stage::GROUP_GAP
+        + (children.len().saturating_sub(1)) as f32 * stage::GROUP_GAP
         + m::TRANSPORT_ROUNDING
 }
 
@@ -304,8 +331,18 @@ fn transport_bar_slots(
         .bg(rgba(m::TRANSPORT_BG))
         .border_1()
         .border_color(rgba(m::TRANSPORT_BORDER));
+    // The child sequence the width derivation reads as well: one entry per
+    // control's slot, plus a `(divider, true)` entry after a group's last
+    // control. The `width` below and `transport_width` therefore cannot drift.
+    let children = transport_children(&controls);
+    // A control's own slot is at its index plus one entry for every divider a
+    // *preceding* control ended its group with; the bar's child order is the
+    // same sequence `transport_children` builds, so the two cannot drift.
+    let mut slot_index = 0;
     for control in controls {
-        let width = control.slot_width();
+        let (width, is_divider) = children[slot_index];
+        debug_assert!(!is_divider, "a control is always followed by its own slot");
+        slot_index += 1 + usize::from(control.ends_group);
         let action = control.action.clone();
         let mut button = ui::icon_button(
             control.id.clone(),
@@ -467,22 +504,60 @@ mod tests {
         TransportControl::new(id, id, icon, id)
     }
 
-    /// The bar derives its width from the controls, exactly like the original:
-    /// ten 44 pt slots (the nine regular buttons plus the window-mode button the
-    /// stage view accounts for separately), the 68 pt settings slot, two 4 pt
-    /// side insets, two 6 pt group gaps and the original's own rounding term.
+    /// The bar derives its width from the controls, exactly like the original —
+    /// but for the **product's** control set, divider included: ten 44 pt slots
+    /// (the nine regular buttons plus the window-mode button the stage view
+    /// accounts for separately), the 68 pt settings slot, the 1 pt group divider
+    /// 下首 ends its group with, two 4 pt side insets, one 6 pt flex gap between
+    /// each of the bar's twelve real children, and the original's rounding term.
+    ///
+    /// The gap count is the bar's, not a guess: the bar is a flex row that gaps
+    /// *every* neighbouring pair of children, so the derivation counts the
+    /// `n - 1` gaps of the child sequence [`transport_children`] returns. The old
+    /// "two group gaps" reading was 55 pt short of the bar it described (529
+    /// derived / 584 painted), which is the defect this pins — a host that placed
+    /// the bar by the derivation put its left edge 55 pt too far right.
+    ///
+    /// That the *painted* bar really is 584 pt is not asserted here — a unit test
+    /// cannot measure paint. `tests/transport_popover_geometry.rs` reads the
+    /// rendered bar's own prepared-layout rect back and pins
+    /// `transport_width(controls) == rendered width` in real pixels.
     #[test]
     fn transport_width_is_derived_from_the_control_set() {
+        // 下首 carries the bar's only group divider, so the product set is
+        // eleven slots **and** one hairline.
         let mut controls: Vec<_> = (0..10)
             .map(|_| control("regular", gpui_kit::assets::IconName::Music))
             .collect();
+        controls[3] = controls[3].clone().ends_group(true);
         controls.push(control("visual", gpui_kit::assets::IconName::Settings));
         assert_eq!(controls.len(), m::REGULAR_BUTTONS + 2, "eleven controls, as in the original bar");
+        assert_eq!(transport_children(&controls).len(), controls.len() + 1);
         assert_eq!(transport_width(&controls), m::TRANSPORT_WIDTH);
-        assert_eq!(transport_width(&controls), 529.);
-        // Removing a control moves the bar, rather than leaving a 529 pt bar
+        assert_eq!(transport_width(&controls), 584.);
+        // Removing a control moves the bar, rather than leaving a 584 pt bar
         // with a hole in it.
         assert!(transport_width(&controls[..controls.len() - 1]) < m::TRANSPORT_WIDTH);
+    }
+
+    /// A group divider is a real flex child, so it adds its own width **and** a
+    /// gap on each side. The derivation that forgot this is what the painted
+    /// width disagreed with.
+    #[test]
+    fn a_group_divider_costs_its_width_and_a_gap_on_each_side() {
+        let plain = vec![
+            control("a", gpui_kit::assets::IconName::Music),
+            control("b", gpui_kit::assets::IconName::Music),
+            control("c", gpui_kit::assets::IconName::Music),
+        ];
+        let mut grouped = plain.clone();
+        grouped[0] = grouped[0].clone().ends_group(true);
+        // One extra child: its 1 pt hairline plus one more flex gap.
+        assert_eq!(
+            transport_width(&grouped) - transport_width(&plain),
+            m::TRANSPORT_DIVIDER.0 + stage::GROUP_GAP,
+            "a divider is a child of the gap'ed flex row"
+        );
     }
 
     /// An open panel hangs off the **bar's own box**, not the 44 pt control
@@ -678,7 +753,10 @@ mod tests {
             );
         }
         // The two moved controls are ordinary 44 pt slots: expanding the bar
-        // moved every slot after 歌词, and the derivation must follow.
+        // moved every slot after 歌词, and the derivation must follow. Each new
+        // child costs its own slot **and** the flex gap that precedes it, so the
+        // bar grows by `44 + 6` per control — a derivation that forgot the gap
+        // would report 88.
         let mut before: Vec<_> = (0..11).map(|_| control("regular", gpui_kit::assets::IconName::Music)).collect();
         before.push(control("visual", gpui_kit::assets::IconName::Settings));
         let mut after = before.clone();
@@ -687,8 +765,8 @@ mod tests {
         assert_eq!(after.len(), before.len() + 2);
         assert_eq!(
             transport_width(&after) - transport_width(&before),
-            2. * stage::CONTROL_SIZE,
-            "each moved control is one 44 pt slot"
+            2. * (stage::CONTROL_SIZE + stage::GROUP_GAP),
+            "each moved control is one 44 pt slot plus the flex gap it brings"
         );
         assert_eq!(after[after.len() - 1].slot_width(), stage::CONTROL_SIZE);
     }

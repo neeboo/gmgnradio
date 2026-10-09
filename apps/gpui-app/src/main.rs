@@ -1231,15 +1231,22 @@ mod layout_tests {
         assert_eq!([next.slot_width(),visual.slot_width()],[stage_metrics::CONTROL_SIZE,stage_metrics::SETTINGS_WIDTH]);
         assert_eq!([stage_metrics::SIDE_INSET,stage_metrics::GROUP_GAP],[4.,6.]);
         // The bar width the shell places is the foundation's own derivation:
-        // 9 regular buttons + the settings slot + the extra control slot +
-        // two 4 pt insets + two 6 pt gaps + the rounding term.
+        // 9 regular buttons + the settings slot + the extra control slot + one
+        // 1 pt group divider + two 4 pt insets + one 6 pt flex gap between each
+        // of the bar's twelve real children + the rounding term.
+        //
+        // The gap count is the reason this test exists at all: counting only the
+        // two *group* gaps derived 529 while the bar painted 584, and a bar
+        // placed by the smaller number is what clipped the leftmost entry.
+        let children = shell_metrics::REGULAR_BUTTONS + 2 + 1;
         let derived=stage_metrics::CONTROL_SIZE*(shell_metrics::REGULAR_BUTTONS as f32+1.)+stage_metrics::SETTINGS_WIDTH
-            +2.*stage_metrics::SIDE_INSET+2.*stage_metrics::GROUP_GAP+shell_metrics::TRANSPORT_ROUNDING;
+            +shell_metrics::TRANSPORT_DIVIDER.0
+            +2.*stage_metrics::SIDE_INSET+(children-1) as f32*stage_metrics::GROUP_GAP+shell_metrics::TRANSPORT_ROUNDING;
         assert_eq!(derived,shell_metrics::TRANSPORT_WIDTH);
         let mut controls=(0..10).map(|_|TransportControl::new("regular","regular",IconName::Music,"regular")).collect::<Vec<_>>();
         controls.push(visual);
         assert_eq!(gmgn_gpui_ui::shell::transport_width(&controls),shell_metrics::TRANSPORT_WIDTH);
-        assert_eq!([shell_metrics::TRANSPORT_WIDTH,shell_metrics::TRANSPORT_HEIGHT,scene_tokens::PANEL_RADIUS_SMALL],[529.,48.,16.]);
+        assert_eq!([shell_metrics::TRANSPORT_WIDTH,shell_metrics::TRANSPORT_HEIGHT,scene_tokens::PANEL_RADIUS_SMALL],[584.,48.,16.]);
         assert_eq!(shell_metrics::TRANSPORT_INSET,22.);
     }
     /// 目的地 and 任务状态区 keep the original frames; 小窗 keeps 224×336.
