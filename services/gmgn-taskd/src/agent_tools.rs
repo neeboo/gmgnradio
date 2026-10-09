@@ -50,9 +50,57 @@ fn safe(v: &Value) -> bool {
         _ => true,
     }
 }
+/// Ceiling for one model-supplied tool argument object, one tool receipt and one
+/// reconciliation receipt. These are the only payloads a model or a transport can
+/// inflate, so they keep the tight bound they always had.
+const MAXIMUM_ARGUMENT_BYTES: usize = 16384;
+/// Ceiling for the whole host-owned tool catalogue.
+///
+/// This used to share `MAXIMUM_ARGUMENT_BYTES`. That was wrong: the catalogue is
+/// the trusted host's own contract — 52..56 tools whose Chinese `description`s are
+/// written for the model to read — not model input. The regression fixture built
+/// from the shipping Swift sources (see `REAL_TOOL_CATALOG`) kept the structural
+/// keys only and elided every description, so it measured ~15.6 KB and fit; the
+/// real catalogue the app sends is ~30 KB, so **every** real registration fell over
+/// this check. Because `agent_dsh_start` maps that refusal to
+/// `agent_dsh_invalid_tools`, the whole tool group was rejected and no session could
+/// start.
+///
+/// 256 KiB leaves ~8x headroom over the largest real catalogue while staying far
+/// below the 12 MiB wire frame limit, so an accidentally enormous catalogue is still
+/// refused — loudly, with its measured size, instead of anonymously.
+const MAXIMUM_CATALOG_BYTES: usize = 262144;
 fn bounded(v: &Value) -> Result<String> {
     let encoded = crate::canonical_json::to_string(v).map_err(|_| "agent_tool_invalid_payload")?;
-    if encoded.len() > 16384 || !safe(v) {
+    if encoded.len() > MAXIMUM_ARGUMENT_BYTES || !safe(v) {
+        return Err("agent_tool_invalid_payload");
+    }
+    Ok(encoded)
+}
+/// The host catalogue gets its own bound, and an oversize catalogue is named on
+/// stderr like every other refusal: a "the whole tool group was rejected" report is
+/// only actionable once it says how big the group was and how big it may be.
+///
+/// A secret-shaped key is still refused: `safe` is unchanged, so this is a size
+/// decision, not a relaxation of what may travel.
+fn bounded_catalog(v: &Value) -> Result<String> {
+    let encoded = crate::canonical_json::to_string(v).map_err(|_| "agent_tool_invalid_payload")?;
+    let oversize = encoded.len() > MAXIMUM_CATALOG_BYTES;
+    if oversize || !safe(v) {
+        eprintln!(
+            "gmgn-taskd: {}",
+            json!({
+                "event": "rejected",
+                "code": "agent_tool_invalid_payload",
+                "tool": format!("{} tool(s)", v.as_array().map_or(0, Vec::len)),
+                "path": "$.tools",
+                "detail": if oversize {
+                    format!("tool catalogue is {} bytes, above the {} byte limit", encoded.len(), MAXIMUM_CATALOG_BYTES)
+                } else {
+                    "tool catalogue contains a credential-shaped key".to_owned()
+                },
+            })
+        );
         return Err("agent_tool_invalid_payload");
     }
     Ok(encoded)
@@ -90,7 +138,7 @@ pub fn register_authorization(db: &mut Connection, p: &Value) -> Result<Value> {
             return Err(violation.code);
         }
     }
-    let encoded = bounded(&p["tools"])?;
+    let encoded = bounded_catalog(&p["tools"])?;
     let tx = db
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| "storage_unavailable")?;
@@ -814,6 +862,69 @@ mod tests {
         assert_eq!(authority_count(&db), 1);
         // The registered group is replayable with the identical catalog.
         register_authorization(&mut db, &authority(catalog())).unwrap();
+    }
+
+    /// The catalogue the shipping host really sends: the structurally-complete
+    /// production fixture plus every shipping `description`, plus the four tools the
+    /// fixture above omits (`resize_prop`, `read_resident_state`,
+    /// `update_resident_intent`, `capture_space_photo`) — 56 tools, 31 574 canonical
+    /// bytes. Rebuilt 2026-10-09 from the Swift producers; see
+    /// `tests/dsh_catalog_probe.py` for how it is replayed against a real daemon.
+    const DESCRIBED_TOOL_CATALOG: &str =
+        include_str!("../tests/fixtures/described-dsh-catalog.json");
+
+    /// The fixture above elides every tool `description`, so it measures ~15.6 KB and
+    /// used to fit the old shared 16 KiB payload bound. The real catalogue cannot:
+    /// the shipping tools carry 14 613 bytes of Chinese description text alone
+    /// (measured from `Agent/{WorldAgentToolContract,DJAgentToolDispatcher,
+    /// ResidentWishMachineTools,ResidentPropToolBridge,ResidentLoopTools,
+    /// ResidentVisionTools}.swift` + `Screen/ResidentScreenTools.swift`), and the
+    /// structurally-complete fixture is already 15 583 bytes raw before a single
+    /// description is added.
+    ///
+    /// This is the regression that keeps the two facts apart: the real catalogue must
+    /// register, and it must still be *bounded*.
+    #[test]
+    fn described_production_catalog_registers_without_unbounding_the_group() {
+        let tools: Value = serde_json::from_str(DESCRIBED_TOOL_CATALOG).unwrap();
+        let entries = tools.as_array().unwrap();
+        assert_eq!(entries.len(), 56, "生产 56 项工具（52 项 fixture + 4 项漏项）");
+        for tool in entries {
+            assert!(
+                supported_schema(&tool["inputSchema"], 0),
+                "real tool schema refused: {}",
+                tool["name"]
+            );
+        }
+        let encoded = crate::canonical_json::to_string(&tools).unwrap();
+        assert!(
+            encoded.len() > MAXIMUM_ARGUMENT_BYTES,
+            "the real catalogue is bigger than one model argument: {} bytes",
+            encoded.len()
+        );
+        assert!(
+            encoded.len() <= MAXIMUM_CATALOG_BYTES,
+            "the real catalogue must stay well inside the catalogue bound: {} bytes",
+            encoded.len()
+        );
+        let mut db = fresh_db();
+        register_authorization(&mut db, &authority(tools.clone())).unwrap();
+        assert_eq!(authority_count(&db), 1, "the described group persists");
+        // Identical bytes replay; the group is still exactly one authority.
+        register_authorization(&mut db, &authority(tools)).unwrap();
+        assert_eq!(authority_count(&db), 1);
+
+        // Bounded, not unbounded: a catalogue past the ceiling is still refused and
+        // leaves no authority behind.
+        let mut oversize = catalog();
+        oversize.as_array_mut().unwrap()[0]["description"] =
+            json!("x".repeat(MAXIMUM_CATALOG_BYTES));
+        let mut db = fresh_db();
+        assert_eq!(
+            register_authorization(&mut db, &authority(oversize)).unwrap_err(),
+            "agent_tool_invalid_payload"
+        );
+        assert_eq!(authority_count(&db), 0);
     }
     #[test]
     fn malformed_type_is_refused_with_tool_and_field_path() {

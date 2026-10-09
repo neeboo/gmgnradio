@@ -19,9 +19,17 @@
 //! 4. [`snapshot_root_keys_are_produced_by_the_host`]：UI 读的 ABI 根键必须在
 //!    overlay 的快照投影白名单里。
 //!
-//! 口径：只认 `#[cfg(test)]` 之前的源码。`apps/gpui-ui/src/**` 里大量 `json!`
-//! 字面量位于 `mod tests` 内（`stage_panels.rs:342`、`props.rs:788`、`settings.rs:4399`…），
-//! 它们不是 UI 能发出的 op；旧门禁没有这道切割，所以它盯的主要是测试面。
+//! 口径：只认测试模块**之外**的源码，按括号配对剥掉 `#[cfg(test)] mod … { … }`
+//! 本体。`apps/gpui-ui/src/**` 里大量 `json!` 字面量位于 `mod tests` 内
+//! （`stage_panels.rs:358`、`props.rs:788`、`settings.rs:4460`…），它们不是 UI 能发出
+//! 的 op。
+//!
+//! 注意**不能**写成"遇到第一个测试模块就把后面全丢"：`stage_panels.rs:358` 的
+//! `video_menu_tests` 和 `stage_panels/props.rs:788` 的 `tests` 都夹在生产代码**中间**
+//! （`stage_panels.rs` 之后还有 1400+ 行生产代码，`props.rs` 之后还有
+//! `impl Render for ResidentPropEditorPane` 整块），截断会把它们后面的全部发出点
+//! 一起丢掉。括号配对与 `services/gmgn-taskd/src/contract.rs` 的
+//! `without_test_modules`、`tools/audit-ui-function-inventory.py` 同口径。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -96,27 +104,106 @@ fn collect(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `#[cfg(test)] mod …` 之前的源码：测试里写出的 op/字段不算 UI 的命令面。
-fn production_source(src: &str) -> &str {
-    let needle = "#[cfg(test)]";
+/// 剥掉每个 `#[cfg(test)] mod … { … }` 的**模块本体**（花括号配对），保留模块前后
+/// 的生产代码。测试里写出的 op/字段不算 UI 的命令面，但生产代码**不因为包着它的
+/// 测试模块而消失**。
+///
+/// 旧实现（`find` 到第一个 `#[cfg(test)] mod` 就 `return &src[..at]`）在
+/// `stage_panels.rs:358` 的 `video_menu_tests`、`stage_panels/props.rs:788` 的
+/// `tests` 处截断——这两个测试模块都在文件中间，所以它们之后的全部发出点从未被
+/// 扫描过。
+///
+/// 被剥掉的区间用**等量换行**覆盖而不是直接删掉：这样 source 的行号不变，
+/// `file:line` 仍然指向真实源码行（断言失败信息里报的就是它）。括号配对跳过字符串、
+/// 行注释与块注释；换行本身不含 `#[cfg(test)]`，所以替换文本不会自我递归。
+fn production_source(src: &str) -> String {
+    let mut out = src.to_owned();
     let mut from = 0usize;
-    while let Some(at) = src[from..].find(needle) {
-        let at = from + at;
-        let rest = &src[at + needle.len()..];
-        let head = rest.trim_start();
-        let is_mod = head.starts_with("mod ")
-            || head
-                .strip_prefix("pub(")
-                .and_then(|r| r.split_once(')'))
-                .map(|(_, r)| r.trim_start().starts_with("mod "))
-                .unwrap_or(false)
-            || head.strip_prefix("pub ").map(|r| r.trim_start().starts_with("mod ")).unwrap_or(false);
-        if is_mod {
-            return &src[..at];
-        }
-        from = at + needle.len();
+    while let Some(at) = test_module_at(&out, from) {
+        let Some(brace) = out[at..].find('{').map(|b| at + b) else { break };
+        let Some(end) = balanced_brace_end(&out, brace) else { break };
+        let stripped = "\n".repeat(out[at..=end].matches('\n').count());
+        out.replace_range(at..=end, &stripped);
+        from = at + stripped.len();
     }
-    src
+    out
+}
+
+/// 下一个 `#[cfg(test)] mod …` 的起点。`#[cfg(test)]` 也可能挂在 `use`/`fn` 上，
+/// 那些不是测试模块，跳过。
+fn test_module_at(src: &str, from: usize) -> Option<usize> {
+    let needle = "#[cfg(test)]";
+    let mut at = from;
+    while let Some(found) = src[at..].find(needle) {
+        let start = at + found;
+        if attributes_end_in_mod(&src[start + needle.len()..]) {
+            return Some(start);
+        }
+        at = start + needle.len();
+    }
+    None
+}
+
+/// `#[cfg(test)]` 之后（中间可以隔着别的 `#[…]` 属性）是不是一个 `mod`。
+fn attributes_end_in_mod(mut rest: &str) -> bool {
+    loop {
+        rest = rest.trim_start();
+        let open = if rest.starts_with("#![") {
+            2
+        } else if rest.starts_with("#[") {
+            1
+        } else {
+            break;
+        };
+        match find_close(rest, open, b'[', b']') {
+            Some(close) => rest = &rest[close + 1..],
+            None => return false,
+        }
+    }
+    rest.starts_with("mod ")
+        || rest
+            .strip_prefix("pub(")
+            .and_then(|r| r.split_once(')'))
+            .map(|(_, r)| r.trim_start().starts_with("mod "))
+            .unwrap_or(false)
+        || rest.strip_prefix("pub ").map(|r| r.trim_start().starts_with("mod ")).unwrap_or(false)
+}
+
+/// 从 `src[open]` 的 `{` 起做花括号配对，跳过字符串、行注释与块注释。
+fn balanced_brace_end(src: &str, open: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i = string_at(src, i)?.1;
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'{' {
+            depth += 1;
+        } else if bytes[i] == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn string_at(src: &str, at: usize) -> Option<(String, usize)> {
@@ -525,10 +612,87 @@ fn handler_regions(root: &Path, h: &Handler) -> Vec<(String, usize, String)> {
         let line = src[..at].matches('\n').count() + 1;
         return vec![(h.file.to_owned(), line, src[at..=close].to_owned())];
     }
-    case_regions(&production_source(&src))
+    let production = production_source(&src);
+    let mut out: Vec<(String, usize, String)> = case_regions(&production)
         .into_iter()
         .filter(|(ops, _, _)| ops.iter().any(|o| h.ops.contains(&o.as_str())))
         .map(|(_, line, region)| (h.file.to_owned(), line, region))
+        .collect();
+    // `case "x":` 找不到时才退到 `if op == "x" { … }`：`ProductHost.settingsCommand`
+    // 用「op 前缀分派 + if 早退」而不是 `case`，不认这种分支就看不到处理者。
+    // 只在为空时回退，已有 `case` 臂的 op 行为不变。
+    if out.is_empty() {
+        out.extend(
+            if_regions(&production, h.ops)
+                .into_iter()
+                .map(|(line, region)| (h.file.to_owned(), line, region)),
+        );
+    }
+    out
+}
+
+/// `if op == "…" { … }` / `if op.hasPrefix("…") { … }` 形式的分支区域。
+/// 条件可以跨行，块用花括号配对切出。`keep` 全是空字符串的 handler 不产出区域。
+///
+/// 外层宽前缀 `if op.hasPrefix("stage.") { … }` 会把里面**每个** op 的实现
+/// （包括它们各自 `if op == "别的 op"` 里的 guard）都吞进来，所以同一分支内
+/// 若还有更精确的匹配，只保留**最内层**的那个：这与 [`strip_foreign_op_ifs`]
+/// 「别的 op 的早退不算本 op 的必填字段」是同一条理由。
+fn if_regions(src: &str, keep: &[&str]) -> Vec<(usize, String)> {
+    if keep.is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = src.split('\n').collect();
+    // 候选：(起始行 1 基, 结束行 1 基, 区域原文)。
+    let mut candidates: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !lines[i].trim_start().starts_with("if ") {
+            i += 1;
+            continue;
+        }
+        let mut cond = String::new();
+        let mut j = i;
+        while j < lines.len() && !lines[j].contains('{') {
+            cond.push_str(lines[j]);
+            j += 1;
+        }
+        if j >= lines.len() {
+            break;
+        }
+        if let Some((before, _)) = lines[j].split_once('{') {
+            cond.push_str(before);
+        }
+        let eqs = quoted_after(&cond, "op == ");
+        let pfx = quoted_after(&cond, "op.hasPrefix(");
+        let matches = eqs.iter().any(|o| keep.contains(&o.as_str()))
+            || pfx.iter().any(|p| keep.iter().any(|k| k.starts_with(p.as_str())));
+        if matches {
+            let rest = lines[i..].join("\n");
+            let Some(brace) = rest.find('{') else { break };
+            let Some(end) = balanced_brace_end(&rest, brace) else { break };
+            let consumed = rest[..=end].matches('\n').count();
+            candidates.push((i + 1, i + 2 + consumed, rest[..=end].to_owned()));
+        }
+        i += 1;
+    }
+    let mut keep_candidate = vec![true; candidates.len()];
+    for a in 0..candidates.len() {
+        for b in 0..candidates.len() {
+            if a != b
+                && candidates[b].0 > candidates[a].0
+                && candidates[b].1 <= candidates[a].1
+            {
+                keep_candidate[a] = false;
+                break;
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| keep_candidate[*index])
+        .map(|(_, (line, _, region))| (line, region))
         .collect()
 }
 /// 每个 op 的字段面与必须读到它们的宿主处理者。清单见
@@ -761,6 +925,17 @@ const OPS: &[OpContract] = &[
         ],
     },
     OpContract {
+        op: "settings.open.presence",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            // 原版 `StageOverlayView` 的「管理角色与动作…」＝ `onManageAssets`。
+            // `ProductHost.settingsCommand` 把它交给 `runtime.openPresenceSettings()`
+            // （先把设置定位到角色页，再打开设置窗口）。
+            Handler { file: "apps/macos/ProductHost/ProductHost.swift", ops: &["settings.open.presence"], func_anchor: "" },
+        ],
+    },
+    OpContract {
         op: "shortcuts.cancel",
         ui_fields: &[],
         rewrite_to: None,
@@ -904,6 +1079,78 @@ const OPS: &[OpContract] = &[
         ],
     },
     OpContract {
+        op: "stage.activity.run",
+        ui_fields: &["id"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.activity.run"], func_anchor: "" },
+            Handler { file: "apps/macos/UnityHost/UnityMediaHost.swift", ops: &["stage.activity.run"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.activity.stop",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.activity.stop"], func_anchor: "" },
+            Handler { file: "apps/macos/UnityHost/UnityMediaHost.swift", ops: &["stage.activity.stop"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.avatar.position",
+        ui_fields: &["axis", "value"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.avatar.position"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.avatar.reset",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.avatar.reset"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.camera.reset",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.camera.reset"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.motion.activate",
+        ui_fields: &["id"],
+        // `ProductHost.settingsCommand` 把这个 op 改写成 `presence.motion`，并把
+        // 同一个字典原样交给设置链（字段一起过去），所以 `id` 的读取算在目标 op 上。
+        rewrite_to: Some("presence.motion"),
+        handlers: &[
+            // 处理者是 `if op == "stage.motion.activate" { … }`，不是 `case` 臂。
+            Handler { file: "apps/macos/ProductHost/ProductHost.swift", ops: &["stage.motion.activate"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.motion.refresh",
+        ui_fields: &[],
+        // 宿主**新建** `["op": "presence.load"]`，不携带任何字段，所以这里不是
+        // `rewrite_to`：UI 侧没有字段需要过去，宿主也不要求它带字段。
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/ProductHost/ProductHost.swift", ops: &["stage.motion.refresh"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.player.particles",
+        ui_fields: &["value"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.player.particles"], func_anchor: "" },
+            Handler { file: "apps/macos/UnityHost/UnityMediaHost.swift", ops: &["stage.player.particles"], func_anchor: "" },
+        ],
+    },
+    OpContract {
         op: "stage.program.back",
         ui_fields: &[],
         rewrite_to: None,
@@ -952,6 +1199,30 @@ const OPS: &[OpContract] = &[
         ],
     },
     OpContract {
+        op: "stage.props.close",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.close"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.props.delete",
+        ui_fields: &["objectID"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.delete"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.props.filter",
+        ui_fields: &["placedOnly"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.filter"], func_anchor: "" },
+        ],
+    },
+    OpContract {
         op: "stage.props.fold",
         ui_fields: &["folded", "group"],
         rewrite_to: None,
@@ -976,11 +1247,35 @@ const OPS: &[OpContract] = &[
         ],
     },
     OpContract {
+        op: "stage.props.nudge",
+        ui_fields: &["y", "z"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.nudge"], func_anchor: "" },
+        ],
+    },
+    OpContract {
         op: "stage.props.resize",
         ui_fields: &["value"],
         rewrite_to: None,
         handlers: &[
             Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.resize"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.props.return",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.return"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.props.rotate",
+        ui_fields: &["direction"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.rotate"], func_anchor: "" },
         ],
     },
     OpContract {
@@ -992,11 +1287,54 @@ const OPS: &[OpContract] = &[
         ],
     },
     OpContract {
+        op: "stage.props.undo",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.undo"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.props.withdraw",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.withdraw"], func_anchor: "" },
+        ],
+    },
+    OpContract {
         op: "stage.video.bind",
         ui_fields: &["id"],
         rewrite_to: None,
         handlers: &[
             Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.bind"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.video.brightness",
+        ui_fields: &["value"],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.brightness"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.video.import",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.import"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.video.mode",
+        ui_fields: &["id"],
+        rewrite_to: None,
+        handlers: &[
+            // 面板用 tile 的 `id` 命名所选模式；UnityScreenVideoBridge 在改写处把
+            // `id` 补成原生 `value`（`native["value"] = native["id"]`），所以这条
+            // op 只要求 UI 发 `id`。
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.mode"], func_anchor: "" },
         ],
     },
     OpContract {
@@ -1016,11 +1354,27 @@ const OPS: &[OpContract] = &[
         ],
     },
     OpContract {
+        op: "stage.video.recoverStop",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.recoverStop"], func_anchor: "" },
+        ],
+    },
+    OpContract {
         op: "stage.video.remove",
         ui_fields: &["id"],
         rewrite_to: None,
         handlers: &[
             Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.remove"], func_anchor: "" },
+        ],
+    },
+    OpContract {
+        op: "stage.video.stop",
+        ui_fields: &[],
+        rewrite_to: None,
+        handlers: &[
+            Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.video.stop"], func_anchor: "" },
         ],
     },
     OpContract {
@@ -1194,7 +1548,7 @@ fn ui_emissions(root: &Path) -> Vec<Emission> {
     for file in files {
         let src = fs::read_to_string(&file).unwrap_or_else(|e| panic!("读不到 {}: {e}", file.display()));
         let rel = file.strip_prefix(root).unwrap_or(&file).display().to_string();
-        emissions(&rel, production_source(&src), &mut out);
+        emissions(&rel, &production_source(&src), &mut out);
     }
     out
 }
@@ -1420,7 +1774,7 @@ fn snapshot_keys_read_by_the_ui_are_produced_by_a_host() {
 
     // 1) settings 子根：SettingsPane 的 `self.snapshot["k"]` 必须在某个宿主的
     //    settings 快照里被写出来。
-    let settings = production_source(&read(&root, "apps/gpui-ui/src/settings.rs")).to_owned();
+    let settings = production_source(&read(&root, "apps/gpui-ui/src/settings.rs"));
     let mut reads: BTreeMap<String, usize> = BTreeMap::new();
     for (i, line) in settings.split('\n').enumerate() {
         let mut at = 0usize;
@@ -1828,9 +2182,10 @@ fn stage_load_is_answered_not_faked() {
     sources.sort();
     // The op name is documented in comments/constants on purpose; a code line
     // that mentions it is the emission this test forbids. The whole file is
-    // scanned, not only the pre-`#[cfg(test)]` part: `stage_panels.rs` has a
-    // small `#[cfg(test)]` block *before* the pane's constructor, so the
-    // production cut would hide exactly the line under test.
+    // scanned (not `production_source`): this test also covers the overlay
+    // fixture tree, and the forbidden shape is a *code line that mentions the
+    // op*, not a production-only one — stripping test modules would only make
+    // the forbidden emission easier to hide.
     let mut emitters = Vec::new();
     for file in &sources {
         let Ok(src) = fs::read_to_string(file) else { continue };

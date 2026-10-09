@@ -148,10 +148,16 @@ fn validation_plan(p: &str, cookie: &str) -> Value {
         json!({"providerID":p,"probes":[{"transport":"qq-library","uin":uin}]})
     }
 }
+
+/// The one guard every music-account entry point passes: a known provider and no
+/// orphan private credential left behind by a previous attempt.
+fn enter(c: &Connection, root: &Path, p: &str) -> Result<()> {
+    provider(p)?;
+    cleanup_unused(c, root, p)
+}
 pub fn request(c: &mut Connection, root: &Path, method: &str, v: &Value) -> Result<Value> {
     let p = text(v, "providerID")?;
-    provider(p)?;
-    cleanup_unused(c,root,p)?;
+    enter(c, root, p)?;
     match method {
         "music_account_import" => {
             // One-time observation of the original private files. No overwrite after Rust owns the provider.
@@ -197,7 +203,6 @@ pub fn request(c: &mut Connection, root: &Path, method: &str, v: &Value) -> Resu
             tx.commit().map_err(|_| "storage_unavailable")?;
             Ok(reply)
         }
-        "music_account_read" => snapshot(c, p),
         "music_account_session" => {
             let view = snapshot(c, p)?;
             if !view["overridden"].as_bool().unwrap_or(false) {
@@ -217,102 +222,6 @@ pub fn request(c: &mut Connection, root: &Path, method: &str, v: &Value) -> Resu
             let session: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| "music_account_invalid_stored_session")?;
             Ok(json!({"account":view,"session":session,"useLegacy":false}))
-        }
-        "music_account_begin" => {
-            let host = text(v, "hostSessionID")?;
-            let request = text(v, "requestID")?;
-            let cookie = normalized_cookie(
-                p,
-                v["cookie"].as_str().ok_or("music_account_invalid_cookie")?,
-            )?;
-            let input_sha = digest(encoded(&json!({"providerID":p,"cookie":cookie}))?.as_bytes());
-            let old: Option<(String,String,String)>=c.query_row("SELECT id,input_sha,state FROM music_account_attempts WHERE host=?1 AND request=?2",params![host,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|"storage_unavailable")?;
-            if let Some((id, sha, state)) = old {
-                if sha != input_sha {
-                    return Err("music_account_request_conflict");
-                }
-                if matches!(state.as_str(), "connected" | "rejected") {
-                    let receipt: String = c
-                        .query_row(
-                            "SELECT receipt FROM music_account_attempts WHERE id=?1",
-                            [&id],
-                            |r| r.get(0),
-                        )
-                        .map_err(|_| "storage_unavailable")?;
-                    let receipt: Value =
-                        serde_json::from_str(&receipt).map_err(|_| "storage_unavailable")?;
-                    return Ok(json!({"attemptID":id,"receipt":receipt}));
-                }
-                if state != "validating" {
-                    return Err("music_account_attempt_not_replayable");
-                }
-                return Ok(json!({"attemptID":id,"plan":validation_plan(p,&cookie)}));
-            }
-            let id = uuid::Uuid::new_v4().to_string();
-            let secret = json!({"credential":{"cookieHeader":{"_0":cookie}}});
-            files::publish(&secret_path(root, &id)?, encoded(&secret)?.as_bytes())?;
-            let tx = c.transaction().map_err(|_| "storage_unavailable")?;
-            let view = snapshot(&tx, p)?;
-            tx.execute(
-                "INSERT INTO music_account_attempts VALUES(?1,?2,?3,?4,?5,?6,'validating',NULL)",
-                params![
-                    id,
-                    p,
-                    host,
-                    request,
-                    input_sha,
-                    view["revision"].as_i64().unwrap_or(0)
-                ],
-            )
-            .map_err(|_| "storage_unavailable")?;
-            tx.commit().map_err(|_| "storage_unavailable")?;
-            Ok(json!({"attemptID":id,"plan":validation_plan(p,&cookie)}))
-        }
-        "music_account_finish" => {
-            let id = text(v, "attemptID")?;
-            let host = text(v, "hostSessionID")?;
-            let request = text(v, "requestID")?;
-            let tx = c.transaction().map_err(|_| "storage_unavailable")?;
-            let old:(String,String,String,i64,String,Option<String>)=tx.query_row("SELECT provider,host,request,base_revision,state,receipt FROM music_account_attempts WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|_|"music_account_unknown_attempt")?;
-            if old.0 != p || old.1 != host || old.2 != request {
-                return Err("music_account_attempt_identity");
-            }
-            let proof_sha = digest(encoded(&v["responses"])?.as_bytes());
-            if old.4 == "connected" || old.4 == "rejected" {
-                let receipt: Value =
-                    serde_json::from_str(old.5.as_deref().ok_or("storage_unavailable")?)
-                        .map_err(|_| "storage_unavailable")?;
-                if receipt["proofSHA"] != proof_sha {
-                    return Err("music_account_receipt_conflict");
-                }
-                return Ok(receipt);
-            }
-            if old.4 != "validating" {
-                return Err("music_account_attempt_not_replayable");
-            }
-            let current = snapshot(&tx, p)?;
-            if current["revision"].as_i64() != Some(old.3) {
-                return Err("music_account_revision_conflict");
-            }
-            let valid = valid_response(p, &v["responses"])?;
-            let receipt = if valid {
-                let bytes = files::read(&secret_path(root, id)?, SECRET_LIMIT)?;
-                tx.execute("INSERT INTO music_accounts VALUES(?1,?2,'connected',1,0,?3,?4) ON CONFLICT(provider) DO UPDATE SET revision=excluded.revision,state=excluded.state,overridden=1,tombstone=0,secret_id=excluded.secret_id,secret_sha=excluded.secret_sha",params![p,old.3+1,id,digest(&bytes)]).map_err(|_|"storage_unavailable")?;
-                json!({"account":snapshot(&tx,p)?,"proofSHA":proof_sha,"accepted":true})
-            } else {
-                json!({"account":current,"proofSHA":proof_sha,"accepted":false,"code":"music_account_account_cannot_play"})
-            };
-            tx.execute(
-                "UPDATE music_account_attempts SET state=?2,receipt=?3 WHERE id=?1",
-                params![
-                    id,
-                    if valid { "connected" } else { "rejected" },
-                    encoded(&receipt)?
-                ],
-            )
-            .map_err(|_| "storage_unavailable")?;
-            tx.commit().map_err(|_| "storage_unavailable")?;
-            Ok(receipt)
         }
         "music_account_disconnect" | "music_account_apple_authorization" => {
             let host = text(v, "hostSessionID")?;
@@ -396,6 +305,112 @@ pub fn request(c: &mut Connection, root: &Path, method: &str, v: &Value) -> Resu
     }
 }
 
+/// The storage half of `music_account_connect`. It is an internal step, never an
+/// RPC method: the provider round-trip stays inside Rust, so a caller cannot
+/// attest its own validation result.
+fn begin_attempt(c: &mut Connection, root: &Path, p: &str, v: &Value) -> Result<Value> {
+    enter(c, root, p)?;
+    let host = text(v, "hostSessionID")?;
+    let request = text(v, "requestID")?;
+    let cookie = normalized_cookie(
+        p,
+        v["cookie"].as_str().ok_or("music_account_invalid_cookie")?,
+    )?;
+    let input_sha = digest(encoded(&json!({"providerID":p,"cookie":cookie}))?.as_bytes());
+    let old: Option<(String,String,String)>=c.query_row("SELECT id,input_sha,state FROM music_account_attempts WHERE host=?1 AND request=?2",params![host,request],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|_|"storage_unavailable")?;
+    if let Some((id, sha, state)) = old {
+        if sha != input_sha {
+            return Err("music_account_request_conflict");
+        }
+        if matches!(state.as_str(), "connected" | "rejected") {
+            let receipt: String = c
+                .query_row(
+                    "SELECT receipt FROM music_account_attempts WHERE id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "storage_unavailable")?;
+            let receipt: Value =
+                serde_json::from_str(&receipt).map_err(|_| "storage_unavailable")?;
+            return Ok(json!({"attemptID":id,"receipt":receipt}));
+        }
+        if state != "validating" {
+            return Err("music_account_attempt_not_replayable");
+        }
+        return Ok(json!({"attemptID":id,"plan":validation_plan(p,&cookie)}));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let secret = json!({"credential":{"cookieHeader":{"_0":cookie}}});
+    files::publish(&secret_path(root, &id)?, encoded(&secret)?.as_bytes())?;
+    let tx = c.transaction().map_err(|_| "storage_unavailable")?;
+    let view = snapshot(&tx, p)?;
+    tx.execute(
+        "INSERT INTO music_account_attempts VALUES(?1,?2,?3,?4,?5,?6,'validating',NULL)",
+        params![
+            id,
+            p,
+            host,
+            request,
+            input_sha,
+            view["revision"].as_i64().unwrap_or(0)
+        ],
+    )
+    .map_err(|_| "storage_unavailable")?;
+    tx.commit().map_err(|_| "storage_unavailable")?;
+    Ok(json!({"attemptID":id,"plan":validation_plan(p,&cookie)}))
+}
+
+/// The storage half of `music_account_connect`. It is an internal step, never an
+/// RPC method: the provider round-trip stays inside Rust, so a caller cannot
+/// attest its own validation result.
+fn finish_attempt(c: &mut Connection, root: &Path, p: &str, v: &Value) -> Result<Value> {
+    enter(c, root, p)?;
+    let id = text(v, "attemptID")?;
+    let host = text(v, "hostSessionID")?;
+    let request = text(v, "requestID")?;
+    let tx = c.transaction().map_err(|_| "storage_unavailable")?;
+    let old:(String,String,String,i64,String,Option<String>)=tx.query_row("SELECT provider,host,request,base_revision,state,receipt FROM music_account_attempts WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).map_err(|_|"music_account_unknown_attempt")?;
+    if old.0 != p || old.1 != host || old.2 != request {
+        return Err("music_account_attempt_identity");
+    }
+    let proof_sha = digest(encoded(&v["responses"])?.as_bytes());
+    if old.4 == "connected" || old.4 == "rejected" {
+        let receipt: Value =
+            serde_json::from_str(old.5.as_deref().ok_or("storage_unavailable")?)
+                .map_err(|_| "storage_unavailable")?;
+        if receipt["proofSHA"] != proof_sha {
+            return Err("music_account_receipt_conflict");
+        }
+        return Ok(receipt);
+    }
+    if old.4 != "validating" {
+        return Err("music_account_attempt_not_replayable");
+    }
+    let current = snapshot(&tx, p)?;
+    if current["revision"].as_i64() != Some(old.3) {
+        return Err("music_account_revision_conflict");
+    }
+    let valid = valid_response(p, &v["responses"])?;
+    let receipt = if valid {
+        let bytes = files::read(&secret_path(root, id)?, SECRET_LIMIT)?;
+        tx.execute("INSERT INTO music_accounts VALUES(?1,?2,'connected',1,0,?3,?4) ON CONFLICT(provider) DO UPDATE SET revision=excluded.revision,state=excluded.state,overridden=1,tombstone=0,secret_id=excluded.secret_id,secret_sha=excluded.secret_sha",params![p,old.3+1,id,digest(&bytes)]).map_err(|_|"storage_unavailable")?;
+        json!({"account":snapshot(&tx,p)?,"proofSHA":proof_sha,"accepted":true})
+    } else {
+        json!({"account":current,"proofSHA":proof_sha,"accepted":false,"code":"music_account_account_cannot_play"})
+    };
+    tx.execute(
+        "UPDATE music_account_attempts SET state=?2,receipt=?3 WHERE id=?1",
+        params![
+            id,
+            if valid { "connected" } else { "rejected" },
+            encoded(&receipt)?
+        ],
+    )
+    .map_err(|_| "storage_unavailable")?;
+    tx.commit().map_err(|_| "storage_unavailable")?;
+    Ok(receipt)
+}
+
 /// All account HTTP and credential publishing remain inside Rust. Swift supplies only a browser cookie.
 pub async fn connect(db: &crate::store::Database, input: Value) -> Result<Value> {
     let p = text(&input, "providerID")?.to_owned();
@@ -407,8 +422,9 @@ pub async fn connect(db: &crate::store::Database, input: Value) -> Result<Value>
     )?;
     let initial = input.clone();
     let root = db.root.clone();
+    let begin_provider = p.clone();
     let begin = db
-        .call(move |s| request(&mut s.connection, &root, "music_account_begin", &initial))
+        .call(move |s| begin_attempt(&mut s.connection, &root, &begin_provider, &initial))
         .await?;
     if let Some(receipt) = begin.get("receipt") {
         return Ok(receipt.clone());
@@ -426,9 +442,10 @@ pub async fn connect(db: &crate::store::Database, input: Value) -> Result<Value>
             return Err(code);
         }
     };
+    let finish_provider = p.clone();
     let finish = json!({"providerID":p,"hostSessionID":input["hostSessionID"],"requestID":input["requestID"],"attemptID":begin["attemptID"],"responses":responses});
     let root = db.root.clone();
-    db.call(move |s| request(&mut s.connection, &root, "music_account_finish", &finish))
+    db.call(move |s| finish_attempt(&mut s.connection, &root, &finish_provider, &finish))
         .await
 }
 
@@ -454,6 +471,16 @@ mod tests {
         fn call(&mut self, m: &str, v: Value) -> Result<Value> {
             request(&mut self.c, &self.root, m, &v)
         }
+        /// The two storage steps `connect` drives. They exercise the same code the
+        /// daemon runs, without pretending to be RPC methods.
+        fn begin(&mut self, v: Value) -> Result<Value> {
+            let p = text(&v, "providerID")?.to_owned();
+            begin_attempt(&mut self.c, &self.root, &p, &v)
+        }
+        fn finish(&mut self, v: Value) -> Result<Value> {
+            let p = text(&v, "providerID")?.to_owned();
+            finish_attempt(&mut self.c, &self.root, &p, &v)
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -470,11 +497,11 @@ mod tests {
     #[test]
     fn accepted_proof_and_disconnect_tombstone_are_sql_authority() {
         let mut f = Fixture::new();
-        let begin=f.call("music_account_begin",json!({"providerID":"netease","hostSessionID":"host","requestID":"r","cookie":"MUSIC_U=private-test"})).unwrap();
+        let begin=f.begin(json!({"providerID":"netease","hostSessionID":"host","requestID":"r","cookie":"MUSIC_U=private-test"})).unwrap();
         let finish = json!({"providerID":"netease","hostSessionID":"host","requestID":"r","attemptID":begin["attemptID"],"responses":[{"transport":"netease-legacy","httpStatus":200,"body":{"profile":{"userId":42}}}]});
-        let done = f.call("music_account_finish", finish.clone()).unwrap();
+        let done = f.finish(finish.clone()).unwrap();
         assert_eq!(done["account"]["state"], "connected");
-        assert_eq!(f.call("music_account_finish", finish).unwrap(), done);
+        assert_eq!(f.finish(finish).unwrap(), done);
         let dump: String =
             f.c.query_row("SELECT input_sha FROM music_account_attempts", [], |r| {
                 r.get(0)
@@ -497,33 +524,64 @@ mod tests {
     #[test]
     fn stale_attempt_and_restart_unknown_never_reconnect() {
         let mut f = Fixture::new();
-        let b=f.call("music_account_begin",json!({"providerID":"netease","hostSessionID":"h","requestID":"r","cookie":"MUSIC_U=secret"})).unwrap();
+        let b=f.begin(json!({"providerID":"netease","hostSessionID":"h","requestID":"r","cookie":"MUSIC_U=secret"})).unwrap();
         recover(&f.c).unwrap();
         let finish = json!({"providerID":"netease","hostSessionID":"h","requestID":"r","attemptID":b["attemptID"],"responses":[{"transport":"netease-legacy","httpStatus":200,"body":{"profile":{"userId":1}}}]});
         assert_eq!(
-            f.call("music_account_finish", finish),
+            f.finish(finish),
             Err("music_account_attempt_not_replayable")
         );
-        assert_eq!(f.call("music_account_begin",json!({"providerID":"netease","hostSessionID":"h","requestID":"r","cookie":"MUSIC_U=changed"})),Err("music_account_request_conflict"));
+        assert_eq!(f.begin(json!({"providerID":"netease","hostSessionID":"h","requestID":"r","cookie":"MUSIC_U=changed"})),Err("music_account_request_conflict"));
     }
     #[test]
     fn denied_and_wrong_provider_responses_do_not_persist_connection() {
         let mut f = Fixture::new();
-        let b=f.call("music_account_begin",json!({"providerID":"netease","hostSessionID":"h","requestID":"r","cookie":"MUSIC_U=secret"})).unwrap();
+        let b=f.begin(json!({"providerID":"netease","hostSessionID":"h","requestID":"r","cookie":"MUSIC_U=secret"})).unwrap();
         let mut proof = json!({"providerID":"netease","hostSessionID":"h","requestID":"r","attemptID":b["attemptID"],"responses":[{"transport":"qq-library","httpStatus":200,"body":{"data":{}}}]});
         assert_eq!(
-            f.call("music_account_finish", proof.clone()),
+            f.finish(proof.clone()),
             Err("music_account_response_identity")
         );
         proof["responses"] = json!([{"transport":"netease-legacy","httpStatus":403,"body":{"profile":{"userId":1}}}]);
         assert_eq!(
-            f.call("music_account_finish", proof).unwrap()["accepted"],
+            f.finish(proof).unwrap()["accepted"],
             false
         );
         assert_eq!(
-            f.call("music_account_read", json!({"providerID":"netease"}))
+            f.call("music_account_session_state", json!({"providerID":"netease"}))
                 .unwrap()["revision"],
             0
         );
+    }
+    /// `request` accepts exactly the method names `daemon.rs` routes, no more and
+    /// no less: the account view is `music_account_session_state`, and the two
+    /// storage steps `connect` drives are functions, not wire methods.
+    #[test]
+    fn request_accepts_exactly_the_routed_method_names() {
+        let mut f = Fixture::new();
+        for method in [
+            "music_account_read",
+            "music_account_begin",
+            "music_account_finish",
+        ] {
+            assert_eq!(
+                f.call(method, json!({"providerID":"netease"})),
+                Err("method_not_found"),
+                "{method} 不该是一个可调用的方法名"
+            );
+        }
+        for method in [
+            "music_account_session_state",
+            "music_account_session",
+            "music_account_import",
+            "music_account_disconnect",
+            "music_account_apple_authorization",
+        ] {
+            assert_ne!(
+                f.call(method, json!({"providerID":"netease"})),
+                Err("method_not_found"),
+                "{method} 必须是 request 接受的方法"
+            );
+        }
     }
 }

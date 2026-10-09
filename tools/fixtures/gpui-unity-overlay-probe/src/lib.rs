@@ -174,6 +174,8 @@ unsafe extern "C" {
     fn probe_native_unity_content_view()->*mut c_void;
     fn probe_native_geometry_revision()->u64;
     fn probe_native_backing_scale()->f64;
+    fn probe_native_host_size(width:*mut f32,height:*mut f32)->i32;
+    fn probe_native_sync_geometry()->i32;
     fn probe_native_owns_input()->i32;
     fn probe_native_wake_frames();
     fn probe_native_text_input_focused()->i32;
@@ -219,7 +221,56 @@ pub(crate) fn report_ui_hit_bounds(bounds:&[Bounds<Pixels>]) {
         b.origin.x.as_f32(),b.origin.y.as_f32(),
         b.size.width.as_f32(),b.size.height.as_f32(),
     ]).collect();
+    trace_hit_regions(&rects);
     unsafe {probe_native_set_hit_regions(rects.as_ptr(),bounds.len() as i32);}
+}
+
+pub(crate) fn input_diagnostics()->bool {
+    std::env::var("GMGN_GPUI_INPUT_DIAGNOSTICS").as_deref()==Ok("1")
+}
+pub(crate) fn trace_ms()->u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.as_millis()).unwrap_or(0)
+}
+
+/// The host window owns the viewport, but gpui only learns about a native
+/// resize through its platform callback: `set_frame_size` invokes
+/// `resize_callback`, which is an `AsyncWindowContext::update` and therefore
+/// goes through `try_borrow_mut`. When that borrow cannot be taken the update
+/// is dropped and only logged, so the window keeps its old `viewport_size`,
+/// its cached layer tiles stay keyed to the old size, and the floating shell
+/// is composited at the previous bottom-right corner of a now larger window.
+/// Re-assert the real host size from the host's per-frame command poll:
+/// change gated on both sides, so a steady frame compares two numbers and
+/// touches nothing.
+fn reconcile_host_geometry(window:&mut Window,cx:&mut App)->bool {
+    let native_changed=unsafe {probe_native_sync_geometry()}==1;
+    let (mut width,mut height)=(0f32,0f32);
+    if unsafe {probe_native_host_size(&mut width,&mut height)}!=1 {return native_changed;}
+    let host=size(px(width),px(height));
+    if window.viewport_size()==host {return native_changed;}
+    if input_diagnostics() {
+        let stale=window.viewport_size();
+        eprintln!("[GPUIOverlayTrace] ms={} event=hostViewportStale host={width}x{height} gpui={}x{} nativeChanged={native_changed}",
+            trace_ms(),f32::from(stale.width),f32::from(stale.height));
+    }
+    window.bounds_changed(cx);
+    window.refresh();
+    true
+}
+
+/// Read-only hit-region tracing for `GMGN_GPUI_INPUT_DIAGNOSTICS=1`, change
+/// gated so a steady frame prints nothing. It shows what the overlay actually
+/// claims to own, which is the same list the native hit test uses.
+fn trace_hit_regions(rects:&[f32]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    if std::env::var("GMGN_GPUI_INPUT_DIAGNOSTICS").as_deref()!=Ok("1") {return;}
+    let mut key=rects.len() as u64;
+    for value in rects {key=key.rotate_left(5)^(value.to_bits() as u64);}
+    if LAST.swap(key,Ordering::Relaxed)==key {return;}
+    let ms=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.as_millis()).unwrap_or(0);
+    let first:Vec<String>=rects.chunks(4).take(6).map(|r|format!("({:.0},{:.0},{:.0}x{:.0})",r[0],r[1],r[2],r[3])).collect();
+    eprintln!("[GPUIOverlayTrace] ms={ms} event=hitRegions count={} {}",rects.len()/4,first.join(" "));
 }
 
 pub(crate) fn select_media_section(section:&str,cx:&mut App) {
@@ -389,11 +440,24 @@ fn refresh_shell(cx:&mut App) {
 fn open_settings_window(cx:&mut App) {
     let existing=SETTINGS_WINDOW.with(|v|*v.borrow());
     if let Some(handle)=existing {
+        // `settings.open.presence` on an already-open window: focus it and land
+        // on 角色管理 through the pane's own `select_page` (the navigation the
+        // original `openPresenceSettings()` performs).
+        if settings_ui::take_pending_presence_page() {
+            let settings=SETTINGS.with(|v|v.borrow().clone());
+            if let Some(settings)=settings {
+                let _=handle.update(cx,|_,window,cx| {
+                    settings.update(cx,|view,cx| {view.select_presence_page(window,cx);});
+                    window.activate_window();
+                });
+            }
+        }
         if handle.update(cx,|_,window,_|window.activate_window()).is_ok() {return;}
         SETTINGS_WINDOW.with(|v|v.borrow_mut().take());
     }
     let commands=COMMANDS.with(Clone::clone);
     let snapshot=SNAPSHOT.with(|v|v.borrow().clone());
+    let presence_page=settings_ui::take_pending_presence_page();
     let result=cx.open_window(WindowOptions {
         window_bounds:Some(WindowBounds::Windowed(Bounds::centered(None,size(px(860.),px(700.)),cx))),
         window_min_size:Some(size(px(760.),px(540.))),
@@ -401,7 +465,10 @@ fn open_settings_window(cx:&mut App) {
         show:true,focus:true,..Default::default()
     },|window,cx| {
         let settings=cx.new(|cx|SettingsPane::new(window,cx,commands));
-        settings.update(cx,|view,cx|view.update_snapshot(&snapshot,window,cx));
+        settings.update(cx,|view,cx| {
+            view.update_snapshot(&snapshot,window,cx);
+            if presence_page {view.select_presence_page(window,cx);}
+        });
         SETTINGS.with(|v|*v.borrow_mut()=Some(settings.clone()));
         window.on_window_should_close(cx,|window,cx| {
             let snapshot=SNAPSHOT.with(|v|v.borrow().clone());
@@ -438,7 +505,20 @@ fn visual_projection(value:&Value)->Value {
     result
 }
 pub(crate) fn settings_projection(envelope:&Value)->Value {
-    json!({"settings":envelope["settings"],"stage":envelope["stage"],"supportedCommands":envelope["supportedCommands"]})
+    // Everything the overlay's settings adapter reads besides the settings
+    // dictionary: `stage` (the stage surface the StagePanelsPane renders),
+    // `characterPosition` (the CAS revisions + pose `presence.position` needs),
+    // `spaceLibrary` (the world package ids `stage.world.enter` must name),
+    // `presence.motions` (the motion ids `stage.motion.activate` must name) and
+    // the whitelist the panes gate their controls on. A focused copy, not the
+    // whole envelope: this value is compared on every poll.
+    let presence = &envelope["settings"]["presence"];
+    json!({"settings":envelope["settings"],"stage":envelope["stage"],
+        "characterPosition":envelope["settings"]["characterPosition"],
+        "spaceLibrary":envelope["settings"]["spaceLibrary"],
+        "presence":{"motions":presence["motions"],"activeMotionID":presence["activeMotionID"],
+            "working":presence["working"],"notice":presence["notice"],"hasError":presence["hasError"]},
+        "supportedCommands":envelope["supportedCommands"]})
 }
 
 fn translate_command(command:ChatCommand,snapshot:&Value)->Option<Value> {
@@ -551,7 +631,9 @@ pub unsafe extern "C" fn gmgn_gpui_chat_snapshot(bytes:*const u8,len:usize)->i32
             let handle=SETTINGS_WINDOW.with(|v|*v.borrow());
             let settings=SETTINGS.with(|v|v.borrow().clone());
             if let (Some(handle),Some(settings))=(handle,settings) {
-                app.update(|cx| {let _=handle.update(cx,|_,window,cx|settings.update(cx,|view,cx|view.update_snapshot(&value,window,cx)));});
+                app.update(|cx| {let _=handle.update(cx,|_,window,cx|settings.update(cx,|view,cx| {
+                    if view.update_snapshot(&value,window,cx) {view.select_presence_page(window,cx);}
+                }));});
             }
         }
     });
@@ -588,7 +670,10 @@ pub unsafe extern "C" fn gmgn_gpui_chat_take_command(out:*mut u8,capacity:usize)
     });
     APPLICATION.with(|app|DONOR.with(|donor| {
         if let (Some(app),Some(donor))=(app.borrow().as_ref(),*donor.borrow()) {
-            app.update(|cx| {let _=donor.update(cx,|_,window,cx|report_kit_text_input(window,cx));});
+            app.update(|cx| {let _=donor.update(cx,|_,window,cx| {
+                if reconcile_host_geometry(window,cx) {unsafe {probe_native_wake_frames();}}
+                report_kit_text_input(window,cx);
+            });});
         }
     }));
     // These requests are local GPUI navigation, never unsupported host tools.
@@ -735,6 +820,41 @@ mod chat_transport_tests {
         // Real external drops use the measured native NSDragging destination.
         // Paths alone never constitute a user-drag authorization.
         assert!(translate_command(ChatCommand::ImportAttachments{paths:vec!["/arbitrary".into()]},&Value::Null).is_none());
+    }
+    #[test]
+    fn host_viewport_is_reasserted_from_the_poll_and_stays_change_gated() {
+        // Real defect: after a fullscreen toggle the native viewport was
+        // already 2048×1152 while gpui's window still reported 720×450, so the
+        // floating shell stayed at the old bottom-right corner. The native
+        // resize notification alone is not enough, so the host poll has to
+        // re-assert the size into gpui's window state — and only on a change.
+        let host=include_str!("../host/OverlayHost.m");
+        let sync=host.split("int32_t probe_native_sync_geometry(void) {").nth(1)
+            .expect("host viewport sync entry point");
+        let sync=sync.split("\nint32_t probe_native_set_panel_expanded").next().unwrap();
+        for applied in ["container.frame.size","donorWindow.contentView.frame.size","mountedView.frame.size"] {
+            assert!(sync.contains(&format!("NSEqualSizes(host, {applied})")),
+                "sync must leave every applied view alone when it already matches ({applied})");
+        }
+        assert_eq!(sync.matches("updateGeometry();").count(),1,
+            "sync must resize only when something actually differs");
+
+        let lib=include_str!("lib.rs");
+        // Cut the test module off: this test's own source must never satisfy it.
+        let code=lib.split("\n#[cfg(test)]").next().expect("library source before tests");
+        let reconcile=code.split("fn reconcile_host_geometry(").nth(1)
+            .expect("viewport reconcile");
+        let reconcile=reconcile.split("\npub(crate) fn select_media_section").next().unwrap();
+        assert!(reconcile.contains("if window.viewport_size()==host {return native_changed;}"),
+            "a steady viewport must not be pushed again");
+        assert!(reconcile.contains("window.bounds_changed(cx);"),
+            "gpui's cached viewport must be updated from the real host size");
+        assert!(reconcile.contains("window.refresh();"),
+            "the window must be marked dirty so the shell re-lays out");
+        let poll=code.split("pub unsafe extern \"C\" fn gmgn_gpui_chat_take_command").nth(1)
+            .expect("per frame host poll");
+        assert!(poll.contains("if reconcile_host_geometry(window,cx) {unsafe {probe_native_wake_frames();}}"),
+            "the host poll must reconcile the viewport every frame it is called");
     }
     #[test]
     fn platform_never_delegates_application_credentials_to_keychain() {

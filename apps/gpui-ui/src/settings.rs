@@ -2236,11 +2236,13 @@ impl AgentSettingsPane {
         let prop_checking = self.snapshot["space"]["propChecking"].as_bool() == Some(true);
         let prop_save_supported = self.op_supported("space.prop.save");
         let prop_check_supported = self.op_supported("space.prop.check");
-        // `space.prop.save` / `space.prop.check` / `space.prop.cancel` are only
-        // handled by the product host (`ProductSettingsParity.swift`); in the
-        // Unity settings window the whitelist refuses them, so the credential
-        // form and its two buttons are not drawn there instead of being drawn
-        // and answered with 「当前运行时不支持此操作」.
+        // The product host (`ProductSettingsParity.swift`) is the only owner of
+        // `space.prop.save` / `space.prop.check` in this branch. When the
+        // whitelist does not carry them, the form and its two buttons are not
+        // drawn instead of being drawn and answered with
+        // 「当前运行时不支持此操作」. (The Unity window renders the same two
+        // inputs through `generation.*` above, and the overlay translates
+        // `space.prop.*` onto it if a host ever publishes those names instead.)
         if !prop_save_supported && !prop_check_supported {
             return SettingsSection::new(settings_copy(locale, "许愿机")).child(ui::muted(
                 settings_copy(locale, "当前运行时不提供许愿机配置。"),

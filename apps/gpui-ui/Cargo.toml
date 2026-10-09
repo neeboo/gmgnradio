@@ -20,3 +20,18 @@ gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f4
 [[test]]
 name = "ui_shots"
 harness = false
+
+# The same treatment for 「我的物件」: the reworked ResidentPropEditorPane is
+# rendered — the merged list with the world's own devices, and the device
+# selection — so the panel can be looked at even when no lab app can be launched.
+[[test]]
+name = "props_pane_shot"
+harness = false
+
+# The transport bar's 音量 popover: the bar's real prepared-layout rect and the
+# pixels the open popover actually paints. GPUI's macOS platform must be created
+# on the main thread, so this is a `harness = false` binary test too.
+[[test]]
+name = "transport_popover_geometry"
+harness = false
+

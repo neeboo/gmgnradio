@@ -117,24 +117,66 @@ Unity Player
 
 ## 5. 未完成与需要决定的事
 
-### 5.1 12 条白名单 op：能力不在 Unity 主机链里（**需要产品决定**）
+### 5.1 12 项舞台设置能力：已接入（附生产入口），**真机读回仍未验**
 
-它们的权威只写在 `apps/macos/Sources/**` + `ProductHost`，Unity 主机链没有分支；本轮硬约束禁止改 `Sources/**`，所以统一处置为"**界面上不提供**"（不是死按钮）：
+上一版这里写的是"界面上不提供"——靠 `supported_ops` 把这些控件藏起来。用户与 Codex 复核都否决了这个收尾。现在这 12 项**都接在既有生产 authority 上**：overlay 适配层（`tools/fixtures/gpui-unity-overlay-probe/src/settings_ui.rs`）把 UI op 翻译成真实生产入口，宿主只加**必要的最小分发**。没有第二套世界/账号/播放上下文。
 
-| op | 用户看到的东西 |
-|---|---|
-| `stage.world.enter` | 舞台设置→世界选择菜单的"进入世界" |
-| `stage.scene.activate` | "激活/切换场景" |
-| `stage.avatar.position` | 角色位置 X/Y/Z 三个滑块 |
-| `stage.avatar.reset` | 角色位置"重置" |
-| `stage.motion.refresh` | 动作列表"刷新" |
-| `stage.motion.activate` | 让角色播放某个动作 |
-| `stage.activity.run` / `.stop` | 活动的开始/停止 |
-| `settings.open.presence` | 设置里「管理角色与动作…」 |
-| `space.prop.save` / `.check` | 许愿机凭据保存 / 检测连接 |
-| `space.prop.cancel` | 取消许愿机配置（Unity 模式本就不发） |
+翻译规则集中在 `translate_settings_command`（`settings_ui.rs`），发布的 op 面是 `settings_supported_ops`（宿主 `settings.supportedCommands` + `STAGE_OPS`），两处同源，所以"宿主声明支持 ↔ 控件出现 ↔ 命令真被处理"是同一条链。
 
-**建议的下一步不是直接移植**：先查这 12 个能力在 **Unity 运行时里的原生入口**（有些能力本来就是 Unity 播放器自己处理的，例如 `stage.camera.reset` 就不走 op）。有原生入口 → 在 overlay 里接到 Unity 原生命令即可，不必动 `Sources/**`；确实没有 → 再决定移植（需要用户授权改 `Sources/**`）还是接受它在 Unity 包里不提供。
+| op（UI 发出） | overlay 翻译到 | 生产入口（真正的处理者） | 是否需要宿主加分支 |
+|---|---|---|---|
+| `stage.world.enter` | 同名 | `UnityMediaHost.enterWorld` → `space.library.select` 事务（`UnitySpaceLibraryBridge.settingsCommand`）→ `completeWorldSelection` 装载世界 | **是**（UnityHost 新增 `case`，因为 `space.library.select` 只接受"世界包 ID"，UI 的菜单 op 需要落到同一事务） |
+| `stage.scene.activate` | 同名 | `UnityMediaHost.activateScene` → `setSpatialEnvironment(scene:)` → `marbleWorlds.activatePreset`（`UnityMarbleWorldBridge:100`） | **是**（同上，复用音乐/居民收音机路径已有的 preset 激活） |
+| `stage.avatar.position` | `presence.position` | `UnityCharacterPositionBridge.command`（世界/两版 CAS 修订 + 全坐标 + requestID） | 否（overlay 补全字段） |
+| `stage.avatar.reset` | `presence.position.reset` | 同一个 bridge 的出生点重置 | 否 |
+| `stage.motion.refresh` | `presence.load` | `UnityPresenceSettingsBridge.command` `case "presence.load"` | 否 |
+| `stage.motion.activate` | `presence.motion` | `UnityMediaHost.settingsCommand` `case "presence.motion"` → `presenceSettings.command`（先 `prepareManualMotionSelection`） | 否 |
+| `stage.activity.run` | 同名 | `UnityMediaHost.runActivity` → `context.startActivityMeasured(id:)`（`WorldAgentContext:1203`） | **是** |
+| `stage.activity.stop` | 同名 | `UnityMediaHost.stopActivity` → `context.stopActivity(reason:)`（`WorldAgentContext:1261`） | **是** |
+| `settings.open.presence` | 本地导航（不上线） | `lib.rs::open_settings_window` + `SettingsPane::select_presence_page` → `AgentSettingsPane::select_page("presence")` → `presence.load` | 否（界面导航不是 op） |
+| `space.prop.save` | `generation.save` | `UnityGenerationConfigurationBridge.settingsCommand` `case "generation.save"`（`endpoint` + `token`） | 否（overlay 把 `apiKey` 映射成 `token`） |
+| `space.prop.check` | `generation.check` | 同一个 bridge 的 `check()`（健康探测，读已保存配置） | 否 |
+| `space.prop.cancel` | **本地编辑取消** | 无 host op：只丢弃本地草稿/在途检测状态，**不触碰已保存凭据** | 否 |
+
+**需要在 UnityHost 加分支的只有 4 条**，理由都是"UI 的 op 名与生产入口不是同一条命令，而 UI 侧不能直接点名生产 op"：
+
+- `stage.world.enter` / `stage.scene.activate`：真正的入口是"选世界包 + 等渲染回执"的两段事务（`space.library.select` → `worldSelection.phase == "activate"`）与 `marbleWorlds.activatePreset`。这两个都不是 `ui.settings.command` 能表达的单一 envelope，所以加**最小分发**，内部只调用既有事务与既有 preset 激活；等待逻辑抽成 `awaitWorldActivation`（与 `setSpatialEnvironment` 原来的内联循环同一份语义，超时/失败仍按原样报错，不假成功）。
+- `stage.activity.run` / `stage.activity.stop`：唯一生产入口是 `context.startActivityMeasured` / `context.stopActivity`，之前只被点唱机与"从设置选动作"调用。新增 `availableActivityItems` / `canRunActivity`（`UnityWorldSessionComposition`）用**和菜单路径同一条** `ResidentPerformanceMotionPolicy.isAvailable` 过滤，保证"列表里能点的"与"`startActivityMeasured` 真能跑的"是同一集合；`stop` 在确实没有活动运行时返回 `false`（→ `settings_command_rejected`），不伪装成功。
+
+顺手补掉的同类缺口（同一条 "隐藏 → 可用" 线，不是新能力）：
+
+- `UnityScreenVideoBridge.supportedCommands` 原来漏了它自己已经在处理的 `stage.video.import` / `stage.video.mode` / `stage.video.toggle` ⇒ 设置窗的"导入 MP4 / MV 场景 / 关闭"永远被白名单挡下。已补进列表；`stage.video.mode` 的 UI 发的是 `id`，在 `stage.video.*` → `video.*` 的既有改写处补 `value`（同一字段的两种拼写，落在同一个 owner）。
+
+**门禁覆盖缺口（本轮查出的既有问题，未修）**：`apps/gpui-ui/tests/interface_parity.rs` 的 `production_source` 在文件**第一个** `#[cfg(test)] mod` 处截断，而 `stage_panels.rs:358` 就有一个（`video_menu_tests`）。于是 `stage_panels.rs` 第 439 行之后的全部发出点都不在这条门禁的 `live` 集合里——`OPS` 表里也从来没有 `stage.avatar.*` / `stage.motion.*` / `stage.activity.*` / `settings.open.presence` 这 12 个 op（我在它报告的 `live` 集合里逐条确认过）。也就是说：**这 12 条 op 的字段面从来没有被这条门禁看过**，`op_field_sets_match_the_source_and_are_read` 的"双向相等"对它们是假的。本轮没有改门禁（会牵动既有 73 条登记与协作者文件），改为在 overlay 侧写**能失败**的单测（`settings_ui.rs` 的 `settings_translation_tests`，13 条）与 `apps/gpui-ui` 侧 2 条新门禁测试覆盖这 12 条。把 `production_source` 改成"扫到 `mod tests` 为止"而不是"第一个 `#[cfg(test)]`"是后续该做的收口。
+
+**"隐藏 → 可用"的具体改动**：
+
+- `settings_ui.rs`：新增 `STAGE_OPS`（12 条）+ `settings_supported_ops`，把宿主 `supportedCommands` 与这 12 条合并后同时喂给 `AgentSettingsPane` / `StagePanelsPane` 与 `dispatch` 白名单。UI 的 `supported_button` / `tab_ops` / `choose_available_tab` / `op_supported` 因此对它们**重新放行**（原来被藏起来）。
+- `stage_panels.rs`：把 4 处"没有 Unity host handler / 界面上不提供"的注释改成真实接线说明（世界菜单、角色 XYZ、动作、活动、管理角色与动作）；判断逻辑本身没改为隐藏，仍是 `op_supported` 门控。
+- `UnityMediaHost.settingsSnapshot`：`settings.stage` 从"只有 `mode`/`player`"扩成完整舞台面（`presentation`/`space`/`activities`/`player`/`motions`），控件读到的键不再恒为 null。
+- 证据：`apps/gpui-ui` 新增 `published_stage_ops_unhide_the_twelve_capabilities_and_their_partitions` 与 `manage_assets_button_is_gated_only_on_its_published_op`；反向验证——把 `supported_ops` 合并拿掉（`settings_supported_ops` 只回宿主列表）⇒ overlay **9 条**测试红；把 `op_supported` 改成恒 `false` ⇒ UI **2 条**测试红；还原后 sha256 一致（见 §9 证据）。
+
+**仍未验的部分（诚实边界）**：
+
+- 这 12 条只有**适配层单测 + 门禁**（overlay 13 条新测试、`apps/gpui-ui` 2 条新门禁测试），**没有一条在真机上点过**。真机点一次要重构建/装机（见 §5.3），本轮硬约束禁止。
+- `stage.activity.run` 的"能不能跑"依赖 `ResidentPerformanceMotionPolicy`，而该策略只认已安装的 `ardy-backflip` / `jumping-jacks-pmx` 两个动作（pmx）。未安装时列表为空 ⇒ 面板显示"这个空间还没有配置生活活动。""，这是真实状态而非隐藏。
+- `stage.scene.activate` 需要世界已可见（`spatialPresentation.confirmVisible()`），隐藏世界时 overlay 直接给具名拒绝 `scene_requires_visible_world`。
+- 快照契约仍是**单一写入者**：`settings.stage` 由 `UnityMediaHost.stageSnapshot` 写，overlay 只投影不改写；UI 读的键见下表。
+
+**快照新增投影清单（组件读的键 → 由谁写 → 新增/已有）**：
+
+| 组件读的键 | 由谁写 | 新增/已有 |
+|---|---|---|
+| `settings.stage.space.position.X/Y/Z` | `UnityMediaHost.stageSnapshot`（源：`characterPosition.snapshot()["position"]`） | **新增** |
+| `settings.stage.space.isVisible` / `isRequested` / `selectedWorldID` | 同上（源：`worldSession` + `worldSelection` + `spaceLibrary.savedSelectionID`） | **新增** |
+| `settings.stage.space.worlds` / `presets` / `worldLabel` | 同上（源：`spaceLibrary.snapshot["worlds"|"marblePresets"]`） | **新增** |
+| `settings.stage.activities.items` / `canRun` / `activeID` / `phase` | 同上（源：`UnityWorldSessionComposition.availableActivityItems` + `activity.snapshot()`） | **新增** |
+| `settings.stage.motions.avatarName/categories/items/activeID/isWorking/notice/message/hasError` | 同上（源：`presenceSettings.snapshot`，形状与 `ProductHost.swift:165-172` 一致） | **新增** |
+| `settings.stage.mode` / `stageRadioPluginEnabled` / `player.*` | 同上 | 已有（`player.*` 在 `stageSnapshot` 里） |
+| `settings.characterPosition.*` | `UnityCharacterPositionBridge.snapshot` | 已有（overlay 现在通过 `settings_projection` 读它） |
+| `settings.spaceLibrary.*` | `UnitySpaceLibraryBridge.snapshot` | 已有 |
+| `settings.generation.*` | `UnityGenerationConfigurationBridge.snapshot` | 已有 |
+| `settings.presence.motions` | `UnityPresenceSettingsBridge.snapshot` | 已有 |
 
 ### 5.2 真机读回（139 条）
 
@@ -210,4 +252,5 @@ python3 tools/audit-ui-function-inventory.py
 
 - **UI 层本身**：七个面已按原版重写并共用一层地基，接入 Unity 嵌入层；控件图标化；四道机械门禁（图标化 / 接口对齐 / op 覆盖 / 渲染回归）都在仓库里且各自能失败。
 - **后端根因**：聊天 `error 3`（工具注册被拒）、音乐账号 6 方法、许愿机配置 3 方法、26 个未发布错误码、Windows 可编译——都已修，**但要重建 helper 并重新装机才生效**。
-- **尚未证明的**：157 条里有 **0 条**经过真机业务读回；这是当前最大的缺口，也是"功能要调通"这句话的真正验收线。未接的 12 条（§5.1）需要产品决定，建议先查 Unity 原生入口再定。
+- **尚未证明的**：157 条里有 **0 条**经过真机业务读回；这是当前最大的缺口，也是"功能要调通"这句话的真正验收线。
+- **§5.1 的 12 项**：**已接入**既有生产入口（overlay 翻译 + 4 条 UnityHost 最小分发 + `settings.stage` 快照投影），不再靠隐藏控件收尾；但同样**没有真机点过**，且 `interface_parity` 的 `production_source` 截断使这 12 条从未被那条门禁覆盖（见 §5.1「门禁覆盖缺口」）。

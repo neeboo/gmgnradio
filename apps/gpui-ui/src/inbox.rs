@@ -20,12 +20,13 @@
 //!   no colour or size literal.
 //!
 //! The original hard constraints are kept: a standalone 720×460 window, a 300 pt
-//! list, detail + “打开” on the right, a single click that only selects and
-//! shows the detail, and an explicit open as the only thing that reduces unread.
+//! list, the detail on the right, a single click that only selects and shows the
+//! detail, and an explicit open as the only thing that reduces unread. The
+//! original's explicit open control in the footer was dropped deliberately, so
+//! the open gestures that remain are the row double-click and Return.
 //! Long titles wrap (the row grows instead of truncating) and the list scrolls.
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui_kit::component::button::*;
 use gpui_kit::component::empty::{Empty, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::list::ListItem;
@@ -85,8 +86,8 @@ pub fn can_open(row: &Value) -> bool {
 }
 
 /// What a row gesture does. A single click only selects and shows the detail; a
-/// message becomes read solely through an explicit open — double-click, the
-/// open button, or Return (`:83-87`, `:126`, `:147`, `:209-212`).
+/// message becomes read solely through an explicit open — double-click or
+/// Return (`:83-87`, `:126`, `:147`, `:209-212`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowActivation {
     Select,
@@ -409,8 +410,10 @@ impl InboxPane {
         list.vertical_scrollbar(&self.scroll).into_any_element()
     }
 
-    /// The right column: empty state, placeholder, read-only detail and the
-    /// explicit open control (`ResidentSystemInboxUI.swift:155-178,203-212`).
+    /// The right column: empty state, placeholder and the read-only detail
+    /// (`ResidentSystemInboxUI.swift:155-178,203-212`). The original's explicit
+    /// open control is deliberately gone; only double-click and Return open a
+    /// message, and both still queue the same `inbox.open` command.
     fn detail_column(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let detail_text = self.state.detail_text();
         let detail_key = format!(
@@ -436,7 +439,6 @@ impl InboxPane {
 
         let has_rows = !self.state.rows().is_empty();
         let selected = self.state.selected_row().is_some();
-        let openable = self.state.selected_row().is_some_and(can_open);
         let persistence_error = self.state.snapshot["persistenceError"]
             .as_str()
             .filter(|error| !error.is_empty())
@@ -471,7 +473,7 @@ impl InboxPane {
         }
         if !selected {
             column = column.child(
-                ui::muted("选择一条消息查看完整内容；双击或按“打开”标记为已读")
+                ui::muted("选择一条消息查看完整内容；双击或按 Return 标记为已读")
                     .text_size(px(m::PLACEHOLDER_SIZE))
                     .text_color(rgba(m::PLACEHOLDER_TEXT)),
             );
@@ -495,23 +497,6 @@ impl InboxPane {
                         .aria_label("消息详情")
                         .accessibility_id("resident.system-inbox.detail-text"),
                 ),
-        );
-        column = column.child(
-            // Icon-only, like every control in this layer: the words are the
-            // tooltip and the accessibility label, never the button's face.
-            Button::new("resident.system-inbox.open")
-                .primary()
-                .small()
-                .icon(gpui_kit::assets::IconName::ExternalLink)
-                .accessibility_id("resident.system-inbox.open")
-                .tooltip("打开选中的系统消息并标记为已读")
-                .accessibility_label("打开选中的系统消息")
-                .disabled(!openable)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.state.open();
-                    window.focus(&this.focus, cx);
-                    cx.notify();
-                })),
         );
         if let Some(error) = persistence_error {
             column = column.child(ui::notice(error));
@@ -900,6 +885,111 @@ mod tests {
             });
             window.refresh();
             window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    /// The footer's explicit open button was dropped from the pane on purpose.
+    /// Every needle is assembled with `concat!` so this test's own source cannot
+    /// satisfy it: putting the button back into `inbox.rs` turns this red.
+    #[test]
+    fn the_open_button_is_gone_from_the_pane_source() {
+        const SOURCE: &str = include_str!("inbox.rs");
+        for needle in [
+            concat!("resident.system-inbox", ".open"),
+            concat!("打开选中的系统消息", "并标记为已读"),
+            concat!("按“打开”", "标记为已读"),
+            concat!("IconName::", "ExternalLink"),
+        ] {
+            assert!(
+                !SOURCE.contains(needle),
+                "the removed open button must not come back; inbox.rs still contains {needle:?}"
+            );
+        }
+        assert!(
+            SOURCE.contains(concat!("双击或按 Return", " 标记为已读")),
+            "the placeholder must point at the gestures that remain"
+        );
+        assert!(
+            SOURCE.contains(concat!(
+                "KeyBinding::new(\"enter\", OpenSelected",
+                ", Some(\"ResidentInbox\"))"
+            )),
+            "Return must stay bound to OpenSelected"
+        );
+    }
+
+    /// The two gestures that remain must still open a message on a real painted
+    /// panel: a row double-click and Return each queue exactly one `inbox.open`
+    /// carrying the displayed event id, while a single click still only selects.
+    /// The removed footer button must also be absent from the rendered tree, so
+    /// painting it again fails here instead of passing silently.
+    #[test]
+    fn only_the_row_double_click_and_return_open_and_the_button_is_not_painted() {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let entity = stored.clone();
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(InboxPane::new);
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        let pane = stored.borrow().clone().expect("pane entity");
+        let expected =
+            json!({"op":"inbox.open","id":"one","scope":"world-a","expectedEventID":"event-one"});
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| {
+                pane.update_snapshot(
+                    json!({"scope":"world-a","entries":[
+                        {"id":"one","eventID":"event-one","isRead":false,
+                         "title":"生成完成","status":"已完成","relativeTimeText":"刚刚",
+                         "updatedAtText":"2026年10月4日 1:23","detail":"已完成 3/3"}
+                    ]}),
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(
+                window.try_find("one").is_some(),
+                "the row must be observable, otherwise the checks below are vacuous"
+            );
+            assert!(
+                window
+                    .try_find(["resident.system-inbox", ".open"].concat())
+                    .is_none(),
+                "the footer open button must not be painted any more"
+            );
+            // A single click only selects and shows the detail.
+            window.click("one", cx);
+            pane.update(cx, |pane, _| {
+                assert!(
+                    pane.take_commands().is_empty(),
+                    "a single click must not acknowledge the delivery"
+                );
+                assert_eq!(pane.state.selected.as_deref(), Some("one"));
+            });
+            // The double-click is the remaining pointer gesture and opens once.
+            window.double_click("one", cx);
+            pane.update(cx, |pane, _| {
+                assert_eq!(
+                    pane.take_commands(),
+                    vec![expected.clone()],
+                    "double-clicking the row must still queue exactly one inbox.open"
+                );
+            });
+            // Return is the remaining keyboard gesture and opens once.
+            window.press("enter", cx);
+            pane.update(cx, |pane, _| {
+                assert_eq!(
+                    pane.take_commands(),
+                    vec![expected.clone()],
+                    "Return on the selected row must still queue exactly one inbox.open"
+                );
+            });
         })
         .unwrap();
     }

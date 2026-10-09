@@ -769,10 +769,13 @@ impl StagePanelsPane {
 
     /// `worldSelectionGroup`: the public-world / generated-scene menu, with the
     /// selected world check-marked inside its section. A section is drawn only
-    /// when its op is in the host whitelist: 公开空间 (`stage.world.enter`) and
-    /// 生成场景 (`stage.scene.activate`) have no Unity host handler
-    /// (`settings_ui.rs` would refuse them), and a menu whose only actions are
-    /// refused is not a menu.
+    /// when its op is in the host whitelist. In the Unity settings window the
+    /// overlay publishes `stage.world.enter` / `stage.scene.activate` and
+    /// translates them itself: 进入世界 onto the `space.library.select`
+    /// transaction with a real package id, 激活/切换场景 onto the existing
+    /// `marbleWorlds.activatePreset` path (`gpui-unity-overlay-probe/src/settings_ui.rs`
+    /// `STAGE_OPS` / `translate_settings_command`). An id the host cannot
+    /// resolve is refused with a named code, never accepted locally.
     fn world_selection(&self, locale: UiLocale, cx: &mut Context<Self>) -> AnyElement {
         let catalog = self.snapshot["space"].clone();
         let label = catalog["worldLabel"]
@@ -853,9 +856,12 @@ impl StagePanelsPane {
                     .text_color(rgba(s::TEXT)),
             );
         let mut axes = v_flex().w_full().gap(px(metrics::AXIS_STACK_GAP));
-        // `stage.avatar.position` has no Unity host handler
-        // (`settings_ui.rs` refuses it), so the three axis sliders are not
-        // drawn there at all. The 镜头复位 button below stays: `stage.camera.reset`
+        // Each slider emits one changed axis; the Unity overlay completes the
+        // coordinate from the host's own `characterPosition` projection and
+        // sends the whole position together with `worldID`, both CAS revisions
+        // and a fresh `requestID` (`presence.position`,
+        // `UnityCharacterPositionBridge.command`), so this stays a real
+        // authority movement rather than a local pose. The 镜头复位 button below
         // is served by the Unity player itself (`GPUIChat2Probe.cs`).
         if self.op_supported("stage.avatar.position") {
             for (i, label) in ["X", "Y", "Z"].into_iter().enumerate() {
@@ -1022,9 +1028,12 @@ impl StagePanelsPane {
                 })),
         );
         let saving = motions["isWorking"].as_bool() == Some(true);
-        // `stage.motion.activate` has no Unity host handler; the whole motion
-        // list would be a wall of refused rows, so it is not drawn there.
-        // `stage.motion.refresh` (the header button) is gated separately.
+        // 刷新 → `presence.load`, 每个动作 → `presence.motion` (the same two
+        // production entries `ProductHost.swift:284-290` uses). The Unity
+        // overlay publishes both ops and translates them
+        // (`gpui-unity-overlay-probe/src/settings_ui.rs` `STAGE_OPS`), so rows
+        // are drawn whenever the host advertises them and a refusal is a real
+        // named failure instead of a missing control.
         if !self.op_supported("stage.motion.activate") {
             return group
                 .child(ui::muted(settings_copy(
@@ -1111,9 +1120,13 @@ impl StagePanelsPane {
             });
         }
         group
-            // `settings.open.presence` is registered only by the product host
-            // (`ProductHost.swift`); the Unity settings window would refuse it,
-            // so the button is not drawn there.
+            // 管理角色与动作… — the original's `onManageAssets` →
+            // `openPresenceSettings()`. In the Unity settings window the
+            // overlay translates it locally onto the real 设置 window's 角色管理
+            // page (`gpui-unity-overlay-probe/src/lib.rs::open_settings_window`
+            // + `SettingsPane::select_presence_page`), which issues the same
+            // `presence.load` the page needs; the product host handles the very
+            // same op (`ProductHost.swift:298`).
             .child(self.supported_button(
                 "manage-motion-assets",
                 "管理角色与动作…",
@@ -1145,9 +1158,12 @@ impl StagePanelsPane {
             )));
         let is_visible = self.snapshot["space"]["isVisible"].as_bool() == Some(true);
         let is_requested = self.snapshot["space"]["isRequested"].as_bool() == Some(true);
-        // Neither `stage.activity.run` nor `stage.activity.stop` has a Unity
-        // host handler (`settings_ui.rs` refuses both), so the activity list
-        // and its stop control are not drawn there.
+        // 开始 → `startActivityMeasured`, 停止 → `stopActivity` (the same calls
+        // `GMGNRadioApp.runLivingWorldActivity` / `stopLivingWorldActivity`
+        // make). The Unity overlay publishes both ops and dispatches them onto
+        // the world session's own activity owner
+        // (`UnityMediaHost.settingsCommand`), so the list is drawn and an
+        // activity that is not runnable is refused by name.
         if !self.op_supported("stage.activity.run") && !self.op_supported("stage.activity.stop") {
             return group
                 .child(ui::muted(settings_copy(
@@ -2109,4 +2125,136 @@ mod tests {
         })
         .unwrap();
     }
+    /// The twelve stage settings capabilities, exactly as the Unity overlay
+    /// publishes them (`gpui-unity-overlay-probe/src/settings_ui.rs` `STAGE_OPS`):
+    /// 进入世界 / 切换场景 / 角色 XYZ / 重置 / 刷新 / 播放动作 / 活动起停 /
+    /// 管理角色与动作 / 许愿机保存与检测 / 取消配置.
+    const STAGE_CAPABILITY_OPS: [&str; 12] = [
+        "stage.world.enter",
+        "stage.scene.activate",
+        "stage.avatar.position",
+        "stage.avatar.reset",
+        "stage.motion.refresh",
+        "stage.motion.activate",
+        "stage.activity.run",
+        "stage.activity.stop",
+        "settings.open.presence",
+        "space.prop.save",
+        "space.prop.check",
+        "space.prop.cancel",
+    ];
+
+    /// A snapshot carrying every value the gated controls read, so the only
+    /// thing that can hide a control is its op missing from the whitelist.
+    fn capability_snapshot() -> serde_json::Value {
+        json!({
+            "stageRadioPluginEnabled": true,
+            "isSaving": false,
+            "space": {
+                "isRequested": true, "isVisible": true,
+                "selectedWorldID": "world.living-pod",
+                "worldLabel": "生活舱",
+                "position": {"X": 0.5, "Y": -1.25, "Z": 2.0},
+                "worlds": [{"id": "world.living-pod", "name": "生活舱"}],
+                "presets": [{"id": "snow", "name": "雪原"}]
+            },
+            "motions": {
+                "avatarName": "小满", "activeID": null, "isWorking": false,
+                "categories": [{"id": "dance", "name": "舞蹈"}],
+                "items": [{"id": "gmgn.motion.wave", "name": "挥手", "compatible": true}],
+                "notice": null, "message": null, "hasError": false
+            },
+            "activities": {
+                "canRun": true, "activeID": null,
+                "items": [{"id": "life.coffee", "name": "冲泡一杯咖啡"}],
+                "message": null
+            },
+            "player": {"lyricID": "classic", "cloudID": "soft", "videoMode": "full"}
+        })
+    }
+
+    /// The published whitelist is the single switch between "hidden" and
+    /// "usable". With the overlay's `STAGE_OPS` merged in, every one of the
+    /// twelve gated controls becomes drawable and every partition it belongs to
+    /// is reachable; without them the same snapshot hides them again.
+    #[test]
+    fn published_stage_ops_unhide_the_twelve_capabilities_and_their_partitions() {
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.add_window(|window, cx| {
+            let pane = cx.new(|cx| super::StagePanelsPane::new(window, cx));
+            pane.update(cx, |pane, cx| {
+                pane.update_snapshot(capability_snapshot(), window, cx);
+                // What the Unity overlay publishes: the host's own
+                // `supportedCommands` plus the twelve translated stage ops.
+                let mut published: Vec<String> =
+                    ["settings.load", "stage.player.lyrics", "stage.player.cloud", "stage.player.particles"]
+                        .iter()
+                        .map(|op| (*op).to_owned())
+                        .collect();
+                published.extend(STAGE_CAPABILITY_OPS.iter().map(|op| (*op).to_owned()));
+                pane.set_supported_ops(published.clone(), cx);
+                for op in STAGE_CAPABILITY_OPS {
+                    assert!(pane.op_supported(op), "{op} must be usable once the host publishes it");
+                }
+                // 角色 partitions stay reachable: with the motion/activity ops
+                // published, 刷新/播放动作 and 活动起停 are drawn in place of the
+                // 「当前运行时不提供…」 substitute.
+                assert!(pane.op_supported("stage.motion.refresh"));
+                assert!(pane.op_supported("stage.motion.activate"));
+                assert!(pane.op_supported("stage.activity.run"));
+                assert!(pane.op_supported("stage.activity.stop"));
+                // And a partition whose ops are absent is still the panel's own
+                // choice, not a blank body: `choose_available_tab` must not move
+                // off 活动 while 活动 is available.
+                pane.tab = 3;
+                assert!(pane.op_supported_any(super::StagePanelsPane::tab_ops(3)));
+                // The same snapshot without the stage ops hides them again —
+                // this is the assertion that fails if the published list stops
+                // carrying them (the "hide it instead" ending).
+                pane.set_supported_ops(vec!["settings.load".to_owned()], cx);
+                for op in STAGE_CAPABILITY_OPS {
+                    assert!(!pane.op_supported(op), "{op} must be hidden when the host does not publish it");
+                }
+                assert!(!pane.op_supported_any(super::StagePanelsPane::tab_ops(3)), "活动 body is refused without its ops");
+                assert!(!pane.op_supported_any(super::StagePanelsPane::tab_ops(2)), "角色 body is refused without its ops");
+            });
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    /// 管理角色与动作… stays a real control: it is published by the overlay (as
+    /// local window navigation) and by the product host, so the button is drawn
+    /// whenever either host advertises it.
+    #[test]
+    fn manage_assets_button_is_gated_only_on_its_published_op() {
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.add_window(|window, cx| {
+            let pane = cx.new(|cx| super::StagePanelsPane::new(window, cx));
+            pane.update(cx, |pane, cx| {
+                pane.update_snapshot(capability_snapshot(), window, cx);
+                pane.set_supported_ops(vec!["settings.open.presence".to_owned()], cx);
+                assert!(pane.op_supported("settings.open.presence"));
+                pane.set_supported_ops(Vec::new(), cx);
+                // An unpublished list must not blank the pane (a host that does
+                // not advertise anything keeps every control).
+                assert!(pane.op_supported("settings.open.presence"));
+            });
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
 }

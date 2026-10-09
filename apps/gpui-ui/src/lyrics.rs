@@ -12,6 +12,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 #[path = "lyrics/gpu_scene.rs"]
 mod gpu_scene;
+#[cfg(all(test, target_os = "macos"))]
+#[path = "lyrics/viewport_budget.rs"]
+mod viewport_budget;
 pub use gpu_scene::{GpuLyricsAtlas, GpuLyricsBatch, GpuLyricsFrame, GpuLyricsGlyph};
 type ShapeKey = (String, u64, u16, u64, bool);
 thread_local! {static SHAPED_LINES:RefCell<HashMap<ShapeKey,outline::Line>>=RefCell::new(HashMap::new());}

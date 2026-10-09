@@ -23,6 +23,82 @@ use crate::ui_tokens::scene as s;
 use crate::ui_tokens::shell as m;
 use crate::ui_tokens::stage;
 
+/// The gap between the bar's top edge and a popover that opens above it.
+///
+/// The popover is anchored to the bar's own box (the bar is the relative
+/// ancestor of every slot), so "up" is `TRANSPORT_HEIGHT + this` from the bar's
+/// **bottom** edge: the panel sits one hairline gap above the bar's top and
+/// never overlaps the panel area above it.
+pub const TRANSPORT_POPOVER_GAP: f32 = 8.;
+/// Width of a popover that carries a horizontal slider (three 44 pt slots, so
+/// it reads as a bar segment rather than a card).
+pub const TRANSPORT_POPOVER_WIDTH: f32 = 132.;
+/// Inner padding of a transport popover.
+pub const TRANSPORT_POPOVER_PADDING: f32 = 9.;
+
+/// The dark surface every transport popover is drawn on.
+///
+/// Deliberately a plain `Div` with explicit overlay-palette values instead of
+/// kit's themed surface variants: `Button::primary()`/`.custom(..)` derive their
+/// fill from `cx.theme()`, which is what turns a control white under a light
+/// system theme (the inbox's white button is that bug). An overlay surface that
+/// floats over the rendered space must keep the fixed dark palette (see
+/// `ui_tokens::scene`).
+pub fn transport_popover(content: impl IntoElement) -> Div {
+    div()
+        .absolute()
+        .bottom(px(m::TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP))
+        .right(px(0.))
+        .flex()
+        .items_center()
+        .gap(px(s::PANEL_GAP / 2.))
+        .w(px(TRANSPORT_POPOVER_WIDTH))
+        .p(px(TRANSPORT_POPOVER_PADDING))
+        .rounded(px(s::PANEL_RADIUS_SMALL))
+        .bg(rgba(s::CARD_BG))
+        .border_1()
+        .border_color(rgba(s::BORDER))
+        .child(content)
+}
+
+/// Opens a panel above one transport control.
+///
+/// A shared builder closure rather than a built [`AnyElement`] because a
+/// [`TransportControl`] is `Clone + Debug + PartialEq` (the host clones and
+/// compares control tables in its own tests) and `AnyElement` is none of those.
+/// The closure keeps the panel out of the control's identity while still owning
+/// the panel's content and its window-derived geometry: a clone shares the same
+/// builder, so `Clone` stays cheap and `Debug`/`PartialEq` stay total.
+#[derive(Clone)]
+pub struct TransportPopover(
+    std::rc::Rc<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>,
+);
+
+impl TransportPopover {
+    pub fn new(build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static) -> Self {
+        Self(std::rc::Rc::new(build))
+    }
+    /// Build the panel for this frame. Takes `&self` so the bar can render a
+    /// control it has already moved out of the list.
+    pub fn element(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.0)(window, cx)
+    }
+}
+
+impl PartialEq for TransportPopover {
+    /// Two popovers are the same only when they share a builder; the panel's
+    /// pixels are not part of a control's identity.
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for TransportPopover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransportPopover")
+    }
+}
+
 /// One control in the transport bar.
 ///
 /// `label` is the tooltip and the accessibility label — never the control's
@@ -52,6 +128,14 @@ pub struct TransportControl {
     /// where the original used `NSColor.systemBlue` and passes it here; `None`
     /// keeps the resting surface (the asserted glyph is accent either way).
     pub active_fill: Option<u32>,
+    /// A panel that opens **above the bar**, anchored to this control's slot.
+    ///
+    /// The host fills it only while the control is open (click the icon → the
+    /// panel appears above the bar, click again → `None` and nothing is drawn),
+    /// so the bar owns the geometry and the host owns the open/closed state.
+    /// The element is drawn through [`transport_popover`], which keeps the
+    /// overlay palette regardless of the system theme.
+    pub popover: Option<TransportPopover>,
 }
 
 impl TransportControl {
@@ -73,6 +157,7 @@ impl TransportControl {
             face_text: None,
             badge: None,
             active_fill: None,
+            popover: None,
         }
     }
     pub fn active(mut self, active: bool) -> Self {
@@ -103,6 +188,22 @@ impl TransportControl {
         self.active_fill = Some(fill);
         self
     }
+    /// Open a panel above this control's slot. `build` is called once per frame
+    /// the panel is open, so the content (for 音量: one
+    /// [`gpui_kit::component::slider::Slider`]) can read live entity state; the
+    /// slot keeps its own geometry because the panel is absolutely positioned.
+    pub fn popover(
+        mut self,
+        build: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.popover = Some(TransportPopover::new(build));
+        self
+    }
+    /// Whether this control currently has a panel open above it. Used by the
+    /// bar's tests; the host decides it from its own open/closed state.
+    pub fn popover_open(&self) -> bool {
+        self.popover.is_some()
+    }
     /// The original's wide slot is the settings control (68 pt); everything else
     /// is a 44 pt slot.
     pub fn slot_width(&self) -> f32 {
@@ -123,10 +224,9 @@ pub fn transport_width(controls: &[TransportControl]) -> f32 {
         + m::TRANSPORT_ROUNDING
 }
 
-/// The transport bar. `on_action` receives the control's action name for a
-/// click; `on_hold` receives `(action, pressed)` for the controls marked
-/// [`TransportControl::hold`], so push-to-talk stays in the host without a
-/// second copy of the row.
+/// The transport bar, without a window: the original signature every existing
+/// host mounts. It is [`transport_bar_in`] with no popover to build, so a host
+/// that has no panel above the bar keeps the exact call it had.
 ///
 /// Every icon here is one gpui-kit embeds (see `BUNDLED_ICONS` in the tests):
 /// `ListMusic`, `SkipBack`, `MessageCircle`, `Mail`, `Package` and `Monitor` all
@@ -137,8 +237,51 @@ pub fn transport_bar(
     on_action: impl Fn(&str, &mut Window, &mut App) + 'static,
     on_hold: impl Fn(&str, bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let on_action = std::rc::Rc::new(on_action);
-    let on_hold = std::rc::Rc::new(on_hold);
+    // No popover is buildable without a window, so this path never paints one;
+    // the loop below still owns the geometry for hosts that do have one.
+    let on_action: std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)> = std::rc::Rc::new(on_action);
+    let on_hold: std::rc::Rc<dyn Fn(&str, bool, &mut Window, &mut App)> = std::rc::Rc::new(on_hold);
+    transport_bar_slots(controls, None, &on_action, &on_hold)
+}
+
+/// The transport bar with the window it is being rendered into, so a control
+/// marked [`TransportControl::popover`] can build and paint its panel above the
+/// bar on this frame. `on_action`/`on_hold` have the same meaning as in
+/// [`transport_bar`].
+pub fn transport_bar_in(
+    controls: Vec<TransportControl>,
+    window: &mut Window,
+    cx: &mut App,
+    on_action: impl Fn(&str, &mut Window, &mut App) + 'static,
+    on_hold: impl Fn(&str, bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let on_action: std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)> = std::rc::Rc::new(on_action);
+    let on_hold: std::rc::Rc<dyn Fn(&str, bool, &mut Window, &mut App)> = std::rc::Rc::new(on_hold);
+    transport_bar_slots(controls, Some((window, cx)), &on_action, &on_hold)
+}
+
+/// The bar itself, shared by both entry points.
+///
+/// `live` is the window a popover is built in — `None` for a host that supplies
+/// no popover (nothing is built, so no window is needed), `Some` for
+/// [`transport_bar_in`]. Keeping one loop is what stops the two entry points
+/// from drifting apart.
+///
+/// The bar is `absolute` and nothing else: it is pinned to the canvas'
+/// bottom-right corner, which is what leaves the whole canvas above it
+/// drawable. `.relative()` here would *replace* that (GPUI's position setters
+/// share one field, so the last one wins), turning `right`/`bottom` into
+/// relative offsets and laying the bar out in flow at the canvas' top-left —
+/// where a popover that opens above it lands at negative `y` and is clipped
+/// away. The popover does not need the bar to be its containing block: it hangs
+/// off the control's own `relative` slot (see `transport_bar_slots`).
+fn transport_bar_slots(
+    controls: Vec<TransportControl>,
+    live: Option<(&mut Window, &mut App)>,
+    on_action: &std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)>,
+    on_hold: &std::rc::Rc<dyn Fn(&str, bool, &mut Window, &mut App)>,
+) -> AnyElement {
+    let mut live = live;
     let mut bar = div()
         .id("stage.transport")
         .absolute()
@@ -224,6 +367,16 @@ pub fn transport_bar(
                     .child(badge.clone()),
             );
         }
+        // A control with an open panel paints it from its own slot, so the
+        // panel tracks the control it belongs to; its anchor is the bar's box
+        // (`absolute` under the bar's padding box), which is what puts it above
+        // the bar instead of inside it. A host that mounted the bar without a
+        // window cannot build a panel, so it is skipped rather than faked.
+        if let Some(popover) = &control.popover {
+            if let Some((window, cx)) = live.as_mut() {
+                slot = slot.child(transport_popover(popover.element(window, cx)));
+            }
+        }
         bar = bar.child(slot);
         if control.ends_group {
             bar = bar.child(
@@ -304,6 +457,130 @@ mod tests {
         // Removing a control moves the bar, rather than leaving a 529 pt bar
         // with a hole in it.
         assert!(transport_width(&controls[..controls.len() - 1]) < m::TRANSPORT_WIDTH);
+    }
+
+    /// A bar's popover opens **above** the bar, not below it.
+    ///
+    /// This is the geometry of 音量's slider: the panel's `bottom` is the bar's
+    /// own height plus [`TRANSPORT_POPOVER_GAP`], so its top edge is one gap
+    /// above the bar's top edge. An `.top(..)` anchor (or a `bottom` smaller
+    /// than the bar) would open it over the bar itself or over the panel area.
+    ///
+    /// The assertions read the element's resolved style, so they fail if the
+    /// anchor is flipped, not merely if a constant is edited.
+    #[test]
+    fn a_popover_opens_above_the_bar_not_below_it() {
+        let mut popover = transport_popover(div());
+        let style = popover.style();
+        // `bottom` is measured from the bar's own bottom edge, so the panel
+        // clears the whole bar plus the gap above it.
+        assert_eq!(
+            style.inset.bottom,
+            Some(gpui_kit::Length::Definite(
+                px(m::TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP).into()
+            )),
+            "the popover must anchor above the bar"
+        );
+        assert_eq!(style.inset.top, None, "an upward popover has no top anchor");
+        // Sanity: the anchor really is outside the bar's own box, so it can
+        // never cover the bar or the panel that sits one composer gap above it.
+        assert!(m::TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP > m::TRANSPORT_HEIGHT);
+    }
+
+    /// An open popover must not paint a themed surface: a light system theme
+    /// may not turn it white (the inbox's white button is that defect). The
+    /// surface colours come from the fixed overlay palette.
+    #[test]
+    fn a_popover_keeps_the_fixed_overlay_surface() {
+        let mut popover = transport_popover(div());
+        let style = popover.style();
+        assert_eq!(
+            style.background,
+            Some(rgba(s::CARD_BG).into()),
+            "the popover surface is the overlay card colour, not a theme colour"
+        );
+        assert_eq!(
+            style.border_color,
+            Some(rgba(s::BORDER).into()),
+            "hairline from the overlay palette"
+        );
+        // The overlay palette is dark and translucent; a theme-derived surface
+        // would not satisfy both.
+        assert!(s::CARD_BG < 0x80000000, "dark surface");
+        assert!(s::CARD_BG & 0xff < 0xff, "translucent surface");
+    }
+
+    /// The open/closed state is the presence of the panel, and a control that
+    /// carries one still clones and compares like every other control (the host
+    /// stores and clones its control table).
+    #[test]
+    fn a_popover_is_the_controls_open_state_and_survives_clone_and_compare() {
+        let closed = control("volume", gpui_kit::assets::IconName::Volume2);
+        assert!(!closed.popover_open());
+        let open = closed
+            .clone()
+            .popover(|_, _| div().into_any_element());
+        assert!(open.popover_open(), "a built panel is the open state");
+        assert_ne!(closed, open, "open and closed are distinct controls");
+        // The builder is shared by a clone, so the two agree.
+        let same = open.clone();
+        assert_eq!(open, same);
+        assert!(format!("{open:?}").contains("TransportPopover"));
+    }
+
+    /// The two entry points must stay one bar: the window-less
+    /// [`transport_bar`] and the window-carrying [`transport_bar_in`] share the
+    /// same loop, so a host that supplies no popover keeps the exact bar.
+    #[test]
+    fn both_bar_entry_points_share_one_geometry() {
+        let source = include_str!("shell.rs");
+        let no_window = &source[source.find("pub fn transport_bar(").unwrap()..];
+        let no_window = &no_window[..no_window.find("\n}").unwrap()];
+        assert!(
+            no_window.contains("transport_bar_slots(controls, None"),
+            "the window-less bar must reuse the shared loop: {no_window}"
+        );
+        let with_window = &source[source.find("pub fn transport_bar_in(").unwrap()..];
+        let with_window = &with_window[..with_window.find("\n}").unwrap()];
+        assert!(
+            with_window.contains("transport_bar_slots(controls, Some((window, cx))"),
+            "the window-carrying bar must reuse the shared loop: {with_window}"
+        );
+        // Both return the same element type, so a host can swap them freely.
+        assert!(no_window.contains("-> AnyElement") && with_window.contains("-> AnyElement"));
+    }
+
+    /// 音量 and 小窗 live in the bar now. The panel's own footer is gone, so the
+    /// bar's control table is the only place either one is named; the two panel
+    /// ids the duplicate row used must not come back, and neither control may
+    /// steal the wide settings slot.
+    #[test]
+    fn the_panel_footer_is_gone_and_its_controls_are_ordinary_bar_slots() {
+        let source = include_str!("shell.rs");
+        // The ids are assembled at run time so this test's own source (including
+        // its doc comment) cannot satisfy the search, which would make the
+        // assertion pass for the wrong reason.
+        for suffix in ["-lyrics", "-compact"] {
+            let id = format!("media{suffix}");
+            assert!(
+                !source.contains(&id),
+                "the panel footer's `{id}` must not return to the bar"
+            );
+        }
+        // The two moved controls are ordinary 44 pt slots: expanding the bar
+        // moved every slot after 歌词, and the derivation must follow.
+        let mut before: Vec<_> = (0..11).map(|_| control("regular", gpui_kit::assets::IconName::Music)).collect();
+        before.push(control("visual", gpui_kit::assets::IconName::Settings));
+        let mut after = before.clone();
+        after.push(control("volume", gpui_kit::assets::IconName::Music));
+        after.push(control("compact", gpui_kit::assets::IconName::Minimize));
+        assert_eq!(after.len(), before.len() + 2);
+        assert_eq!(
+            transport_width(&after) - transport_width(&before),
+            2. * stage::CONTROL_SIZE,
+            "each moved control is one 44 pt slot"
+        );
+        assert_eq!(after[after.len() - 1].slot_width(), stage::CONTROL_SIZE);
     }
 
     /// The destination control is a square icon button: the original's 112 pt

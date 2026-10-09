@@ -18,6 +18,10 @@
 
 // Experimental native mount only. The child must be a real GPUI view supplied by Rust.
 static NSArray<NSValue *> *hitRegions;
+static unsigned inputTraceCount;
+static BOOL inputDiagnostics;
+static double traceClock(void) { return [NSDate date].timeIntervalSince1970 * 1000.0; }
+static double traceLastGeometryMs;
 static void releaseOutsideFocus(NSView *view);
 static BOOL hitsUI(NSView *view, NSPoint local) {
     if (!NSPointInRect(local, view.bounds)) return NO;
@@ -28,10 +32,31 @@ static BOOL hitsUI(NSView *view, NSPoint local) {
 @interface GMGNProbeContainer : NSView
 @end
 @implementation GMGNProbeContainer
+// Diagnostics only: proves whether a real left-mouse-down reached the mounted
+// container and whether the painted hit regions cover the point.
+static void traceHitTest(NSView *view, NSPoint local, BOOL hit) {
+    static double lastMs;
+    if (!inputDiagnostics) return;
+    NSEvent *event = NSApp.currentEvent;
+    if (event.type != NSEventTypeLeftMouseDown && event.type != NSEventTypeRightMouseDown) return;
+    double now = traceClock();
+    if (now - lastMs < 150) return;
+    lastMs = now;
+    NSMutableString *regions = [NSMutableString string];
+    for (NSUInteger index = 0; index < hitRegions.count && index < 8; index++) {
+        NSRect rect = hitRegions[index].rectValue;
+        [regions appendFormat:@"(%.0f,%.0f,%.0fx%.0f)", rect.origin.x, rect.origin.y, rect.size.width, rect.size.height];
+    }
+    NSLog(@"[GPUIOverlayTrace] ms=%.1f event=hitTest hit=%d local=%.0f,%.0f bounds=%.0fx%.0f regions=%lu %@",
+        now, hit, local.x, local.y, view.bounds.size.width, view.bounds.size.height,
+        (unsigned long)hitRegions.count, regions);
+}
 - (NSView *)hitTest:(NSPoint)point {
     NSPoint local = [self convertPoint:point fromView:self.superview];
     if (self.hidden) return nil;
-    if (!hitsUI(self, local)) { releaseOutsideFocus(self); return nil; }
+    BOOL hit = hitsUI(self, local);
+    traceHitTest(self, local, hit);
+    if (!hit) { releaseOutsideFocus(self); return nil; }
     return [super hitTest:point];
 }
 @end
@@ -49,11 +74,14 @@ static NSTimeInterval frameUntil;
 static BOOL frameQueued;
 static void drawMountedFrame(void) {
     if (!mountedView || !originalViewClass || !registeredWindow.visible || registeredWindow.miniaturized) return;
+    if (inputDiagnostics && traceClock() - traceLastGeometryMs < 400) {
+        double ms = traceClock();
+        NSLog(@"[GPUIOverlayTrace] ms=%.1f event=drawMountedFrame sinceGeometryMs=%.0f mounted=%.0fx%.0f",
+            ms, ms - traceLastGeometryMs, mountedView.frame.size.width, mountedView.frame.size.height);
+    }
     Method method = class_getInstanceMethod(originalViewClass, @selector(displayLayer:));
     if (method) ((void (*)(id, SEL, id))method_getImplementation(method))(mountedView, @selector(displayLayer:), mountedView.layer);
 }
-static unsigned inputTraceCount;
-static BOOL inputDiagnostics;
 static void wakeFrames(void);
 // GPUI retains its original window as its activation authority after its view
 // is embedded. Reflect the real host's key state without activating or showing
@@ -239,10 +267,47 @@ static BOOL installAdapter(NSView *view) {
     object_setClass(view, adapter);
     return YES;
 }
+// Read-only resize tracing. `GMGN_GPUI_INPUT_DIAGNOSTICS=1` prints the real
+// ordering of the host window notifications, the applied viewport and the
+// 30 Hz pulse so a late/absent geometry update can be measured instead of
+// guessed. It never resizes or draws by itself.
+static void traceFacts(const char *event) {
+    if (!inputDiagnostics || !registeredWindow || !container) return;
+    NSRect window = registeredWindow.frame;
+    NSRect content = registeredWindow.contentView.bounds;
+    NSLog(@"[GPUIOverlayTrace] ms=%.1f event=%s win=%.0fx%.0f content=%.0fx%.0f container=%.0fx%.0f mounted=%.0fx%.0f donor=%.0fx%.0f rev=%llu",
+        traceClock(), event, window.size.width, window.size.height,
+        content.size.width, content.size.height,
+        container.frame.size.width, container.frame.size.height,
+        mountedView.frame.size.width, mountedView.frame.size.height,
+        donorWindow.contentView.frame.size.width, donorWindow.contentView.frame.size.height,
+        geometryRevision);
+}
+static void traceWindowSizeChange(void) {
+    static NSSize observed;
+    static BOOL haveObserved;
+    if (!inputDiagnostics || !registeredWindow || !container) return;
+    NSSize window = registeredWindow.contentView.bounds.size;
+    if (haveObserved && NSEqualSizes(window, observed)) return;
+    observed = window;
+    haveObserved = YES;
+    traceFacts("pulseWindowSize");
+}
+static void traceGeometryGap(void) {
+    static double lastGapMs;
+    if (!inputDiagnostics || !registeredWindow || !container) return;
+    NSSize window = registeredWindow.contentView.bounds.size;
+    if (NSEqualSizes(window, container.frame.size)) return;
+    double now = traceClock();
+    if (now - lastGapMs < 100) return;
+    lastGapMs = now;
+    traceFacts("pulseGeometryGap");
+}
 static void updateGeometry(void) {
     if (!registeredWindow || !container) return;
     NSRect bounds = registeredWindow.contentView.bounds;
     NSRect frame = bounds;
+    BOOL changed = !NSEqualSizes(container.frame.size, frame.size);
     container.frame = frame;
     // Resize the real donor's viewport too, so GPUI receives its native resize
     // callback and Metal drawable dimensions match the visible mounted view.
@@ -255,11 +320,35 @@ static void updateGeometry(void) {
     if (resize) ((void (*)(id, SEL, NSSize))method_getImplementation(resize))(mountedView, @selector(setFrameSize:), frame.size);
     else [mountedView setFrameSize:frame.size];
     transparentMountedLayer();
-    if (inputDiagnostics) NSLog(@"[GPUIOverlay] geometry host=%@ donor=%@ mounted=%@ layerOpaque=%d scale=%.2f",
+    traceLastGeometryMs = traceClock();
+    if (inputDiagnostics) NSLog(@"[GPUIOverlay] geometry host=%@ donor=%@ mounted=%@ layerOpaque=%d scale=%.2f changed=%d ms=%.1f",
         NSStringFromSize(frame.size), NSStringFromSize(donorWindow.contentView.frame.size),
-        NSStringFromSize(mountedView.frame.size), mountedView.layer.opaque, registeredWindow.backingScaleFactor);
+        NSStringFromSize(mountedView.frame.size), mountedView.layer.opaque, registeredWindow.backingScaleFactor,
+        changed, traceLastGeometryMs);
     wakeFrames();
     geometryRevision++;
+}
+int32_t probe_native_host_size(float *width, float *height) {
+    if (![NSThread isMainThread] || !width || !height || !registeredWindow || !container) return 0;
+    NSSize host = registeredWindow.contentView.bounds.size;
+    if (!isfinite(host.width) || !isfinite(host.height) || host.width <= 0 || host.height <= 0) return 0;
+    *width = (float)host.width;
+    *height = (float)host.height;
+    return 1;
+}
+int32_t probe_native_sync_geometry(void) {
+    if (![NSThread isMainThread] || !registeredWindow || !container || !mountedView) return 0;
+    NSSize host = registeredWindow.contentView.bounds.size;
+    if (!isfinite(host.width) || !isfinite(host.height) || host.width <= 0 || host.height <= 0) return 0;
+    // The host window owns the viewport. A missed or late AppKit resize
+    // notification must not leave the mounted view on the old size, so the
+    // host poll re-asserts it: nothing is touched while all three views
+    // already match, which is what keeps a steady frame free of resizes.
+    if (NSEqualSizes(host, container.frame.size) &&
+        NSEqualSizes(host, donorWindow.contentView.frame.size) &&
+        NSEqualSizes(host, mountedView.frame.size)) return 0;
+    updateGeometry();
+    return 1;
 }
 int32_t probe_native_set_panel_expanded(int32_t expanded) {
     if (![NSThread isMainThread] || !mountedView || !registeredWindow || (expanded != 0 && expanded != 1)) return 0;
@@ -337,9 +426,13 @@ int32_t probe_attach_view(void *parentPointer, void *childPointer, float width, 
     [parent addSubview:container positioned:NSWindowAbove relativeTo:nil];
     NSMutableArray *tokens = [NSMutableArray array];
     for (NSNotificationName name in @[NSWindowDidResizeNotification, NSWindowDidChangeBackingPropertiesNotification,
-                                     NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification]) {
+                                     NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification,
+                                     NSWindowDidChangeScreenNotification]) {
         [tokens addObject:[NSNotificationCenter.defaultCenter addObserverForName:name object:registeredWindow
-            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { (void)note; updateGeometry(); }]];
+            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+                traceFacts(note.name.UTF8String);
+                updateGeometry();
+            }]];
     }
     for (NSNotificationName name in @[NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification]) {
         [tokens addObject:[NSNotificationCenter.defaultCenter addObserverForName:name object:registeredWindow
@@ -355,9 +448,10 @@ int32_t probe_attach_view(void *parentPointer, void *childPointer, float width, 
     // Bounded activity pulses; use the visible host, not the hidden donor's occlusion.
     frameTimer = [NSTimer timerWithTimeInterval:1.0/30 repeats:YES block:^(NSTimer *timer) {
         (void)timer;
-        if (mountedView && registeredWindow.visible && !registeredWindow.miniaturized &&
-            NSProcessInfo.processInfo.systemUptime < frameUntil) {
-            drawMountedFrame();
+        if (mountedView && registeredWindow.visible && !registeredWindow.miniaturized) {
+            traceWindowSizeChange();
+            traceGeometryGap();
+            if (NSProcessInfo.processInfo.systemUptime < frameUntil) drawMountedFrame();
         }
     }];
     [NSRunLoop.mainRunLoop addTimer:frameTimer forMode:NSRunLoopCommonModes];

@@ -26,13 +26,29 @@ use gpui_kit::component::{
     Disableable,
     input::{Input, InputState},
     scroll::ScrollableElement,
-    tab::{Tab, TabBar},
 };
 use gpui_kit::*;
 use serde_json::{Value, json};
 
 const SECTIONS: [&str; 6] = ["library", "queue", "programs", "screen", "inbox", "wish"];
-const LABELS: [&str; 6] = ["音乐库", "队列", "节目", "电视", "消息", "愿望"];
+/// The header is a **readout** of the section the transport button (or a
+/// `ui.music.open` / `ui.wish.open` command) already selected — never a
+/// control. The original Swift media UI is a single rail whose content is
+/// chosen entirely by the transport, so the panel owns no navigation of its
+/// own; the early Rust port's in-panel segmented tab strip was a second entry
+/// point and is deliberately gone. `section` has exactly one writer,
+/// [`MediaPane::select_section`].
+fn section_title(section: usize) -> &'static str {
+    match SECTIONS.get(section) {
+        Some(&"library") => "音乐库",
+        Some(&"queue") => "队列",
+        Some(&"programs") => "节目",
+        Some(&"screen") => "电视",
+        Some(&"inbox") => "消息",
+        Some(&"wish") => "愿望",
+        _ => "媒体",
+    }
+}
 /// The rail's own routes, mirrored from `rail_route` in
 /// `gmgn_gpui_ui::stage_panels::program`; the surface owns the route because the
 /// production snapshot has no route of its own.
@@ -758,20 +774,11 @@ impl Render for MediaPane {
         };
         media_surface()
             .child(
-                TabBar::new("media-sections")
-                    .selected_index(self.section)
-                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        this.section = *index;
-                        this.refresh(cx);
-                    }))
-                    .children(LABELS.iter().map(|label| Tab::new().label(*label))),
-            )
-            .child(
                 div()
                     .flex()
                     .justify_between()
                     .items_center()
-                    .child(ui::card_title(LABELS[self.section]))
+                    .child(ui::card_title(section_title(self.section)))
                     .child(
                         ui::icon_button("media-refresh", IconName::RefreshCw, "刷新", false)
                             .disabled(state["pending"] == true || self.section == 1)
@@ -930,5 +937,76 @@ mod tests {
                 json!({"op":"music.program.history"}),
             ]
         );
+    }
+
+    /// The header must read out the transport-selected section, so every
+    /// section the transport (or a `ui.*.open` command) can name has a title.
+    #[test]
+    fn section_header_reads_out_every_ownable_section() {
+        for (index, name) in SECTIONS.iter().enumerate() {
+            let title = section_title(index);
+            assert_ne!(title, "媒体", "{name} must have its own readout title");
+            assert!(!title.is_empty());
+        }
+        assert_eq!(section_title(SECTIONS.len()), "媒体");
+    }
+
+    /// Regression guard for the user-reported defect: the media panel is one
+    /// rail whose content is chosen by the transport, so it must never grow a
+    /// second navigation entry. The source scan excludes this test module (it
+    /// names the very symbols it forbids).
+    #[test]
+    fn media_panel_renders_no_pagination_control() {
+        let source = include_str!("media_ui.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        for forbidden in ["TabBar", "Tab::new", "LABELS", "selected_index"] {
+            assert!(
+                !production.contains(forbidden),
+                "media panel must not draw its own pagination ({forbidden})"
+            );
+        }
+        // `section` has exactly one writer: the transport-driven setter. The
+        // trailing space separates the assignment from `self.section == 1`.
+        assert_eq!(production.matches("self.section = ").count(), 1);
+        assert!(production.contains("pub fn select_section(&mut self, section: &str"));
+    }
+
+    /// Regression guard for the user-reported defect: the media panel is one
+    /// surface mounted inside the floating bar's panel frame, and the frame's
+    /// own row (音量 + slider + 歌词 + 小窗) is the **bar's** chrome
+    /// (`shell_ui.rs` `media_controls`), not this surface's. This panel keeps
+    /// exactly two header children — its section readout and its own refresh
+    /// action — so the volume slider, the lyrics button and the window
+    /// (小窗/全屏) controls must never reappear here.
+    ///
+    /// The full guard lands together with the `shell_ui.rs` fix; this half pins
+    /// the panel side so the old row cannot be "fixed" by moving it back in.
+    #[test]
+    fn media_panel_draws_no_volume_lyrics_or_window_controls() {
+        let source = include_str!("media_ui.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        for forbidden in [
+            "音量",
+            "Slider",
+            "media-lyrics",
+            "media-compact",
+            "ui.lyrics.toggle",
+            "ui.window.fullscreen",
+            "ui.window.compact",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "the media panel must not draw the floating bar's own row ({forbidden})"
+            );
+        }
+        // The panel header is exactly the readout plus its refresh action.
+        assert!(production.contains("ui::card_title(section_title(self.section))"));
+        assert!(production.contains("\"media-refresh\""));
     }
 }

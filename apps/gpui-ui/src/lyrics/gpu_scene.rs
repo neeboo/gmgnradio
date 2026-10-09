@@ -41,7 +41,37 @@ pub struct GpuLyricsFrame {
     pub atlases: Vec<GpuLyricsAtlas>,
     pub batches: Vec<GpuLyricsBatch>,
 }
+/// Native-compositor pixel budget for one lyric render target.
+///
+/// `tools/gpui-lyrics-metal-probe/lyrics_layer.m` clamps every intermediate and
+/// presentation target it allocates to `MIN(4194304, 256MiB/(4*(5+maxdepth)))`
+/// pixels (2048x2048) and recomputes its blur sigma from that effective scale.
+/// The atlas rasters below are the Rust half of the same intermediate layer, so
+/// they follow the same budget: with a fixed device scale the atlas area grows
+/// with the viewport, and `pack` then rejects the whole frame with
+/// `gpu_atlas_frame_budget_exceeded` exactly when the window goes fullscreen.
+const NATIVE_TARGET_PIXEL_BUDGET: f64 = 4_194_304.;
+
+/// Device scale bounded by the native target budget.
+///
+/// A 720x450-point window at scale 2 (1440x900 px, 1.30M px) fits the budget and
+/// keeps its full scale, so the windowed rendering path is unchanged. A
+/// 2048x1152-point fullscreen window (4096x2304 px, 7.28x the pixels) is
+/// rasterized at `sqrt(budget/area)` = 1.333 instead — exactly the scale the
+/// native compositor already downsamples its own targets to, so nothing that is
+/// visible is lost while the atlas area drops by `(2/1.333)^2` = 2.25x. Glyph
+/// transforms, per-glyph progress, blur and glow stay exact: only the
+/// intermediate raster resolution follows the viewport.
+fn bounded_scale(width: f64, height: f64, scale: f32) -> f32 {
+    let area = (width * height).max(1.);
+    let bounded = (NATIVE_TARGET_PIXEL_BUDGET / area).sqrt().min(f64::from(scale));
+    bounded.clamp(0.05, f64::from(scale)) as f32
+}
 impl GpuLyricsFrame {
+    /// Raster scale this frame's atlases were actually rendered at.
+    pub fn raster_scale(&self) -> f32 {
+        self.scale
+    }
     pub fn diagnostics(&self) -> String {
         let glyphs = self.batches.iter().map(|b| b.glyphs.len()).sum::<usize>();
         let depth = self
@@ -329,6 +359,10 @@ impl AtlasCache {
         scale: f32,
         generation: u64,
     ) -> Result<GpuLyricsFrame, String> {
+        // The frame's reported scale is the raster scale, and the native layer
+        // sizes its targets from it, so both halves of the intermediate layer
+        // share one viewport-derived pixel budget.
+        let scale = bounded_scale(width, height, scale);
         let mut gradients = String::new();
         let mut filters: HashMap<String, Vec<(f64, [f64; 4], f64)>> = HashMap::new();
         let mut gradient_start = None;

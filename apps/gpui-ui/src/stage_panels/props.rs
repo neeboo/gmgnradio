@@ -9,12 +9,20 @@
 //!   「房间里」 are the same list seen through `showsPlacedOnly`; the pair is
 //!   decided once by [`ownership_scope`] instead of being re-spelled at the picker,
 //!   at the empty state and at every row.
-//! - **One content scroll, fixed header.** The title row (`摆放` + collapse)
-//!   never scrolls, so the collapse control cannot be pushed out of the panel;
+//! - **One content scroll, fixed header.** The title row (the current scope's
+//!   name, [`panel_title`], + collapse) never scrolls, so the collapse control
+//!   cannot be pushed out of the panel;
 //!   everything below it scrolls inside the original 390 pt cap. The original
 //!   nested a second 190 pt scroll around the ownership list; this layer keeps a
 //!   single scroll region (the layer-wide rule), which the host's bounded row
 //!   projection plus the 「还有 N 件」 line already keeps in reach.
+//! - **A built-in device is an object, not a second surface.** 音乐播放器 /
+//!   许愿机 arrive as rows of the same list, in the same groups and with the
+//!   same status words; the one difference the projection can state is that the
+//!   world authority takes exactly one operation for them
+//!   ([`SelectedControls::Device`]) and that 删除 does not exist for them
+//!   ([`delete_entry_visible`]). The panel never draws a second device card
+//!   beside itself, so two panels can never overlap.
 //! - **The selected object is two mutually exclusive control sets**, chosen by
 //!   [`selected_controls`]: in the hand it is 展示微调 + nudge + rotate + 放回;
 //!   loose it is 拿着看 / 收回 with the hold-point picker on the same line. The
@@ -119,18 +127,66 @@ pub enum SelectedControls {
     Held,
     /// Loose in the room: 拿着看 / 收回 + the hold-point picker.
     Loose,
+    /// A built-in device (基础设备): it is an object like any other — it lives
+    /// in the room, is selected and reads its status the same way — but the
+    /// world authority takes exactly one operation for it. `world_device.rs`
+    /// `can_place` accepts a device id whose only metadata is
+    /// `gmgn.builtin-device.v1` and commits it through `world.device.place`,
+    /// while every `world.prop.command` arm runs `world_prop::reduce`, whose
+    /// first act is `generated(&before)?` → `world_prop_basic_object`
+    /// (`services/gmgn-taskd/src/world_prop.rs:1884` → `:130-134`). So 摆放 /
+    /// 重新摆放 (the host's own `ui.device.place`) is the whole set: no 收回,
+    /// no hold point, and — the one difference the list must show — no 删除.
+    Device,
     /// Nothing selected.
     None,
 }
 
-pub fn selected_controls(has_selection: bool, is_held: bool) -> SelectedControls {
+/// The selected control set. `is_device` is the projection's own fact
+/// (`selected.deviceTemplateID`), so the device branch can never be guessed
+/// from a name or an id prefix.
+pub fn selected_controls_for(
+    has_selection: bool,
+    is_held: bool,
+    is_device: bool,
+) -> SelectedControls {
     if !has_selection {
         SelectedControls::None
+    } else if is_device {
+        SelectedControls::Device
     } else if is_held {
         SelectedControls::Held
     } else {
         SelectedControls::Loose
     }
+}
+
+pub fn selected_controls(has_selection: bool, is_held: bool) -> SelectedControls {
+    selected_controls_for(has_selection, is_held, false)
+}
+
+/// A row/selection that is one of the world's own built-in devices. The
+/// projection sets `deviceTemplateID` exactly when the object came from
+/// `builtinDevices.templates` (`inventory_ui.rs`), never by inspecting an id.
+pub fn is_device_selection(selected: &Value) -> bool {
+    selected["deviceTemplateID"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+}
+
+/// 删除 is the one entry a built-in device must never show: the row would be
+/// refused by name (`world_prop_basic_object`) after the click. The list shows
+/// no delete entry for it at all instead of a disabled one, so nothing promises
+/// an operation that cannot exist.
+pub fn delete_entry_visible(is_device: bool) -> bool {
+    !is_device
+}
+
+/// The panel's title is the content on screen, not a fixed word
+/// (「面板标题按当前内容变」): both scopes come from [`ownership_scope`], so the
+/// title can never drift from the picker or the empty sentence.
+pub fn panel_title(placed_only: bool) -> &'static str {
+    ownership_scope(placed_only).title
 }
 
 /// `sizeControl` visibility (`:338-339`): only a selected, not-held object with
@@ -630,6 +686,57 @@ impl ResidentPropEditorPane {
             .into_any_element()
     }
 
+    /// The selected panel's 永久删除 entry — and for a built-in device there is
+    /// no entry at all ([`delete_entry_visible`]): the world authority answers
+    /// `world_prop_basic_object` (`world_prop.rs:1884` → `:130-134`), so a
+    /// visible control would be a click that can only fail. Built as its own
+    /// function so the absence is a render-level fact a test can check, not
+    /// just a predicate.
+    fn delete_entry(&self, visible: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !visible {
+            return None;
+        }
+        let saving = self.snapshot["isSaving"].as_bool() == Some(true);
+        Some(
+            h_flex()
+                .w_full()
+                .gap(px(m::CONTROL_GAP))
+                .child(
+                    Button::new("prop-delete")
+                        .custom(scene_variant(
+                            cx,
+                            0x00000000,
+                            m::TINT_FAILED,
+                            m::TINT_FAILED,
+                        ))
+                        .small()
+                        .rounded(px(m::ROW_RADIUS))
+                        .text_color(rgba(m::TINT_FAILED))
+                        .disabled(saving)
+                        .tooltip("永久删除这一件生成资产：不可恢复。正在摆放或拿在手里的会先收场再删。")
+                        .accessibility_label("永久删除")
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(m::LEGEND_ENTRY_GAP))
+                                .child(Icon::new(AssetIcon::Delete).size(px(m::STATUS_SIZE)))
+                                .child("删除"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let object = this.snapshot["selected"]["objectID"].clone();
+                            this.open_delete(
+                                json!({"op":"stage.props.delete","objectID":object}),
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        })),
+                )
+                .child(div().flex_1())
+                .into_any_element(),
+        )
+    }
+
     /// The hold-point picker (`slotPicker`, `:314-327`): one segmented control,
     /// 156 pt wide, in whichever control row is on screen.
     fn slot_picker(
@@ -870,6 +977,115 @@ mod tests {
         assert_ne!(SelectedControls::Held, SelectedControls::Loose);
     }
 
+    /// 基础设备 is its own control set: the device fact outranks the held bit,
+    /// and it is never one of the two generated-prop sets (`Device` would
+    /// otherwise draw 收回 / 挂点 / 尺寸, all of which the world authority
+    /// refuses with `world_prop_basic_object`).
+    #[test]
+    fn a_builtin_device_is_its_own_control_set() {
+        assert_eq!(
+            selected_controls_for(true, false, true),
+            SelectedControls::Device
+        );
+        assert_eq!(
+            selected_controls_for(true, true, true),
+            SelectedControls::Device
+        );
+        assert_ne!(SelectedControls::Device, SelectedControls::Loose);
+        assert_ne!(SelectedControls::Device, SelectedControls::Held);
+        assert_eq!(selected_controls_for(false, false, true), SelectedControls::None);
+        // The projection's marker is the only thing that turns the branch on.
+        assert!(is_device_selection(&json!({"deviceTemplateID":"prop.jukebox"})));
+        assert!(!is_device_selection(&json!({"objectID":"prop.jukebox"})));
+        assert!(!is_device_selection(&json!({"deviceTemplateID":""})));
+        assert!(!is_device_selection(&json!(null)));
+    }
+
+    /// 删除 has no entry for a built-in device: the row-level actions never
+    /// carry it (`inventory_ui.rs`) and the selected panel must not build the
+    /// button either — a visible-but-refused control is exactly the "点了才失败"
+    /// the product forbids.
+    #[test]
+    fn a_builtin_device_has_no_delete_entry() {
+        assert!(!delete_entry_visible(true));
+        assert!(delete_entry_visible(false));
+        assert_ne!(delete_entry_visible(true), delete_entry_visible(false));
+    }
+
+    /// The same rule as a **render-level** fact: the frames the pane actually
+    /// paints contain no 删除 target for a device selection, while a generated
+    /// prop keeps exactly the one it always had. Dropping the gate fails here,
+    /// not only in the predicate above.
+    #[test]
+    fn the_delete_entry_is_not_built_for_a_builtin_device() {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let entity = stored.clone();
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(|cx| super::ResidentPropEditorPane::new(window, cx));
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        let device = json!({
+            "objectID": "prop.jukebox", "name": "音乐播放器", "held": false,
+            "enabled": true, "deviceTemplateID": "prop.jukebox", "holdPoint": "hand"
+        });
+        let prop = json!({
+            "objectID": "o1", "name": "长剑", "held": false, "enabled": true,
+            "longestEdge": 1.4, "holdPoint": "hand"
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let pane = stored.borrow().as_ref().unwrap().clone();
+            for (selected, expected) in [(device.clone(), false), (prop.clone(), true)] {
+                pane.update(cx, |pane, cx| {
+                    assert_eq!(is_device_selection(&selected), !expected, "{selected} marker");
+                    assert_eq!(
+                        pane.delete_entry(delete_entry_visible(is_device_selection(&selected)), cx)
+                            .is_some(),
+                        expected,
+                        "{selected} must {} a 删除 entry",
+                        if expected { "have" } else { "not have" }
+                    );
+                    let mut snapshot = pane.snapshot.clone();
+                    if !snapshot.is_object() {
+                        snapshot = json!({});
+                    }
+                    snapshot["selected"] = selected.clone();
+                    snapshot["placedOnly"] = json!(false);
+                    snapshot["isSaving"] = json!(false);
+                    snapshot["rowCount"] = json!(1);
+                    snapshot["sections"] = json!([]);
+                    pane.update_snapshot(snapshot, window, cx);
+                    let _ = pane.take_commands();
+                });
+                // What the frame really painted: no 删除 target to click.
+                window.render_frame(cx);
+                assert_eq!(
+                    window.try_find("prop-delete").is_some(),
+                    expected,
+                    "{selected} must {} the 删除 control in the painted frame",
+                    if expected { "have" } else { "not have" }
+                );
+                window.draw(cx).clear(cx);
+            }
+        })
+        .unwrap();
+    }
+
+    /// The panel title is the content on screen, so it can never contradict the
+    /// scope picker or the empty sentence of the same scope.
+    #[test]
+    fn the_panel_title_follows_the_current_scope() {
+        assert_eq!(panel_title(false), "我的物件");
+        assert_eq!(panel_title(true), "房间里");
+        assert_eq!(panel_title(false), ownership_scope(false).title);
+        assert_eq!(panel_title(true), ownership_scope(true).title);
+        assert_ne!(panel_title(false), panel_title(true));
+    }
+
     /// The size block exists only for a selected, loose object with a generated
     /// prop (`:338-339`).
     #[test]
@@ -1041,7 +1257,7 @@ mod tests {
             gpui_kit::base::Root::new(pane, window, cx)
         });
         let held = std::rc::Rc::new(std::cell::RefCell::new(json!({})));
-        for state in ["loose", "held", "none"] {
+        for state in ["loose", "held", "device", "none"] {
             let held_slot = held.clone();
             cx.update_window(handle.into(), |_, window, cx| {
                 let pane = stored.borrow().as_ref().unwrap().clone();
@@ -1051,6 +1267,18 @@ mod tests {
                         "held" => {
                             snapshot["selected"]["held"] = json!(true);
                             snapshot["selected"]["holdUnavailableReason"] = json!(null);
+                        }
+                        // A built-in device: no longest edge (nothing to resize),
+                        // no hold point, and no delete entry anywhere.
+                        "device" => {
+                            snapshot["selected"] = json!({
+                                "objectID": "prop.jukebox",
+                                "name": "音乐播放器",
+                                "held": false,
+                                "enabled": true,
+                                "deviceTemplateID": "prop.jukebox",
+                                "holdPoint": "hand"
+                            });
                         }
                         "none" => {
                             snapshot["selected"] = json!(null);
@@ -1165,7 +1393,13 @@ impl Render for ResidentPropEditorPane {
         }
         let selected = self.snapshot["selected"].clone();
         let has_selection = !selected.is_null();
-        match selected_controls(has_selection, selected["held"].as_bool() == Some(true)) {
+        let device_selected = has_selection && is_device_selection(&selected);
+        let controls = if device_selected {
+            SelectedControls::Device
+        } else {
+            selected_controls(has_selection, selected["held"].as_bool() == Some(true))
+        };
+        match controls {
             SelectedControls::None => {}
             SelectedControls::Held => {
                 content = content.child(divider());
@@ -1287,52 +1521,63 @@ impl Render for ResidentPropEditorPane {
                         .child("移动指针选位置，左键放下，右键转 45°，Esc 放回。"),
                 );
             }
+            SelectedControls::Device => {
+                // 基础设备 is placed (or moved) through the one op the world
+                // authority takes for a device — the same
+                // `ui.device.place`/`world.device.place` path the world's own
+                // device placement uses (`UnityDevicePlacementBridge.place`,
+                // `world_device.rs::can_place`). 收回 / 挂点 / 尺寸 would each be
+                // answered `world_prop_basic_object`, so they are not drawn.
+                content = content.child(divider());
+                let placed = selected["enabled"].as_bool() == Some(true);
+                content = content.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap(px(m::CONTROL_GAP))
+                        .child(self.control(
+                            "prop-device-place",
+                            if placed { "重新摆放" } else { "摆放" },
+                            // The bundled glyph the row's own `place` action
+                            // already uses; the old device strip's `Box` is not
+                            // in the icon bundle (`icon_gates.rs`), so it painted
+                            // an empty square.
+                            AssetIcon::ArrowDown,
+                            // The placement entry is the component's one
+                            // placement op; the adapter routes it to
+                            // `ui.device.place` for a device and to
+                            // `ui.inventory.place` for a generated prop.
+                            json!({"op":"stage.props.hold"}),
+                            false,
+                            cx,
+                        ))
+                        .child(div().flex_1()),
+                );
+                content = content.child(
+                    div()
+                        .text_size(px(m::HINT_SIZE))
+                        .text_color(rgba(s::TEXT_MUTED))
+                        .child("移动指针选位置，左键放下，右键转 45°，Esc 放回。"),
+                );
+            }
         }
         if has_selection {
-            content = content.child(
-                h_flex()
-                    .w_full()
-                    .gap(px(m::CONTROL_GAP))
-                    .child(
-                        Button::new("prop-delete")
-                            .custom(scene_variant(
-                                cx,
-                                0x00000000,
-                                m::TINT_FAILED,
-                                m::TINT_FAILED,
-                            ))
-                            .small()
-                            .rounded(px(m::ROW_RADIUS))
-                            .text_color(rgba(m::TINT_FAILED))
-                            .disabled(saving)
-                            .tooltip("永久删除这一件生成资产：不可恢复。正在摆放或拿在手里的会先收场再删。")
-                            .accessibility_label("永久删除")
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(m::LEGEND_ENTRY_GAP))
-                                    .child(Icon::new(AssetIcon::Delete).size(px(m::STATUS_SIZE)))
-                                    .child("删除"),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let object = this.snapshot["selected"]["objectID"].clone();
-                                this.open_delete(
-                                    json!({"op":"stage.props.delete","objectID":object}),
-                                    window,
-                                    cx,
-                                );
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().flex_1()),
-            );
-            if size_controls_visible(
+            if let Some(entry) = self.delete_entry(delete_entry_visible(device_selected), cx) {
+                content = content.child(entry);
+            }
+        }
+        // The size block is a generated-asset operation (`world.prop.command`
+        // 「resize」): a built-in device has no generated prop to resize, and
+        // the projection never gives it a longest edge.
+        if has_selection
+            && !device_selected
+            && size_controls_visible(
                 has_selection,
                 selected["held"].as_bool() == Some(true),
                 selected["longestEdge"].as_f64().is_some(),
-            ) {
-                content = content.child(self.size_control(&selected, cx));
-            }
+            )
+        {
+            content = content.child(self.size_control(&selected, cx));
         }
         let wall_faces = self.snapshot["wallFaces"].as_u64().unwrap_or(0);
         let mut legend = h_flex().w_full().gap(px(m::LEGEND_GAP));
@@ -1408,9 +1653,16 @@ impl Render for ResidentPropEditorPane {
                 .child(div().flex_1()),
         );
         // One panel, one content scroll: the title row never scrolls.
+        //
+        // No `.h_full()`: the panel is content-sized and the shell pins its
+        // extent to the bottom-right corner, exactly like the transport bar
+        // (`StageWindowController.swift:1521-1526` pins
+        // `propEditorPanel.trailing == transportControls.trailing` and
+        // `bottom == transportControls.top - 12`). Stretching to the container's
+        // full height is what used to push the panel's content to the window's
+        // top-left. `max_h` + the inner scroll still bound a long list.
         v_flex()
             .w_full()
-            .h_full()
             .max_w(px(m::PANEL_WIDTH))
             .max_h(px(m::PANEL_MAX_HEIGHT))
             .gap(px(m::GROUP_GAP))
@@ -1434,9 +1686,13 @@ impl Render for ResidentPropEditorPane {
                     )
                     .child(
                         div()
+                            .id("props-panel-title")
                             .text_size(px(m::TITLE_SIZE))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("摆放"),
+                            // The title is the content on screen (我的物件 /
+                            // 房间里), never a fixed word that the picker below
+                            // would contradict.
+                            .child(panel_title(placed_only)),
                     )
                     .child(div().flex_1())
                     .child(

@@ -9,7 +9,12 @@ import simd
 /// Exports borrowed Metal textures, not signed media URLs or pixel JSON. Host must
 /// destroy the Unity consumers before close. No content starts during construction.
 @MainActor final class UnityScreenVideoBridge: WorldScreenControlling {
-    static let supportedCommands = ["screen.list", "screen.play", "screen.stop", "video.load", "video.choose", "video.select", "video.remove", "video.play", "video.pause", "video.stop", "video.recoverStop", "video.mode", "video.brightness", "video.bind", "video.unbind", "video.bound.play", "video.bound.dismiss", "stage.video.import", "stage.video.toggle", "stage.video.remove", "stage.video.bind", "stage.video.unbind", "stage.video.stop", "stage.video.recoverStop", "stage.video.mode", "stage.video.brightness"]
+    static let supportedCommands = ["screen.list", "screen.play", "screen.stop", "video.load", "video.choose", "video.select", "video.remove", "video.play", "video.pause", "video.stop", "video.recoverStop", "video.mode", "video.brightness", "video.bind", "video.unbind", "video.bound.play", "video.bound.dismiss",
+        // The stage settings window's 播放器 page uses the `stage.video.*`
+        // names. `import`/`mode`/`toggle` were handled here but missing from
+        // this list, so the settings transport refused them before dispatch
+        // (`UnityMediaHost.command` guard) and the controls never appeared.
+        "stage.video.import", "stage.video.toggle", "stage.video.remove", "stage.video.bind", "stage.video.unbind", "stage.video.stop", "stage.video.recoverStop", "stage.video.mode", "stage.video.brightness"]
     struct CurrentTrack {
         let id: String
         let title: String
@@ -229,6 +234,10 @@ import simd
         if op.hasPrefix("stage.video.") {
             var native = value
             native["op"] = op == "stage.video.import" ? "video.choose" : String(op.dropFirst("stage.".count))
+            // The stage panel names the chosen mode tile in `id`
+            // (`stage_panels.rs` `pickerButton`); the native mode command reads
+            // `value`. Same field, one spelling at the owner.
+            if op == "stage.video.mode", native["value"] == nil { native["value"] = native["id"] }
             if op == "stage.video.bind" || op == "stage.video.unbind" {
                 guard let track = currentTrack() else { return false }
                 native["trackID"] = track.id
@@ -284,7 +293,12 @@ import simd
         case "video.stop": videos.disableByUser()
         case "video.recoverStop": videos.recoverPendingByStopping()
         case "video.mode":
-            guard let mode = value["value"] as? String, let selected = StageVideoPlaybackMode(rawValue: mode) else { return false }
+            // The stage panel names the chosen tile in `id` (`stage_panels.rs`
+            // `pickerButton` → `{"op":"stage.video.mode","id":…}`); the settings
+            // video page and the agent tools use `value`. Accept both spellings
+            // of the same field rather than rejecting one caller's shape.
+            guard let requested = value["value"] as? String,
+                  let selected = StageVideoPlaybackMode(rawValue: requested) else { return false }
             videos.setMode(selected)
         case "video.brightness":
             // Same band as the product host (`GMGNRadioApp` `case

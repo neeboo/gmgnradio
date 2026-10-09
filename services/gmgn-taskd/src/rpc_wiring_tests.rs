@@ -85,6 +85,27 @@ async fn unknown_methods_still_return_unknown_method() {
     }
 }
 
+/// The two storage steps behind `music_account_connect` are functions, and the
+/// account snapshot is `music_account_session_state`. None of the three names may
+/// come back as an RPC method: `connect` owns the provider round-trip, so a
+/// published `begin`/`finish` would let any local caller attest its own
+/// validation result.
+#[tokio::test]
+async fn music_account_internal_steps_are_not_rpc_methods() {
+    let fixture = Fixture::new();
+    for method in [
+        "music_account_read",
+        "music_account_begin",
+        "music_account_finish",
+    ] {
+        assert_eq!(
+            fixture.call(method, json!({"providerID": "netease"})).await,
+            Err("unknown_method"),
+            "`{method}` 是 connect 的内部步骤，不该在 daemon 上可调用"
+        );
+    }
+}
+
 #[tokio::test]
 async fn music_account_session_state_reaches_the_implementation() {
     let fixture = Fixture::new();

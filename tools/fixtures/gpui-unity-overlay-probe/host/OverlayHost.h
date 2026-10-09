@@ -10,6 +10,12 @@ int32_t probe_attach_view(void *parent, void *actual_gpui_view, float width, flo
 int32_t probe_detach_view(void *actual_gpui_view);
 uint64_t probe_native_geometry_revision(void);
 double probe_native_backing_scale(void);
+// Host content viewport in logical points: the size the overlay must lay out
+// for. 1 = available, 0 = no host view or invalid size.
+int32_t probe_native_host_size(float *width, float *height);
+// Re-assert the host's current content viewport from the caller's poll.
+// Change gated: 1 = the applied viewport changed, 0 = it already matched.
+int32_t probe_native_sync_geometry(void);
 // Read-only native focus/pointer fact; 1 means the mounted panel currently owns input.
 int32_t probe_native_owns_input(void);
 int32_t probe_native_text_input_focused(void);

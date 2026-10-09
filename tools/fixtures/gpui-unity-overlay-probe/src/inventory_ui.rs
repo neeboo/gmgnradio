@@ -12,20 +12,23 @@
 //! - **The component owns the look.** `ResidentPropEditorPane` paints the panel,
 //!   the rows, the kit delete dialog and the tokens. This file owns the
 //!   projection in and the translation out, nothing else.
-//! - **The built-in device strip stays.** 音乐播放器 / 许愿机 placement was an
-//!   operation of the old adapter (`ui.device.place`); the component has no slot
-//!   for it, so it is drawn above the panel with the same shared primitives and
-//!   the same op/payload.
+//! - **One list owns everything that is in the room.** 音乐播放器 / 许愿机 are
+//!   the world's own built-in devices (`builtinDevices.templates`), and they are
+//!   objects: they get the same rows, the same groups and the same status words
+//!   as every generated prop. The one thing that differs is what the world
+//!   authority accepts for them — placement through `ui.device.place`
+//!   (`world_device.rs::can_place`) and nothing else, because every
+//!   `world.prop.command` arm starts at `world_prop::reduce` →
+//!   `generated(&before)?` → `world_prop_basic_object`
+//!   (`services/gmgn-taskd/src/world_prop.rs:1884` → `:130-134`). So a device row
+//!   carries no 删除 (and no 收回/挂点/尺寸 in the selected pane) instead of an
+//!   entry that would fail after the click.
 //! - **Local state stays local.** The scope (我的物件 / 房间里), the 已结束 fold,
 //!   the selected row and the hold point are this click's UI state. They never
 //!   travel as invented host commands — only as a re-projection.
 use crate::{UiCommandQueue, enqueue_ui_command};
 use gmgn_gpui_ui::stage_panels::ResidentPropEditorPane;
-use gmgn_gpui_ui::{
-    primitives as ui,
-    ui_tokens::{self as tokens, props as prop_metrics, scene as s},
-};
-use gpui_kit::assets::IconName;
+use gmgn_gpui_ui::ui_tokens::{self as tokens, props as prop_metrics, scene as s};
 use gpui_kit::*;
 use serde_json::{Value, json};
 use std::{cell::RefCell, rc::Rc};
@@ -74,6 +77,10 @@ pub struct Row {
     pub status: String,
     pub actions: Vec<&'static str>,
     pub group: &'static str,
+    /// Set exactly for a row that came from `builtinDevices.templates`: the id
+    /// the host's own `ui.device.place` addresses. `None` for every generated
+    /// prop and wish row.
+    pub device: Option<String>,
 }
 
 fn group_of(state: &str) -> &'static str {
@@ -98,6 +105,83 @@ fn section_title(group: &str, count: usize) -> String {
 
 fn text(value: &Value) -> Option<&str> {
     value.as_str().filter(|v| !v.is_empty())
+}
+
+/// The product names of the world's own devices. The classifier is the
+/// renderer, exactly the one `UnityBuiltinDevicesBridge.snapshot(package:)`
+/// published them under (`apps/macos/UnityHost/UnityBuiltinDevicesBridge.swift:17`
+/// keeps `builtin.jukebox` / `builtin.wish_machine`); a template with any other
+/// renderer is not a basic device and never becomes a row.
+fn device_name(renderer: Option<&str>) -> Option<&'static str> {
+    match renderer {
+        Some("builtin.jukebox") => Some("音乐播放器"),
+        Some("builtin.wish_machine") => Some("许愿机"),
+        _ => None,
+    }
+}
+
+/// The `builtinDevices.templates` snapshot, kept to the real devices. Each entry
+/// is the authored procedural declaration
+/// (`UnityBuiltinDevicesBridge.snapshot(package:)`,
+/// `UnityMediaHost.swift:1492 "builtinDevices": ["templates": deviceTemplates]`)
+/// whose id is the Rust catalog's own (`services/gmgn-taskd/src/world_device.rs:96-102`
+/// `("prop.jukebox","builtin.jukebox") | ("wish_machine.device","builtin.wish_machine")`)
+/// and whose committed object id is the template id itself
+/// (`world_device.rs` `next["objectStates"][&pointer.template_id] = object`).
+pub fn device_templates(snapshot: &Value) -> Vec<&Value> {
+    snapshot["builtinDevices"]["templates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|template| {
+            text(&template["id"]).is_some() && device_name(template["renderer"].as_str()).is_some()
+        })
+        .collect()
+}
+
+/// Whether `id` is one of the world's own built-in devices. This is the only
+/// test the adapter uses to pick the device command face, so the decision comes
+/// from the host's own catalog and never from an id prefix.
+pub fn is_builtin_device(snapshot: &Value, id: &str) -> bool {
+    device_templates(snapshot)
+        .iter()
+        .any(|template| template["id"].as_str() == Some(id))
+}
+
+/// Whether a device is in the room: the world state records it under its own
+/// template id with `isEnabled` (`world_device.rs::can_place` reads the same
+/// field). A device has no tombstone path — `delete` is refused for it — so it
+/// can never appear under 已结束.
+fn device_placed(snapshot: &Value, id: &str) -> bool {
+    snapshot["unityWorldAuthority"]["state"]["objectStates"][id]["isEnabled"].as_bool() == Some(true)
+}
+
+/// 基础设备 rows: the same shape, the same groups and the same status words as a
+/// generated prop. `place` is the device's real capability and the row's
+/// selectability marker; 删除 is deliberately absent (no entry to click).
+fn device_rows(snapshot: &Value) -> Vec<Row> {
+    device_templates(snapshot)
+        .into_iter()
+        .filter_map(|template| {
+            let id = text(&template["id"])?;
+            let name = device_name(template["renderer"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| id.to_owned());
+            let placed = device_placed(snapshot, id);
+            let state = if placed { "placed" } else { "inInventory" };
+            Some(Row {
+                id: format!("device:{id}"),
+                object_id: id.to_owned(),
+                job_id: None,
+                name,
+                state,
+                status: if placed { "已摆放" } else { "在库里（没摆）" }.into(),
+                actions: vec!["place"],
+                group: group_of(state),
+                device: Some(id.to_owned()),
+            })
+        })
+        .collect()
 }
 
 /// The whole list: world objects, tombstones and wish jobs, one row each.
@@ -146,8 +230,13 @@ pub fn rows(snapshot: &Value) -> Vec<Row> {
             status,
             actions,
             group: group_of(state),
+            device: None,
         });
     }
+    // 基础设备 come next, before the tombstones: same list, same groups, same
+    // status words — they are the room's own objects, not a second surface.
+    // (A device is never a tombstone: `delete` is refused for it.)
+    out.extend(device_rows(snapshot));
     // Deleted objects leave `objectStates` and become tombstones; that is the
     // only place 「已结束」 can still name them.
     for (id, tombstone) in state["propTombstones"].as_object().into_iter().flatten() {
@@ -164,6 +253,7 @@ pub fn rows(snapshot: &Value) -> Vec<Row> {
             status: "已删除".into(),
             actions: Vec::new(),
             group: "ended",
+            device: None,
         });
     }
     // Newest wish first (the array is append-ordered), and only jobs whose object
@@ -213,6 +303,7 @@ pub fn rows(snapshot: &Value) -> Vec<Row> {
             status: status.to_owned(),
             actions,
             group: group_of(state),
+            device: None,
         });
     }
     out
@@ -227,6 +318,9 @@ fn row_json(row: &Row) -> Value {
         "state": row.state,
         "statusText": row.status,
         "actions": row.actions,
+        // Null for every generated prop / wish row; the component's device
+        // branch is driven by this and by `selected.deviceTemplateID` only.
+        "deviceTemplateID": row.device,
     })
 }
 
@@ -313,6 +407,32 @@ pub fn project(snapshot: &Value, local: &LocalState) -> Value {
 }
 
 fn selected_json(snapshot: &Value, local: &LocalState, id: &str) -> Option<Value> {
+    // A built-in device is selectable exactly like a generated prop: the same
+    // row click, the same status read from the world state. What it must not
+    // claim is a generated asset's control set (收回 / 挂点 / 尺寸 / 删除) —
+    // `deviceTemplateID` is what makes the component draw the device's one real
+    // operation instead, and it is the id the host's `ui.device.place` takes.
+    if is_builtin_device(snapshot, id) {
+        let name = device_templates(snapshot)
+            .into_iter()
+            .find(|template| template["id"].as_str() == Some(id))
+            .and_then(|template| device_name(template["renderer"].as_str()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| id.to_owned());
+        let placed = device_placed(snapshot, id);
+        return Some(json!({
+            "objectID": id,
+            "name": name,
+            // A device can never be in a resident's hand: every `hold` arm goes
+            // through the generated-prop reducer (`world_prop.rs:1884`).
+            "held": false,
+            // 摆放 is the only op, and it is available whether the device is
+            // already placed (the host's device placement relocates it) or not.
+            "enabled": placed,
+            "deviceTemplateID": id,
+            "holdPoint": local.hold_point,
+        }));
+    }
     let item = snapshot["unityInventory"]
         .as_array()?
         .iter()
@@ -438,21 +558,54 @@ pub fn translate(
     local: &mut LocalState,
     sequence: &mut u64,
 ) -> Option<Value> {
-    match command["op"].as_str()? {
-        // Read/refresh the wish projection through the bridge that owns it.
-        "stage.props.load" => Some(json!({"op": "wish.status", "requestID": request_id(sequence)})),
+    let op = command["op"].as_str()?;
+    // The scope, the fold and the selection are this click's UI state: they are
+    // the same for a generated prop, a wish job and a built-in device, and they
+    // never become host commands. They are decided before the device guard so a
+    // selected device can still be deselected, folded or scoped.
+    match op {
         "stage.props.filter" => {
             local.placed_only = command["placedOnly"].as_bool() == Some(true);
-            None
+            return None;
         }
         "stage.props.fold" => {
             local.ended_folded = command["folded"].as_bool() == Some(true);
-            None
+            return None;
         }
         "stage.props.select" => {
             local.selected = text(&command["objectID"]).map(str::to_owned);
-            None
+            return None;
         }
+        _ => {}
+    }
+    // 基础设备的命令面只有一条真实路径。The world authority takes exactly
+    // `ui.device.place` for a device (`world_device.rs::can_place` accepts a
+    // device whose only metadata is `gmgn.builtin-device.v1`, and
+    // `WorldInteractionController.BeginDevicePlacement` serves both a first
+    // placement and a relocation), while every `world.prop.command` arm —
+    // delete, withdraw, hold, adjustGrip, resize, place — runs
+    // `world_prop::reduce`, whose first act is `generated(&before)?` →
+    // `world_prop_basic_object` (`services/gmgn-taskd/src/world_prop.rs:1884`
+    // → `:130-134`). So an unsupported op for a device is refused *here*, before
+    // any command exists, instead of becoming a click that fails.
+    if let Some(device) = target(command, local).filter(|id| is_builtin_device(snapshot, id)) {
+        return match op {
+            // 摆放 / 重新摆放 — the host's own device placement.
+            "stage.props.hold" if command["point"].is_null() => {
+                device_place_command(&json!({"id": device}))
+            }
+            // Read/refresh and the panel's × are not object mutations and stay
+            // available for a device exactly as they are for anything else.
+            "stage.props.load" => Some(json!({"op": "wish.status", "requestID": request_id(sequence)})),
+            "stage.props.close" => Some(json!({"op": "ui.overlay.panel", "expanded": false})),
+            // Everything else here (delete / withdraw / hold point / resize /
+            // nudge / rotate / return) would be refused by name.
+            _ => None,
+        };
+    }
+    match op {
+        // Read/refresh the wish projection through the bridge that owns it.
+        "stage.props.load" => Some(json!({"op": "wish.status", "requestID": request_id(sequence)})),
         "stage.props.claim" | "stage.props.retry" | "stage.props.retryInventoryRegistration" => {
             let wish = match command["op"].as_str()? {
                 "stage.props.claim" => "wish.claim",
@@ -595,7 +748,6 @@ pub struct InventoryPane {
     local: LocalState,
     sequence: u64,
     notice: String,
-    device_templates: Vec<Value>,
     _observation: Subscription,
 }
 
@@ -613,25 +765,29 @@ impl InventoryPane {
             local: LocalState::default(),
             sequence: 0,
             notice: String::new(),
-            device_templates: Vec::new(),
             _observation: observation,
         }
     }
 
     pub fn update_snapshot(&mut self, snapshot: &Value, cx: &mut Context<Self>) {
         self.snapshot = snapshot.clone();
-        self.device_templates = snapshot["builtinDevices"]["templates"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
         self.notice = notice(snapshot);
-        if self.local.selected.as_deref().is_some_and(|id| {
-            !snapshot["unityInventory"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|item| item["objectID"].as_str() == Some(id))
-        }) {
+        // A selection survives while the host still publishes the object: a
+        // generated prop from `unityInventory`, or one of the world's own
+        // devices. A device is never in `unityInventory`
+        // (`WorldRuntimeBridge.PublishInventory` lists only objects carrying
+        // `gmgn.generated-prop.v1`, and a device carries
+        // `gmgn.builtin-device.v1`), so without this a selected 音乐播放器 would
+        // be dropped on the next snapshot.
+        let selection_alive = self.local.selected.as_deref().is_none_or(|id| {
+            is_builtin_device(snapshot, id)
+                || snapshot["unityInventory"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|item| item["objectID"].as_str() == Some(id))
+        });
+        if !selection_alive {
             self.local.selected = None;
         }
         self.publish(cx);
@@ -708,85 +864,29 @@ impl InventoryPane {
             self.publish(cx);
         }
     }
-
-    fn submit(&mut self, command: Value, cx: &mut Context<Self>) {
-        if !enqueue_ui_command(&self.commands, command) {
-            self.notice = QUEUE_FULL.into();
-        }
-        cx.notify();
-    }
-
-    fn device_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let mut card = ui::scene_card()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p(px(s::PANEL_PADDING))
-            .min_w_0()
-            .child(ui::section_title("基本设备 · 保留"));
-        let mut any = false;
-        for template in &self.device_templates {
-            let Some(command) = device_place_command(template) else {
-                continue;
-            };
-            let title = match template["renderer"].as_str() {
-                Some("builtin.jukebox") => "音乐播放器",
-                Some("builtin.wish_machine") => "许愿机",
-                _ => continue,
-            };
-            let id = command["templateID"].as_str().unwrap_or_default().to_owned();
-            any = true;
-            card = card.child(
-                ui::scene_inset()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .p_3()
-                    .min_w_0()
-                    .child(div().flex_1().min_w_0().child(ui::body(title)))
-                    .child(
-                        ui::icon_button(
-                            SharedString::from(format!("device-place-{id}")),
-                            IconName::Box,
-                            "摆放",
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.submit(command.clone(), cx);
-                        })),
-                    ),
-            );
-        }
-        any.then(|| card.into_any_element())
-    }
 }
 
 impl Render for InventoryPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_pending(window, cx);
         self.collect(cx);
-        let devices = self.device_section(cx);
-        let mut root = div()
+        // One panel, one card: 基础设备 rows live inside the component's list
+        // (`device_rows`), so there is no second surface to anchor and nothing
+        // for two panels to overlap with. The shell pins this pane to the same
+        // bottom-right corner as the transport bar (`shell_ui.rs`
+        // `panel_container`), which is the original's
+        // `propEditorPanel.trailing/bottom == transportControls.trailing/top`
+        // (`StageWindowController.swift:1521-1526`).
+        div()
             .flex()
             .flex_col()
-            .size_full()
             .min_h_0()
             .min_w_0()
             .gap(px(s::PANEL_GAP))
             .font_family(tokens::FONT_FAMILY)
             .text_size(px(tokens::BODY))
-            .text_color(rgba(s::TEXT));
-        if let Some(devices) = devices {
-            root = root.child(devices);
-        }
-        root = root.child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .child(self.editor.clone()),
-        );
-        root
+            .text_color(rgba(s::TEXT))
+            .child(self.editor.clone())
     }
 }
 
@@ -818,7 +918,15 @@ mod tests {
                     "layoutUndo": {},
                     "propTombstones": {"prop-gone":{"objectID":"prop-gone","displayName":"旧花瓶"}},
                     "objectStates": {
-                        "prop-hand": {"metadata": {"gmgn.prop-grip.v1": "{\"avatarAssetID\":\"2b\",\"hand\":\"rightHand\",\"normalizedGrip\":[0.5,0.5,0.5],\"localOffset\":[0.0,0.0,0.0],\"localRotation\":[0.0,0.0,0.0,1.0]}"}}
+                        "prop-hand": {"metadata": {"gmgn.prop-grip.v1": "{\"avatarAssetID\":\"2b\",\"hand\":\"rightHand\",\"normalizedGrip\":[0.5,0.5,0.5],\"localOffset\":[0.0,0.0,0.0],\"localRotation\":[0.0,0.0,0.0,1.0]}"}},
+                        // Devices are committed into the same `objectStates` under
+                        // their template id (`world_device.rs`), with the
+                        // `gmgn.builtin-device.v1` declaration and nothing else.
+                        "prop.jukebox": {"isEnabled":true,"metadata":{"gmgn.builtin-device.v1":"{\"id\":\"prop.jukebox\"}"}},
+                        "wish_machine.device": {"isEnabled":false,"metadata":{"gmgn.builtin-device.v1":"{\"id\":\"wish_machine.device\"}"}},
+                        // An object whose id matches one of the non-device
+                        // templates: it is an ordinary object, never a device.
+                        "prop.not-a-device": {"isEnabled":true,"metadata":{}}
                     }
                 }
             },
@@ -837,7 +945,17 @@ mod tests {
             },
             "inventoryMutation": {"generation": 3},
             "unityUICommandResult": {"op":"ui.inventory.place","status":"started"},
-            "builtinDevices": {"templates": [{"id":"builtin-jukebox","renderer":"builtin.jukebox"}]}
+            // The real shape `UnityBuiltinDevicesBridge.snapshot(package:)` /
+            // `UnityMediaHost.swift:1492` publish: the authored procedural
+            // declaration under the Rust catalog's own id, plus one template
+            // that is not a device at all (negative control). 音乐播放器 is in
+            // the room (the world state records it under its own id), 许愿机 is
+            // not — so both device groups are exercised.
+            "builtinDevices": {"templates": [
+                {"id":"prop.jukebox","renderer":"builtin.jukebox","size":[1,1,1]},
+                {"id":"wish_machine.device","renderer":"builtin.wish_machine","size":[1,1,1]},
+                {"id":"prop.not-a-device","renderer":"prop.procedural","size":[1,1,1]}
+            ]}
         })
     }
 
@@ -880,8 +998,9 @@ mod tests {
         let sections = projection["sections"].as_array().unwrap();
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0]["group"], "inRoom");
-        // 房间里 = the placed rows, including one the resident is carrying.
-        assert_eq!(projection["rowCount"], 2);
+        // 房间里 = the placed rows, including one the resident is carrying —
+        // and, since it is an object of the room, the placed 音乐播放器.
+        assert_eq!(projection["rowCount"], 3);
 
         let mine = project(&production(), &local());
         assert_eq!(mine["placedOnly"], false);
@@ -945,6 +1064,9 @@ mod tests {
             .collect::<Vec<_>>());
         snapshot["wish"] = json!({"pending": false, "entries": []});
         snapshot["unityWorldAuthority"]["state"]["propTombstones"] = json!({});
+        // A world whose package authors no devices contributes no device rows;
+        // the budget is the same whichever kind of object fills it.
+        snapshot["builtinDevices"] = json!({"templates": []});
         let projection = project(&snapshot, &local());
         let rows = projection["sections"]
             .as_array()
@@ -955,6 +1077,250 @@ mod tests {
         assert_eq!(rows, ROW_BUDGET);
         assert_eq!(projection["remainingCount"], 3);
         assert_eq!(projection["rowCount"], 9);
+    }
+
+    /// 基础设备 = 物品：one list, one row shape, the same group/status words as a
+    /// generated prop. The only difference is that 删除 has no entry at all
+    /// (the world authority answers `world_prop_basic_object` for it:
+    /// `services/gmgn-taskd/src/world_prop.rs:1884` → `:130-134`).
+    #[test]
+    fn builtin_devices_are_rows_in_the_same_list_without_a_delete_entry() {
+        let snapshot = production();
+        let all = rows(&snapshot);
+        let find = |id: &str| all.iter().find(|row| row.object_id == id);
+
+        let jukebox = find("prop.jukebox").expect("音乐播放器 is a row of this list");
+        assert_eq!(jukebox.id, "device:prop.jukebox");
+        assert_eq!(jukebox.name, "音乐播放器");
+        assert_eq!(jukebox.device.as_deref(), Some("prop.jukebox"));
+        // Same state/status/group vocabulary as a placed generated prop.
+        assert_eq!(jukebox.state, "placed");
+        assert_eq!(jukebox.status, "已摆放");
+        assert_eq!(jukebox.group, "inRoom");
+        assert_eq!(jukebox.group, find("prop-placed").unwrap().group);
+        assert_eq!(jukebox.status, find("prop-placed").unwrap().status);
+        // The device's real capability, and never 删除.
+        assert_eq!(jukebox.actions, vec!["place"]);
+        assert!(!jukebox.actions.contains(&"delete"), "no delete entry");
+
+        let wish = find("wish_machine.device").expect("许愿机 is a row of this list");
+        assert_eq!(wish.name, "许愿机");
+        assert_eq!(wish.state, "inInventory");
+        assert_eq!(wish.status, "在库里（没摆）");
+        assert_eq!(wish.group, "inInventory");
+        assert_eq!(wish.actions, vec!["place"]);
+        assert!(!wish.actions.contains(&"delete"));
+        // A device is never 已结束 (删除 is refused, so it has no tombstone path).
+        assert!(all
+            .iter()
+            .filter(|row| row.device.is_some())
+            .all(|row| row.group == "inRoom" || row.group == "inInventory"));
+        // A template that is not one of the two authored renderers never becomes
+        // a device row, even when an object state carries its id.
+        assert!(all.iter().all(|row| row.object_id != "prop.not-a-device"));
+        assert!(!is_builtin_device(&snapshot, "prop.not-a-device"));
+        assert!(is_builtin_device(&snapshot, "prop.jukebox"));
+
+        // One list: the device rows sit in the very same sections as the objects.
+        // (The wish backlog would eat the 6-row budget before 在房间里, so this
+        // projection keeps the world objects and the devices only.)
+        let mut list = snapshot.clone();
+        list["wish"] = json!({"pending": false, "entries": []});
+        list["unityWorldAuthority"]["state"]["propTombstones"] = json!({});
+        let projection = project(&list, &local());
+        let sections = projection["sections"].as_array().unwrap();
+        let room = sections
+            .iter()
+            .find(|section| section["group"] == "inRoom")
+            .unwrap();
+        let room_rows = room["rows"].as_array().unwrap();
+        assert!(room_rows.iter().any(|row| row["objectID"] == "prop-placed"));
+        assert!(room_rows.iter().any(|row| row["objectID"] == "prop.jukebox"));
+        assert!(room_rows
+            .iter()
+            .any(|row| row["deviceTemplateID"] == "prop.jukebox"));
+        assert!(room_rows
+            .iter()
+            .find(|row| row["objectID"] == "prop-placed")
+            .unwrap()
+            .get("deviceTemplateID")
+            .is_some_and(Value::is_null));
+        // No device row anywhere in the projection carries a delete action.
+        for section in sections {
+            for row in section["rows"].as_array().into_iter().flatten() {
+                if row["deviceTemplateID"].is_string() {
+                    assert!(
+                        !row["actions"].as_array().unwrap().contains(&json!("delete")),
+                        "{row} must not offer 删除"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A world that publishes no devices (or a template without an id) adds no
+    /// rows: the list is still exactly the generated props and wish jobs.
+    #[test]
+    fn a_world_without_builtin_devices_adds_no_device_rows() {
+        let with_devices = rows(&production()).len();
+        let mut snapshot = production();
+        snapshot["builtinDevices"] = json!({"templates": []});
+        assert!(rows(&snapshot).iter().all(|row| row.device.is_none()));
+        assert_eq!(rows(&snapshot).len(), with_devices - 2);
+        // A missing key behaves like an empty list.
+        snapshot["builtinDevices"] = Value::Null;
+        assert!(rows(&snapshot).iter().all(|row| row.device.is_none()));
+        // A template the host cannot address (no id) is not a row.
+        snapshot["builtinDevices"] = json!({"templates":[{"renderer":"builtin.jukebox"}]});
+        assert!(rows(&snapshot).iter().all(|row| row.device.is_none()));
+        assert!(!is_builtin_device(&snapshot, "prop.jukebox"));
+    }
+
+    /// Selecting a device is selecting an object: the same selection payload,
+    /// the same status read, plus the template id that picks the device command
+    /// face. It must not claim a generated asset's controls (no longest edge, no
+    /// hold point, no 收回).
+    #[test]
+    fn a_builtin_device_is_selectable_and_projects_no_generated_asset_controls() {
+        let mut state = local();
+        state.selected = Some("prop.jukebox".into());
+        state.hold_point = "back".into();
+        let projection = project(&production(), &state);
+        let selected = &projection["selected"];
+        assert_eq!(selected["objectID"], "prop.jukebox");
+        assert_eq!(selected["name"], "音乐播放器");
+        assert_eq!(selected["deviceTemplateID"], "prop.jukebox");
+        assert_eq!(selected["held"], false);
+        assert_eq!(selected["enabled"], true);
+        assert_eq!(selected["holdPoint"], "back");
+        assert!(selected.get("longestEdge").is_none());
+        assert!(selected["holdUnavailableReason"].is_null());
+
+        // 许愿机 is not placed: the same row still selects, and says so.
+        state.selected = Some("wish_machine.device".into());
+        let projection = project(&production(), &state);
+        assert_eq!(projection["selected"]["name"], "许愿机");
+        assert_eq!(projection["selected"]["enabled"], false);
+        assert_eq!(projection["selected"]["deviceTemplateID"], "wish_machine.device");
+
+        // A template that is not a device cannot be selected as one.
+        state.selected = Some("prop.not-a-device".into());
+        let projection = project(&production(), &state);
+        assert!(projection["selected"].is_null());
+    }
+
+    /// 摆放 / 重新摆放 reaches the host through its own device op
+    /// (`ui.device.place`, `GPUIChat2Probe.cs:125-138` →
+    /// `WorldInteractionController.BeginDevicePlacement`), for a device that is
+    /// already in the room as well as for one that is not. Everything the world
+    /// authority refuses for a device is refused here, before a click can fail.
+    #[test]
+    fn a_builtin_device_places_through_ui_device_place_and_nothing_else() {
+        let snapshot = production();
+        let mut state = local();
+        state.selected = Some("prop.jukebox".into());
+        let mut sequence = 0;
+        let place = translate(
+            &json!({"op":"stage.props.hold"}),
+            &snapshot,
+            &mut state,
+            &mut sequence,
+        )
+        .expect("the placement entry must reach the device op");
+        assert_eq!(place, json!({"op":"ui.device.place","templateID":"prop.jukebox"}));
+        assert_eq!(place["templateID"], "prop.jukebox");
+
+        // The same entry for a device that is not in the room yet.
+        state.selected = Some("wish_machine.device".into());
+        assert_eq!(
+            translate(&json!({"op":"stage.props.hold"}), &snapshot, &mut state, &mut sequence)
+                .expect("an unplaced device places the same way"),
+            json!({"op":"ui.device.place","templateID":"wish_machine.device"})
+        );
+
+        // A hold point (挂点) is a generated-prop operation.
+        state.selected = Some("prop.jukebox".into());
+        assert!(
+            translate(
+                &json!({"op":"stage.props.hold","point":"waist"}),
+                &snapshot,
+                &mut state,
+                &mut sequence
+            )
+            .is_none()
+        );
+        // And so is every other operation the authority answers
+        // `world_prop_basic_object` for. None of them may become a command.
+        for op in [
+            json!({"op":"stage.props.delete"}),
+            json!({"op":"stage.props.withdraw"}),
+            json!({"op":"stage.props.resize","value":1.2}),
+            json!({"op":"stage.props.nudge","y":0.02,"z":0.0}),
+            json!({"op":"stage.props.rotate","direction":1}),
+            json!({"op":"stage.props.return"}),
+        ] {
+            assert!(
+                translate(&op, &snapshot, &mut state, &mut sequence).is_none(),
+                "{op} must not become a host command for a built-in device"
+            );
+        }
+        // The read/refresh and the panel's × are not object mutations.
+        assert_eq!(
+            translate(&json!({"op":"stage.props.load"}), &snapshot, &mut state, &mut sequence)
+                .unwrap()["op"],
+            "wish.status"
+        );
+        assert_eq!(
+            translate(&json!({"op":"stage.props.close"}), &snapshot, &mut state, &mut sequence)
+                .unwrap(),
+            json!({"op":"ui.overlay.panel","expanded":false})
+        );
+        // Local state keeps working while a device is selected: scope, fold and
+        // selection are the same for every kind of object.
+        assert!(
+            translate(
+                &json!({"op":"stage.props.filter","placedOnly":true}),
+                &snapshot,
+                &mut state,
+                &mut sequence
+            )
+            .is_none()
+        );
+        assert_eq!(state.placed_only, true);
+        assert!(
+            translate(
+                &json!({"op":"stage.props.fold","group":"ended","folded":false}),
+                &snapshot,
+                &mut state,
+                &mut sequence
+            )
+            .is_none()
+        );
+        assert_eq!(state.ended_folded, false);
+        assert!(
+            translate(
+                &json!({"op":"stage.props.select","objectID":"prop-bag"}),
+                &snapshot,
+                &mut state,
+                &mut sequence
+            )
+            .is_none()
+        );
+        assert_eq!(state.selected.as_deref(), Some("prop-bag"));
+    }
+
+    /// The device placement answer is the receipt the adapter already speaks:
+    /// the same two sentences `ui.inventory.place` gets, from the same op.
+    #[test]
+    fn the_device_placement_receipt_uses_the_existing_placement_notice() {
+        let mut snapshot = production();
+        snapshot["unityUICommandResult"] = json!({"op":"ui.device.place","status":"started"});
+        assert_eq!(notice(&snapshot), "已进入摆放预览；请在场景中确认位置。");
+        snapshot["unityUICommandResult"] = json!({"op":"ui.device.place","status":"rejected"});
+        assert_eq!(
+            notice(&snapshot),
+            "当前无法开始摆放，请等待模型与场景准备完成后重试。"
+        );
     }
 
     #[test]

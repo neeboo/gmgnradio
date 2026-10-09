@@ -335,6 +335,29 @@ final class UnityWorldSessionComposition {
         activity.invalidateProjection()
     }
 
+    /// The activity list the stage settings surface may render: the authored
+    /// catalog filtered by the *same* policy the menu path uses
+    /// (`ResidentPerformanceMotionPolicy.isAvailable` over the approved motions
+    /// of the current world and the rendered avatar format). An activity that
+    /// this list omits is one `startActivityMeasured` could not run, so the
+    /// projection and the run guard can never disagree.
+    var availableActivityItems: [[String: Any]] {
+        guard !closed else { return [] }
+        let format = avatarFormat
+        let approved = approvedMotions
+        return context.activityCatalog.definitions
+            .filter { ResidentPerformanceMotionPolicy.isAvailable(activityID: $0.id, avatarFormat: format, approvedMotions: approved) }
+            .map { ["id": $0.id, "name": $0.displayName ?? $0.id] }
+    }
+
+    /// Whether `startActivityMeasured` can be attempted for this id right now.
+    /// The manifest must declare it and the motion policy must accept it.
+    func canRunActivity(id: String) -> Bool {
+        guard !closed,
+              context.manifest.activityDefinitions.contains(where: { $0.id == id }) || context.manifest.activities.contains(where: { $0.id == id }) else { return false }
+        return ResidentPerformanceMotionPolicy.isAvailable(activityID: id, avatarFormat: avatarFormat, approvedMotions: approvedMotions)
+    }
+
     func refreshApprovedMotions() throws {
         guard !closed else { throw CompositionError.sessionClosed }
         let installed = try motionStore.listMotions()
@@ -811,6 +834,7 @@ final class UnityWorldSessionComposition {
          "agentNotifications": notifications?.snapshot() ?? [:],
          "notificationRetryFailures": notificationRetry.failures,
          "renderedWishOutputIDs": wishOutputReceipts.renderedObjectIDs,
+         "activityItems": availableActivityItems,
          "currentActivityPhase": context.snapshot.activeActivity?.phase.rawValue as Any? ?? NSNull()]
     }
 

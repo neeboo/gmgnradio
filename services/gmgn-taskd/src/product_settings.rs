@@ -1266,4 +1266,32 @@ mod tests {
         .unwrap();
         assert_eq!(apply(&mut c,json!({"selectedWorldID":"world","ttsProvider":"fish","ttsModel":"s2.1-pro-free","ttsVoice":"actual-reference"})).unwrap()["values"]["selectedWorldID"],"world");
     }
+
+    /// One authority, two revision caches: the stale cache is refused, and a cache
+    /// that tracks the revision it was handed writes consecutively. This is the
+    /// real-machine `product_settings_revision_conflict`: `UnityMediaHost` wrote
+    /// through two `RustProductSettingsClient` instances on one `tasks.sqlite3`.
+    #[test]
+    fn a_second_revision_cache_on_one_authority_is_refused() {
+        let mut c = Connection::open_in_memory().unwrap();
+        schema(&c).unwrap();
+        request(&mut c, "product_settings_import", &json!({"values":{}})).unwrap();
+        let mut cache_a = read(&c).unwrap()["revision"].as_i64().unwrap();
+        let cache_b = cache_a;
+        assert_eq!(cache_a, 1);
+        let first = request(&mut c, "product_settings_apply", &json!({"requestID":"a","expectedRevision":cache_a,"changes":{"locale":"ja"}})).unwrap();
+        cache_a = first["revision"].as_i64().unwrap();
+        assert_eq!(cache_a, 2);
+        assert_eq!(
+            request(&mut c, "product_settings_apply", &json!({"requestID":"b","expectedRevision":cache_b,"changes":{"autoSpeak":false}})),
+            Err("product_settings_revision_conflict")
+        );
+        // One cache per authority: the writer reads back the revision it was handed
+        // and two consecutive settings writes both land.
+        let cache_b = read(&c).unwrap()["revision"].as_i64().unwrap();
+        let second = request(&mut c, "product_settings_apply", &json!({"requestID":"b","expectedRevision":cache_b,"changes":{"autoSpeak":false}})).unwrap();
+        assert_eq!(second["revision"], cache_b + 1);
+        let third = request(&mut c, "product_settings_apply", &json!({"requestID":"c","expectedRevision":second["revision"],"changes":{"locale":"en"}})).unwrap();
+        assert_eq!(third["revision"], second["revision"].as_i64().unwrap() + 1);
+    }
 }

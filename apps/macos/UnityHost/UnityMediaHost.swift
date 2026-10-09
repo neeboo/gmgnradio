@@ -62,7 +62,7 @@ final class UnityMediaHost {
             guard let self, !self.closed, let session = self.worldSession else { throw CancellationError() }
             try await session.context.setWeather(weather, source: .ui)
         })
-    private lazy var djPreferences = DJAgentPreferences(defaults: defaults)
+    private lazy var djPreferences = DJAgentPreferences(defaults: defaults, settings: productSettings.authority)
     private lazy var djProgram = UnityDJProgramBridge(archiveRoot: root.appendingPathComponent("gmgn radio/DJPrograms", isDirectory: true),
         hooks: .init(plan: { [weak self] instruction in
             guard let self, !self.closed else { throw CancellationError() }
@@ -87,6 +87,17 @@ final class UnityMediaHost {
     private var worldSelection: [String: Any] = [:]
     private var pendingWorldPackage: BundledLivingWorldPackage?
     private var worldSelectionTask: Task<Void, Never>?
+    /// 启动默认呈现面是**空间**。启动那一次的世界进入是一个事务，冷启动时它会
+    /// 输给三种竞态，而以前每一种都让整场会话留在**播放器**上：
+    /// 权威还没起来（`world_authority_unavailable`，helper 冷启动）、
+    /// 权威里还没有这个世界（`world_authority_record_missing`，这台机器从未进过空间）、
+    /// 载入期间世界状态前进（`world_authority_activation_failed`）。
+    /// 这三种都不是"用户偏好播放器"，所以默认路径**有界重试**到进空间为止；
+    /// 显式的用户选择（已有 worldSession 时切换世界）不在这里重试。
+    private static let startupSpaceAttemptLimit = 4
+    private static let startupSpaceRetryDelay = Duration.milliseconds(1500)
+    private var startupSpaceAttempts = 0
+    private var startupSpaceRetryTask: Task<Void, Never>?
     private var marbleRuntimeReady = false
     private lazy var marbleRegistration: UnityMarbleAuthorityRegistration = {
         let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
@@ -113,7 +124,7 @@ final class UnityMediaHost {
         requestSelection: { [weak self] package, revision in self?.prepareWorldSelection(package, revision: revision) ?? false },
         productDefaults: productDefaults,
         livingPodWorldID: (try? LivingWorldBootstrap.loadBundledCanary(preferMarble: true))?.manifest.worldID,
-        marble: marbleWorlds)
+        marble: marbleWorlds, settings: productSettings.authority)
     private func registerMarblePackage(_ package: BundledLivingWorldPackage) async throws -> Bool {
         try await marbleRegistration.register(package)
     }
@@ -709,9 +720,18 @@ final class UnityMediaHost {
                     let endpoint = WorldAuthorityEndpoint(applicationSupportBase: root)
                     let client = WorldAuthorityClient(worldID: id, endpointFile: endpoint.endpointFile,
                         helperPath: endpoint.helperPath, allowsLaunching: true)
-                    let record = try await Task.detached(priority: .utility) { try client.snapshot() }.value
+                    var record = try await Task.detached(priority: .utility) { try client.snapshot() }.value
                     try Task.checkCancellation()
                     guard !closed else { return }
+                    // 没有用户偏好/这台机器还没进过空间：权威里没有这个世界的记录。
+                    // 把只读预像**一次性**导入（与用户显式选空间走的是同一条导入），
+                    // 默认路径就能落在空间，而不是因为没有偏好就退回播放器。
+                    // 已有记录时 load() 只读、不覆盖；没有预像时不凭空造世界。
+                    if record == nil, importDefaultSpaceRecord(package: package, endpoint: endpoint) {
+                        record = try await Task.detached(priority: .utility) { try client.snapshot() }.value
+                        try Task.checkCancellation()
+                        guard !closed else { return }
+                    }
                     guard record != nil else { failureCode = "world_authority_record_missing"; continue }
                     // Renderer preparation must precede the single live world
                     // owner. Starting a context here advances a restored active
@@ -733,10 +753,87 @@ final class UnityMediaHost {
             }
             guard !closed else { return }
             worldSelectionTask = nil
+            if scheduleStartupSpaceRetry(failureCode: failureCode) { return }
             worldSelection = ["revision": UInt64(0), "phase": "failed", "code": failureCode,
                 "message": "空间暂时无法连接，音乐和聊天仍可使用。请重新选择空间或稍后重试。"]
             NSLog("[UnityMediaHost] space startup unavailable: %@; audio/chat retained", failureCode)
         }
+    }
+    /// 启动默认落空间的**有界**重试。次数与间隔都是常量：权威一直不起来时
+    /// 仍然给出真实失败（日志 + 红字），只是不再一次失败就整场会话停在播放器。
+    private func scheduleStartupSpaceRetry(failureCode: String) -> Bool {
+        guard !closed, worldSession == nil, startupSpaceAttempts < Self.startupSpaceAttemptLimit else { return false }
+        startupSpaceAttempts += 1
+        let attempt = startupSpaceAttempts
+        startupSpaceRetryTask?.cancel()
+        startupSpaceRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.startupSpaceRetryDelay)
+            guard let self, !self.closed, self.worldSession == nil,
+                  self.worldSelectionTask == nil, self.pendingWorldPackage == nil else { return }
+            NSLog("[UnityMediaHost] space startup retry %ld after %@", attempt, failureCode)
+            self.startExistingWorldSession()
+        }
+        return true
+    }
+    /// 首次启动的**一次性**只读预像导入（`AuthorityWorldStatePersistence.load()`
+    /// 只在权威没有记录时导入）。返回是否确实拿到了这个世界。
+    ///
+    /// 预像路径除了 `LivingWorldBootstrap` 自己算出来的那一条，还要按**产品身份**
+    /// `ai.gmgn.radio` 再找一遍：`RenderHost` 模块编译进来的 `ProductIdentity` 是
+    /// fixture 身份 `ai.gmgn.gpui-probe.render-host`，而旧的 `state.json` 预像真实
+    /// 写在 `ai.gmgn.radio` 下（生产机上只有后者）。两条都找不到就**不导入**——
+    /// 绝不凭空造一个世界。
+    private func importDefaultSpaceRecord(package: BundledLivingWorldPackage, endpoint: WorldAuthorityEndpoint) -> Bool {
+        guard let archive = try? LivingWorldBootstrap.statePersistence(manifest: package.manifest,
+                                                                        applicationSupportBase: root),
+              let compiledIn = try? LivingWorldBootstrap.preImageCandidateURLs(manifest: package.manifest,
+                                                                              applicationSupportBase: root) else {
+            NSLog("[UnityMediaHost] default space seed: no pre-image path for world=%@", package.manifest.worldID)
+            return false
+        }
+        let candidates = compiledIn + Self.legacyProductPreImageURLs(package: package.manifest, base: root)
+        let preImage = LegacyWorldStatePreImage(archive: archive, candidateURLs: candidates)
+        guard preImage.rawPreImage() != nil else {
+            NSLog("[UnityMediaHost] default space seed: pre-image absent for world=%@ paths=%@",
+                  package.manifest.worldID, candidates.map(\.path).joined(separator: ","))
+            return false
+        }
+        let persistence = AuthorityWorldStatePersistence(manifest: package.manifest,
+            preImage: preImage, endpointFile: endpoint.endpointFile, helperPath: endpoint.helperPath)
+        do {
+            let state = try persistence.load()
+            NSLog("[UnityMediaHost] default space seed: world=%@ state=%@", package.manifest.worldID,
+                  state == nil ? "absent" : "present")
+            return state != nil
+        } catch {
+            NSLog("[UnityMediaHost] default space seed: world=%@ failed=%@", package.manifest.worldID,
+                  String(describing: type(of: error)))
+            return false
+        }
+    }
+    /// 产品自己的 Application Support 身份（`GMGNRadioApp.swift` 的 `ProductIdentity`，
+    /// 也是旧 `state.json` 预像的真实位置）。按当前包版本优先、其余版本按修改时间从新到旧。
+    static let legacyProductIdentity = "ai.gmgn.radio"
+    static func legacyProductPreImageURLs(package: WorldManifest, base: URL,
+                                          fileManager: FileManager = .default) -> [URL] {
+        let directory = base
+            .appendingPathComponent(legacyProductIdentity, isDirectory: true)
+            .appendingPathComponent("LivingWorld", isDirectory: true)
+            .appendingPathComponent(package.packageID, isDirectory: true)
+        let current = directory
+            .appendingPathComponent(LivingWorldBootstrap.sanitizedPackageVersionDirectory(package.packageVersion),
+                                    isDirectory: true)
+            .appendingPathComponent("state.json")
+        let versions = (try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey]))?
+            .filter { fileManager.fileExists(atPath: $0.appendingPathComponent("state.json").path) }
+            .sorted { lhs, rhs in
+                let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return left > right
+            }
+            .map { $0.appendingPathComponent("state.json") } ?? []
+        var seen = Set<String>()
+        return ([current] + versions).filter { seen.insert($0.path).inserted }
     }
     private func prepareWorldSelection(_ package: BundledLivingWorldPackage, revision: UInt64) -> Bool {
         guard !closed, pendingWorldPackage == nil, worldSelectionTask == nil else { return false }
@@ -799,34 +896,141 @@ final class UnityMediaHost {
                 guard spaceLibrary.settingsCommand(["op": "space.library.select", "id": id]),
                       let revision = spaceLibrary.snapshot["selectionRevision"] as? UInt64 else { throw UnityMarbleError.selectionRejected }
                 spatialSceneSelectionRevision = revision
-                let deadline = ContinuousClock.now.advanced(by: .seconds(90))
-                do {
-                    while true {
-                        try Task.checkCancellation()
-                        guard !closed else { throw CancellationError() }
-                        if worldSelection["revision"] as? UInt64 == revision, worldSelection["worldID"] as? String == id {
-                            if worldSelection["phase"] as? String == "failed" { throw UnityMarbleError.selectionRejected }
-                            if worldSelection["phase"] as? String == "activate",
-                               worldSession?.context.state.worldID == id, spaceLibrary.savedSelectionID == id { break }
-                        }
-                        guard ContinuousClock.now < deadline else { throw UnityMarbleError.selectionTimedOut }
-                        try await Task.sleep(for: .milliseconds(100))
-                    }
-                } catch {
-                    // Invalidate only this unactivated request. Late renderer
-                    // receipts cannot retire the previous authoritative session.
-                    if pendingWorldPackage?.manifest.worldID == id, spaceLibrary.snapshot["selectionRevision"] as? UInt64 == revision {
-                        worldSelectionTask?.cancel(); pendingWorldPackage = nil
-                        worldSelection = ["revision": revision, "worldID": id, "phase": "failed", "code": "spatial_selection_cancelled"]
-                        _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
-                    }
-                    throw error
-                }
+                try await awaitWorldActivation(id: id, revision: revision)
             }
         }
         try Task.checkCancellation()
         if scene != nil { try await spatialPresentation.confirmVisible() }
         if let weather { try await spatialPresentation.setWeather(weather) }
+    }
+    /// Wait for the selection transaction this host already owns to reach the
+    /// renderer-verified `activate` phase. The world is not declared entered
+    /// before that phase, so a timeout is never reported as success. Shared by
+    /// the scene-preset path and the settings window's 进入世界/切换场景.
+    private func awaitWorldActivation(id: String, revision: UInt64) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(90))
+        while true {
+            try Task.checkCancellation()
+            guard !closed else { throw CancellationError() }
+            if worldSelection["revision"] as? UInt64 == revision, worldSelection["worldID"] as? String == id {
+                if worldSelection["phase"] as? String == "failed" { throw UnityMarbleError.selectionRejected }
+                if worldSelection["phase"] as? String == "activate",
+                   worldSession?.context.state.worldID == id, spaceLibrary.savedSelectionID == id { return }
+            }
+            guard ContinuousClock.now < deadline else { throw UnityMarbleError.selectionTimedOut }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+    /// `stage.world.enter`: the public-world menu. The only real entry is the
+    /// existing `space.library.select` transaction — no second world owner and
+    /// no locally remembered selection. An id the library does not list is
+    /// rejected (`false` ⇒ `settings_command_rejected`), never silently kept.
+    private func enterWorld(id: String) async throws {
+        guard !closed, let entry = (spaceLibrary.snapshot["worlds"] as? [[String: Any]])?.first(where: { $0["id"] as? String == id }) else {
+            throw UnityMarbleError.selectionRejected
+        }
+        if worldSession?.context.state.worldID == id, spaceLibrary.savedSelectionID == id { return }
+        guard entry["manifestSHA256"] as? String != nil, spaceLibrary.package(for: id) != nil,
+              spaceLibrary.settingsCommand(["op": "space.library.select", "id": id]),
+              let revision = spaceLibrary.snapshot["selectionRevision"] as? UInt64 else { throw UnityMarbleError.selectionRejected }
+        try await awaitWorldActivation(id: id, revision: revision)
+    }
+    /// `stage.scene.activate`: the generated-scene menu. Reuses the same
+    /// preset activation the radio/agent path uses (`setSpatialEnvironment`).
+    private func activateScene(presetID: String) async throws {
+        guard !closed, let preset = SpatialScenePreset(rawValue: presetID) else { throw UnityMarbleError.selectionRejected }
+        try await setSpatialEnvironment(scene: preset, weather: nil)
+    }
+    /// `stage.activity.run`: the measured activity path the menu uses. The id
+    /// must be one this composition reports as runnable right now.
+    private func runActivity(id: String) throws {
+        guard !closed, let session = worldSession, session.canRunActivity(id: id) else { throw UnityMarbleError.selectionRejected }
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session else { return }
+            do {
+                try await session.context.startActivityMeasured(id: id)
+                guard !self.closed, self.worldSession === session else { return }
+                session.activity.invalidateProjection()
+            } catch {
+                guard !self.closed, self.worldSession === session else { return }
+                self.notice = "活动未能开始：\(error.localizedDescription)"
+            }
+        }
+    }
+    /// `stage.activity.stop`: the authority's own stop, same call the menu uses.
+    /// With nothing running there is nothing to stop — answers `false` so the
+    /// UI receives `settings_command_rejected` instead of a no-op success.
+    @discardableResult
+    private func stopActivity() -> Bool {
+        guard !closed, let session = worldSession, session.context.snapshot.activeActivity != nil else { return false }
+        do { try session.context.stopActivity(reason: "用户从舞台设置停止活动") }
+        catch { notice = "活动未能停止：\(error.localizedDescription)"; return false }
+        session.activity.invalidateProjection()
+        return true
+    }
+    /// The stage surface shape the settings window renders
+    /// (`settings.stage` = `presentation`/`space`/`activities`/`player`), built
+    /// from the values this host already owns. It is a projection only: every
+    /// item comes from the live library/catalog/selection state.
+    private func stageSnapshot(_ video: [String: Any], activity: [String: Any], activityItems: [[String: Any]],
+                              presence: [String: Any]) -> [String: Any] {
+        let worlds = (spaceLibrary.snapshot["worlds"] as? [[String: Any]]) ?? []
+        let presets = (spaceLibrary.snapshot["marblePresets"] as? [[String: Any]]) ?? []
+        let selected = worldSelection["worldID"] as? String ?? spaceLibrary.savedSelectionID
+        let activeID = activity["activeActivity"] as? [String: Any]
+        let phase = activeID?["phase"] as? String ?? (activity["activeID"] as? String).map { _ in "active" }
+        let visible = worldSession != nil && selected != nil && worldSession?.context.state.worldID == selected
+        let character = characterPosition?.snapshot() ?? [:]
+        let xyz = character["position"] as? [Double] ?? []
+        // The motion list the 角色 partition renders: exactly the keys
+        // `apps/gpui-ui/src/stage_panels.rs` reads, sourced from the presence
+        // bridge's own projection (the same shape `ProductHost.swift:165-172`
+        // builds for the product host).
+        let motions = ["avatarName": presence["avatarName"] ?? NSNull(),
+                       "categories": presence["categories"] ?? [],
+                       "items": presence["motions"] ?? [],
+                       "activeID": presence["activeMotionID"] ?? NSNull(),
+                       "isWorking": presence["working"] ?? false,
+                       "notice": presence["motionNotice"] ?? NSNull(),
+                       "message": presence["notice"] ?? NSNull(),
+                       "hasError": presence["hasError"] ?? false] as [String: Any]
+        return ["mode": visible ? "space" : "player",
+                "stageRadioPluginEnabled": RadioPluginAvailability.isEnabled(defaults: defaults),
+                "presentation": ["isWorldPresentationRequested": worldSession != nil || pendingWorldPackage != nil,
+                                 "isWorldVisible": visible, "isDestinationButtonHidden": !visible,
+                                 "isWorldInteractionHidden": !visible, "isPointCloudHidden": !visible,
+                                 "isLoadingIndicatorHidden": visible, "isSpatialWorldHidden": !visible,
+                                 "chatAvailable": true, "propsAvailable": true, "taskFeedbackVisible": true],
+                "space": ["worlds": worlds, "presets": presets,
+                          "selectedWorldID": selected as Any? ?? NSNull(),
+                          "worldLabel": (worlds.first(where: { $0["id"] as? String == selected })?["name"] as? String) ?? "公开空间 · 无需生成",
+                          "position": ["X": xyz.count == 3 ? xyz[0] : 0,
+                                       "Y": xyz.count == 3 ? xyz[1] : 0,
+                                       "Z": xyz.count == 3 ? xyz[2] : 0],
+                          "isVisible": visible, "isRequested": worldSession != nil || pendingWorldPackage != nil,
+                          "notice": worldSelection["message"] as? String ?? video["notice"] as Any? ?? NSNull(),
+                          "generationMessage": (spaceLibrary.snapshot["marbleProgress"] as? String) as Any? ?? NSNull(),
+                          "errorMessage": spaceLibrary.snapshot["marbleError"] as Any? ?? NSNull()] as [String: Any],
+                "activities": ["items": activityItems, "activeID": activeID?["id"] as? String ?? activity["activeID"] as Any? ?? NSNull(),
+                               "canRun": visible, "phase": phase as Any? ?? NSNull(),
+                               "message": activity["notice"] as Any? ?? NSNull()] as [String: Any],
+                "motions": motions,
+                "player": ["lyrics": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] },
+                           "lyricID": lyricsStore.visualMode.agentValue,
+                           "clouds": StagePointCloudChoice.allCases.map { ["id": $0.rawValue, "name": $0.title] },
+                           "cloudID": visualDirection.currentPointCloudChoice.rawValue,
+                           "particleScale": visualDirection.particleSizeMultiplier,
+                           "videoModes": StageVideoPlaybackMode.allCases.map { ["id": $0.rawValue, "name": $0.displayName] },
+                           "videoMode": video["mode"] ?? NSNull(),
+                           "videoActive": video["activeID"] is String,
+                           "videoAssetID": video["activeID"] ?? NSNull(),
+                           "videoBrightness": video["brightness"] ?? NSNull(),
+                           "videoAssets": video["assets"] ?? [],
+                           "videoBoundAssetID": video["boundAssetID"] ?? NSNull(),
+                           "videoTrackID": video["currentTrackID"] ?? NSNull(),
+                           "videoTrackTitle": video["currentTrackTitle"] ?? NSNull(),
+                           "videoNotice": video["notice"] ?? NSNull(),
+                           "videoCanRecoverStop": video["canRecoverStop"] ?? false]]
     }
     private func completeWorldSelection(_ value: [String: Any]) -> Bool {
         guard let revision = value["revision"] as? UInt64, revision == worldSelection["revision"] as? UInt64,
@@ -866,6 +1070,9 @@ final class UnityMediaHost {
             worldSelection["message"] = "空间状态在载入期间发生变化，请重新选择空间。"
             NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=world_authority_activation_failed type=%@", id, String(describing: type(of: error)))
             _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
+            // 默认路径（还没有任何 worldSession）遇到"载入期间状态前进"时按启动竞态
+            // 处理：有界重试，而不是让启动停在播放器、等用户手动重新选一次空间。
+            if worldSession == nil { _ = scheduleStartupSpaceRetry(failureCode: "world_authority_activation_failed") }
             return true
         }
         residentAutonomy?.close(); devicePlacement?.close(); generationConfiguration?.close()
@@ -1031,6 +1238,12 @@ final class UnityMediaHost {
             return true
         }
         if value["op"] as? String == "world.physics.receipt" { return worldPhysics.accept(value) }
+        // Same stage settings surface, reached when the native viewport (not the
+        // settings window) submits the command. Accepted onto the same owners.
+        if let op = value["op"] as? String, ["stage.world.enter", "stage.scene.activate"].contains(op) {
+            Task { @MainActor [weak self] in _ = await self?.settingsCommand(value) }
+            return true
+        }
         if value["op"] as? String == "presence.position.rendered" { return characterPosition?.acknowledgeRendered(value) ?? false }
         if let op = value["op"] as? String, op == "presence.position" || op == "presence.position.reset" { return characterPosition?.command(value) ?? false }
         if let op = value["op"] as? String, UnityChatImageBridge.supportedCommands.contains(op) { return chatImages.command(value) }
@@ -1470,6 +1683,23 @@ final class UnityMediaHost {
             }
             return true
         case _ where UnityShortcutSettingsBridge.supportedCommands.contains(op): return shortcutSettings.command(value)
+        // The settings window's world/scene/activity surface. `true` only means
+        // the request was accepted onto the same owner the menu/agent path uses;
+        // the world/scene phase and the activity id keep flowing through the
+        // normal snapshot projection, so the UI never reads a local success.
+        case "stage.world.enter":
+            guard value.count == 2, let id = value["id"] as? String, !id.isEmpty, id.utf8.count <= 256 else { return false }
+            do { try await enterWorld(id: id) } catch { notice = "未能进入该空间：\(error.localizedDescription)"; return false }
+            return true
+        case "stage.scene.activate":
+            guard value.count == 2, let id = value["id"] as? String, !id.isEmpty, id.utf8.count <= 256 else { return false }
+            do { try await activateScene(presetID: id) } catch { notice = "未能切换到该场景：\(error.localizedDescription)"; return false }
+            return true
+        case "stage.activity.run":
+            guard value.count == 2, let id = value["id"] as? String, !id.isEmpty, id.utf8.count <= 256 else { return false }
+            do { try runActivity(id: id) } catch { notice = "活动未能开始：\(error.localizedDescription)"; return false }
+            return true
+        case "stage.activity.stop": return stopActivity()
         case "presence.motion":
             guard let id = value["id"] as? String, presenceSettings.canSelectMotion(id) else { return false }
             residentAutonomy?.pauseByUser()
@@ -1560,27 +1790,26 @@ final class UnityMediaHost {
                              "planningSupported": true,
                              "autoSpeakSupported": true,
                              "unavailableMessage": "该页面尚未完成 Unity 运行时接线。"]
+        // The stage surface the settings window's StagePanelsPane renders. The
+        // keys are the ones `apps/gpui-ui/src/stage_panels.rs` reads
+        // (`space.position.X/Y/Z`, `space.isVisible/isRequested/selectedWorldID`,
+        // `activities.items/canRun/activeID`, `motions`), projected from the same
+        // owners the rest of this host uses: `characterPosition` for the pose,
+        // `spaceLibrary` + `worldSelection` for the space, the world session's
+        // own runnable-activity list for the activity menu.
+        let worldServices = worldSession?.snapshot() ?? [:]
+        settings["stage"] = stageSnapshot(video, activity: worldServices["activity"] as? [String: Any] ?? [:],
+                                          activityItems: worldSession?.availableActivityItems ?? [[String: Any]](),
+                                          presence: presenceSettings.snapshot)
         return ["version": 1, "revision": visualRevision, "settings": settings,
                 "runtimeDiagnostics": runtimeDiagnostics(),
-                "stage": ["mode": "player", "stageRadioPluginEnabled": true,
-                          "player": ["lyrics": StageLyricsVisualMode.allCases.map { ["id": $0.agentValue, "name": $0.displayName] },
-                                     "lyricID": lyricsStore.visualMode.agentValue,
-                                     "clouds": StagePointCloudChoice.allCases.map { ["id": $0.rawValue, "name": $0.title] },
-                                     "cloudID": visualDirection.currentPointCloudChoice.rawValue,
-                                     "particleScale": visualDirection.particleSizeMultiplier,
-                                     "videoModes": StageVideoPlaybackMode.allCases.map { ["id": $0.rawValue, "name": $0.displayName] },
-                                     "videoMode": video["mode"] ?? NSNull(),
-                                     "videoActive": video["activeID"] is String,
-                                     "videoAssetID": video["activeID"] ?? NSNull(),
-                                     "videoBrightness": video["brightness"] ?? NSNull(),
-                                     "videoAssets": video["assets"] ?? [],
-                                     "videoBoundAssetID": video["boundAssetID"] ?? NSNull(),
-                                     "videoTrackID": video["currentTrackID"] ?? NSNull(),
-                                     "videoTrackTitle": video["currentTrackTitle"] ?? NSNull(),
-                                     "videoNotice": video["notice"] ?? NSNull(),
-                                     "videoCanRecoverStop": video["canRecoverStop"] ?? false]],
                 "supportedCommands": ["app.language", "settings.load", "speech.settings.load", "speech.settings.cancel", "stage.load",
                                       "stage.player.lyrics", "stage.player.cloud", "stage.player.particles", "agent.save",
+                                      // The stage settings window's world/scene/activity controls. Each one is
+                                      // dispatched in `settingsCommand` onto an owner that already exists
+                                      // (the `space.library.select` transaction, `marbleWorlds.activatePreset`,
+                                      // `startActivityMeasured` / `stopActivity`); no second world owner.
+                                      "stage.world.enter", "stage.scene.activate", "stage.activity.run", "stage.activity.stop",
                                       "tts.provider", "tts.refresh", "tts.save", "tts.preview", "tts.stop", "asr.provider", "asr.save",
                                       "music.load", "music.connect", "music.disconnect", "music.sync", "generation.load", "generation.save", "generation.check", "space.library.load", "space.library.select", "space.default", "space.key.save", "space.key.clear"]
                                       + UnityShortcutSettingsBridge.supportedCommands
