@@ -1,5 +1,6 @@
 import Foundation
 import MotionDistribution
+import os
 
 /// Original package/motion services, explicitly scoped to the Unity data root.
 /// Host owns runtime consumption; supported engines must reflect real renderers.
@@ -7,6 +8,11 @@ import MotionDistribution
 final class UnityPresenceSettingsBridge {
     let model: PresenceSettingsModel
     let runtime: StageAvatarRuntimeStore
+    /// Every refusal of a manual motion selection lands here with the motion id
+    /// and the named reason. `settingsCommand`'s receipt carries the same name,
+    /// so one log line and one on-screen notice explain a refused 选定动作
+    /// instead of the anonymous `settings_command_rejected`.
+    static let log = Logger(subsystem: "ai.gmgn.radio", category: "PresenceSelection")
     private let supportedEngines: Set<String>
     private let selectionAuthority: RustPresenceSelectionClient
     private let onRuntimeChanged: (StageAvatarRuntimeSnapshot) -> Void
@@ -62,11 +68,27 @@ final class UnityPresenceSettingsBridge {
         }
         return true
     }
-    func canSelectMotion(_ id: String) -> Bool {
-        operation == nil && pendingSelection == nil && model.availableMotions.contains {
-            $0.id == id && model.motionCompatibility($0) == .compatible
+    /// Why `presence.motion` cannot start **right now**; `nil` = selectable.
+    ///
+    /// This is the single predicate behind the snapshot's per-row `selectable`
+    /// flag, [`canSelectMotion`] and the `presence.motion` command guard. The
+    /// settings rows used to be enabled on `compatible` alone, so a row drawn
+    /// as selectable could still be refused here — silently, because the
+    /// refusal only became the anonymous `settings_command_rejected`
+    /// (2026-10-09 report: 选定动作报错 with nothing in any log). Names follow
+    /// the authority's own vocabulary (`presence_renderer_pending`).
+    func motionSelectionRefusal(_ id: String) -> String? {
+        if operation != nil || model.isWorking { return "presence_selection_busy" }
+        if pendingSelection != nil { return "presence_renderer_pending" }
+        guard let motion = model.availableMotions.first(where: { $0.id == id }) else {
+            return "presence_motion_unavailable"
         }
+        guard model.motionCompatibility(motion) == .compatible else {
+            return "presence_motion_incompatible"
+        }
+        return nil
     }
+    func canSelectMotion(_ id: String) -> Bool { motionSelectionRefusal(id) == nil }
     var agentMotions: [WorldAgentMotionOption] {
         guard operation == nil, pendingSelection == nil,
               let engine = model.activeAvatarEngine,
@@ -103,7 +125,10 @@ final class UnityPresenceSettingsBridge {
             return ["id": motion.id, "name": motion.name, "format": motion.format.rawValue,
                     "active": motion.id == confirmedMotionID, "builtIn": model.isBuiltInMotion(motion), "isBuiltIn": model.isBuiltInMotion(motion),
                     "detail": motion.format.rawValue, "category": MotionLibraryCategory.category(forMotionID: motion.id)?.rawValue as Any? ?? NSNull(),
-                    "compatible": compatible, "reason": reason as Any? ?? NSNull()] as [String: Any]
+                    "compatible": compatible, "reason": reason as Any? ?? NSNull(),
+                    // The host's own answer to "would 选定动作 start right now",
+                    // so the row can never be drawn selectable and then be refused.
+                    "selectable": canSelectMotion(motion.id)] as [String: Any]
         }, "publishedMotions": model.availablePublishedMotions.map { motion in
             let state = model.publishedMotionInstallState(motion)
             let label: String = { switch state { case .installed: "已安装"; case .updateAvailable: "更新"; case .notInstalled: "安装" } }()
@@ -158,6 +183,13 @@ final class UnityPresenceSettingsBridge {
             model.remove(package)
         case "presence.motion":
             guard let motion = model.availableMotions.first(where: { $0.id == id }), model.motionCompatibility(motion) == .compatible else { return false }
+            // The caller (`UnityMediaHost.settingsCommand`) already refused the
+            // named cases; whatever is left is a race with an in-flight load and
+            // still deserves a name rather than a silent `false`.
+            if let refusal = motionSelectionRefusal(id) {
+                Self.log.error("presence.motion refused id=\(id, privacy: .public) code=\(refusal, privacy: .public)")
+                return false
+            }
             run { bridge in
                 do { try await bridge.model.activateMotionConfirmed(motion) }
                 catch{bridge.model.message=error.localizedDescription;bridge.model.hasError=true}

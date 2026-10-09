@@ -3,6 +3,7 @@ import AppKit
 import UniformTypeIdentifiers
 import AVFoundation
 import WorldRuntime
+import os
 
 /// Unity owns the window and renderer. This host constructs only the actual
 /// audio graph and isolated DSH conversation, never AppDelegate or a scene.
@@ -36,6 +37,13 @@ final class UnityMediaHost {
     private var visualCommandState: [String:Any] = [:]
     private var gpuiSettingsTask: Task<Void, Never>?
     private var gpuiSettingsResult: [String: Any] = [:]
+    /// The named reason behind the *current* `ui.settings.command` refusal.
+    /// Without it every settings refusal collapses into the anonymous
+    /// `settings_command_rejected`, and a person clicking a control gets an
+    /// error no log and no receipt can explain (the 选定动作 report of
+    /// 2026-10-09). Cleared before each command and on close.
+    private var gpuiSettingsRefusal: String?
+    private static let settingsLog = Logger(subsystem: "ai.gmgn.radio", category: "SettingsCommand")
     private var session: UInt64 = 0
     private var lines: [StageLyricLine] = []
     private var lyricRevision: UInt64 = 0
@@ -1217,22 +1225,39 @@ final class UnityMediaHost {
     }
     func command(_ value: [String: Any]) -> Bool {
         if value["op"] as? String == "ui.settings.command" {
+            let answeredRequestID = value["requestID"] as? String
             guard !closed, gpuiSettingsTask == nil,
-                  let requestID = value["requestID"] as? String,
+                  let requestID = answeredRequestID,
                   !requestID.isEmpty, requestID.utf8.count <= 128,
                   let command = value["command"] as? [String: Any],
                   let operation = command["op"] as? String,
-                  (settingsSnapshot()["supportedCommands"] as? [String])?.contains(operation) == true else { return false }
+                  (settingsSnapshot()["supportedCommands"] as? [String])?.contains(operation) == true else {
+                // A rejection the window never hears about is a dead control.
+                // Name it, log it, and (unless another command owns the slot)
+                // answer the same requestID with the code.
+                let busy = gpuiSettingsTask != nil
+                let operation = (value["command"] as? [String: Any])?["op"] as? String ?? "ui.settings.command"
+                let code = busy ? "settings_command_busy" : "settings_command_not_supported"
+                settingsRefusal(op: operation, code: code)
+                if !busy, let answeredRequestID, !answeredRequestID.isEmpty, answeredRequestID.utf8.count <= 128 {
+                    gpuiSettingsResult = ["requestID": answeredRequestID, "status": "failed", "code": code]
+                }
+                return false
+            }
             gpuiSettingsResult = ["requestID": requestID, "status": "pending"]
+            gpuiSettingsRefusal = nil
             gpuiSettingsTask = Task { [weak self] in
                 guard let self else { return }
                 let completed = await self.settingsCommand(command)
                 guard !self.closed, !Task.isCancelled else { return }
                 // This is the existing owner's handler receipt. Some handlers
                 // begin asynchronous persistence; only its later snapshot is
-                // evidence of confirmed saved values.
-                self.gpuiSettingsResult = ["requestID": requestID, "status": completed ? "accepted" : "failed",
-                                           "code": completed ? NSNull() : "settings_command_rejected"]
+                // evidence of confirmed saved values. A refusal carries the
+                // owner's own named reason when it has one.
+                var receipt: [String: Any] = ["requestID": requestID, "status": completed ? "accepted" : "failed"]
+                receipt["code"] = completed ? NSNull() : (self.gpuiSettingsRefusal ?? "settings_command_rejected")
+                self.gpuiSettingsResult = receipt
+                self.gpuiSettingsRefusal = nil
                 self.gpuiSettingsTask = nil
             }
             return true
@@ -1604,7 +1629,7 @@ final class UnityMediaHost {
     }
 
     func close() {
-        gpuiSettingsTask?.cancel(); gpuiSettingsTask = nil
+        gpuiSettingsTask?.cancel(); gpuiSettingsTask = nil; gpuiSettingsRefusal = nil
         visualCommandTask?.cancel(); visualCommandTask=nil
         worldPhysics.close()
         closed = true
@@ -1647,6 +1672,18 @@ final class UnityMediaHost {
             residentScope: composition.residentScope, endpointFile: endpoint.endpointFile,
             hostSessionID: composition.residentHostSessionID)
         autonomy.bindScheduler(scheduler, backend: chat.backend)
+    }
+
+    /// Record + log a named settings refusal. The player log gets the op, the
+    /// code and the identifying field; the window's receipt gets the same code
+    /// instead of `settings_command_rejected`. Names come from the authority's
+    /// own vocabulary (`presence_renderer_pending`, `presence_motion_incompatible`)
+    /// so a log line and a daemon refusal read the same.
+    @discardableResult
+    private func settingsRefusal(op: String, code: String, detail: String = "-") -> Bool {
+        gpuiSettingsRefusal = code
+        Self.settingsLog.error("settings command refused op=\(op, privacy: .public) code=\(code, privacy: .public) detail=\(detail, privacy: .public)")
+        return false
     }
 
     private func settingsCommand(_ value: [String: Any]) async -> Bool {
@@ -1701,11 +1738,28 @@ final class UnityMediaHost {
             return true
         case "stage.activity.stop": return stopActivity()
         case "presence.motion":
-            guard let id = value["id"] as? String, presenceSettings.canSelectMotion(id) else { return false }
+            guard let id = value["id"] as? String, !id.isEmpty, id.utf8.count <= 4096 else {
+                return settingsRefusal(op: op, code: "presence_invalid_input")
+            }
+            // One predicate owns "can this row be selected right now": the same
+            // one the bridge publishes per motion row. A control the snapshot
+            // drew as selectable can therefore no longer be refused here, and a
+            // refusal that does happen names itself instead of vanishing.
+            if let refusal = presenceSettings.motionSelectionRefusal(id) {
+                return settingsRefusal(op: op, code: refusal, detail: id)
+            }
             residentAutonomy?.pauseByUser()
             do { try worldSession?.prepareManualMotionSelection() }
-            catch { return false }
-            return presenceSettings.command(value)
+            catch {
+                let detail: String
+                if case .daemon(let code)? = error as? WorldAuthorityError { detail = "\(id):\(code)" }
+                else { detail = "\(id):\(type(of: error))" }
+                return settingsRefusal(op: op, code: "presence_world_not_ready", detail: detail)
+            }
+            guard presenceSettings.command(value) else {
+                return settingsRefusal(op: op, code: presenceSettings.motionSelectionRefusal(id) ?? "presence_selection_rejected", detail: id)
+            }
+            return true
         case _ where UnityPresenceSettingsBridge.supportedCommands.contains(op): return presenceSettings.command(value)
         case "music.load", "music.connect", "music.disconnect", "music.sync": return musicLibrary.settingsCommand(value)
         // Same as the `command(_:)` arm: no production action exists behind

@@ -278,6 +278,24 @@ pub fn motion_action(is_active: bool, compatible: bool) -> MotionAction {
     }
 }
 
+/// Whether 选定动作 can actually start for this row **right now**.
+///
+/// `compatible` alone is not the host's answer. `UnityPresenceSettingsBridge`
+/// refuses `presence.motion` while another selection is in flight, while the
+/// renderer still owes an acknowledgement (`presence_renderer_pending`) and
+/// whenever the motion is not in the current avatar's own list. Those refusals
+/// used to reach the window as the anonymous `settings_command_rejected`: the
+/// row was drawn enabled and the click errored with nothing in any log
+/// (2026-10-09 report). `selectable` is the host's own projection of that same
+/// predicate and `working` is its busy flag, so a drawn button is one the host
+/// will accept. Both default permissively: an older host that publishes neither
+/// keeps today's `compatible`-only gate.
+pub fn motion_select_enabled(motion: &Value, working: bool) -> bool {
+    motion["compatible"].as_bool().unwrap_or(false)
+        && motion["selectable"].as_bool().unwrap_or(true)
+        && !working
+}
+
 /// The six authorization states of `MusicAccountsModel`
 /// (`MusicAccountsView.swift:137-152`). Callers translate the result.
 pub fn music_status_label(status: Option<&str>) -> &'static str {
@@ -2599,6 +2617,7 @@ impl AgentSettingsPane {
                                 .unwrap_or_default()
                         ))),
                 );
+            let working = self.snapshot["presence"]["working"].as_bool() == Some(true);
             match motion_action(active, compatible) {
                 MotionAction::Current => {
                     row = row.child(
@@ -2613,13 +2632,16 @@ impl AgentSettingsPane {
                             .child(ui::muted(settings_copy(locale, "当前动作"))),
                     );
                 }
-                MotionAction::Select { enabled } => {
+                MotionAction::Select { .. } => {
+                    // The host's own answer, not `compatible` alone: a row the
+                    // host would refuse is drawn disabled instead of erroring.
+                    let selectable = motion_select_enabled(motion, working);
                     row = row.child(
                         Button::new(format!("motion-{id}"))
                             .icon(IconName::Check)
                             .tooltip(settings_copy(locale, "选择"))
                             .small()
-                            .disabled(!enabled)
+                            .disabled(!selectable)
                             .accessibility_id(format!("settings.presence.motion.{id}"))
                             .on_click(cx.listener({
                                 let id = id.clone();
@@ -4526,7 +4548,7 @@ mod settings_display_tests {
         PAGE_SHORTCUTS, PAGE_SPACE, PAGE_SPACE_PREFS, PresenceAction, avatar_detail,
         generation_check_enabled, generation_save_enabled, header_vertical_padding,
         import_menu_enabled, marble_save_enabled, model_in_catalog, motion_action,
-        motion_format, music_connect_label, music_row_authorizing, music_status_label,
+        motion_format, motion_select_enabled, music_connect_label, music_row_authorizing, music_status_label,
         music_sync_command, orb_intensity_percent, page_header_routes, page_index_for_key,
         page_notice_section, presence_action, presence_more_accessibility, prop_check_enabled,
         prop_save_enabled, save_ack_clear, settings_tabs,
@@ -4808,6 +4830,36 @@ mod settings_display_tests {
             motion_action(true, false),
             MotionAction::Select { enabled: false }
         );
+    }
+
+    /// 选定动作 must be drawn disabled whenever the host would refuse it. The
+    /// row used to be enabled on `compatible` alone, so the click became the
+    /// anonymous `settings_command_rejected` — the 2026-10-09 report of an
+    /// error with no named code anywhere.
+    #[test]
+    fn motion_rows_are_drawn_only_when_the_host_would_accept_the_click() {
+        let row = |compatible: bool, selectable: Option<bool>| {
+            let mut value = serde_json::json!({"id": "gmgn.motion.wave", "compatible": compatible});
+            if let Some(selectable) = selectable {
+                value["selectable"] = serde_json::json!(selectable);
+            }
+            value
+        };
+        // The host's own "can this start now" answer decides.
+        assert!(motion_select_enabled(&row(true, Some(true)), false));
+        assert!(!motion_select_enabled(&row(true, Some(false)), false));
+        // An in-flight selection still refuses the click at the host.
+        assert!(!motion_select_enabled(&row(true, Some(true)), true));
+        // Compatibility still gates on its own.
+        assert!(!motion_select_enabled(&row(false, Some(true)), false));
+        // An older host that publishes no `selectable` keeps the old gate.
+        assert!(motion_select_enabled(&row(true, None), false));
+        assert!(!motion_select_enabled(&row(false, None), false));
+        // A row without the field at all is not selectable.
+        assert!(!motion_select_enabled(
+            &serde_json::json!({"id": "gmgn.motion.wave"}),
+            false
+        ));
     }
 
     #[test]

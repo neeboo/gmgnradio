@@ -240,7 +240,31 @@ fn legacy_id(root: &str) -> Option<String> {
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     v["activeID"].as_str().map(str::to_owned)
 }
+/// The exact record printed for a refused presence request: the method, the
+/// authority's own code and the fields a host can actually check against
+/// (`event`/`id`/`expectedRevision`). Without it a UI refusal reached the
+/// person as an anonymous message and left no trace in this daemon's log
+/// (2026-10-09 「选定动作」 report: nothing to read anywhere).
+fn rejection_record(method: &str, p: &Value, code: &str) -> Value {
+    json!({
+        "event": "rejected",
+        "code": code,
+        "method": method,
+        "scope": p["scope"].as_str().unwrap_or(""),
+        "eventName": p["event"].as_str().unwrap_or(""),
+        "id": p["id"].as_str().unwrap_or(""),
+        "requestID": p["requestID"].as_str().unwrap_or(""),
+        "expectedRevision": p["expectedRevision"].clone(),
+    })
+}
 pub fn request(c: &mut Connection, method: &str, p: &Value) -> Result<Value> {
+    let result = dispatch(c, method, p);
+    if let Err(code) = &result {
+        eprintln!("gmgn-taskd: {}", rejection_record(method, p, code));
+    }
+    result
+}
+fn dispatch(c: &mut Connection, method: &str, p: &Value) -> Result<Value> {
     if !matches!(
         method,
         "presence_selection_read"
@@ -920,6 +944,38 @@ mod tests {
             f.event("renderer_ack", None, Some(true)).unwrap_err(),
             "presence_renderer_receipt_stale"
         );
+    }
+    /// A refused selection has to be readable from this daemon's own log: the
+    /// method, the authority's code, and the motion the person clicked. The
+    /// 2026-10-09 「选定动作」 report left nothing readable anywhere, so a
+    /// refusal that names itself is what makes the next one diagnosable.
+    #[test]
+    fn a_refused_motion_selection_is_logged_with_its_code_and_motion() {
+        let mut f = Fixture::new("unity");
+        f.bind();
+        f.event("select_avatar", Some("test.pmx"), None).unwrap();
+        f.event("renderer_ack", None, Some(true)).unwrap();
+        let before = request(
+            &mut f.c,
+            "presence_selection_read",
+            &json!({"scope":f.root}),
+        )
+        .unwrap();
+        // The exact request the Swift client builds for 选定动作.
+        let p = json!({"scope":f.root,"requestID":"log-refusal","expectedRevision":before["revision"],
+            "event":"select_motion","id":"test.vrma"});
+        assert_eq!(
+            request(&mut f.c, "presence_selection_event", &p).unwrap_err(),
+            "presence_motion_incompatible"
+        );
+        let record = rejection_record("presence_selection_event", &p, "presence_motion_incompatible");
+        assert_eq!(record["event"], "rejected");
+        assert_eq!(record["method"], "presence_selection_event");
+        assert_eq!(record["code"], "presence_motion_incompatible");
+        assert_eq!(record["eventName"], "select_motion");
+        assert_eq!(record["id"], "test.vrma");
+        assert_eq!(record["requestID"], "log-refusal");
+        assert_eq!(record["expectedRevision"], before["revision"]);
     }
     #[test]
     fn catalog_scope_path_identity_and_stale_revision_fail_closed() {

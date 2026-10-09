@@ -505,17 +505,31 @@ fn visual_projection(value:&Value)->Value {
     result
 }
 pub(crate) fn settings_projection(envelope:&Value)->Value {
-    // Everything the overlay's settings adapter reads besides the settings
-    // dictionary: `stage` (the stage surface the StagePanelsPane renders),
-    // `characterPosition` (the CAS revisions + pose `presence.position` needs),
-    // `spaceLibrary` (the world package ids `stage.world.enter` must name),
-    // `presence.motions` (the motion ids `stage.motion.activate` must name) and
-    // the whitelist the panes gate their controls on. A focused copy, not the
-    // whole envelope: this value is compared on every poll.
-    let presence = &envelope["settings"]["presence"];
-    json!({"settings":envelope["settings"],"stage":envelope["stage"],
-        "characterPosition":envelope["settings"]["characterPosition"],
-        "spaceLibrary":envelope["settings"]["spaceLibrary"],
+    // Everything the overlay's settings adapter reads, at the single root it
+    // reads it from: the settings dictionary (which the panes render), `stage`
+    // (the stage surface the StagePanelsPane renders), `characterPosition` (the
+    // CAS revisions + pose `presence.position` needs), `spaceLibrary` (the world
+    // package ids `stage.world.enter` must name), `presence.motions` (the motion
+    // ids `stage.motion.activate` must name), `generation` (the saved
+    // configuration `space.prop.save`/`check` gate on) and the whitelist the
+    // panes gate their controls on. A focused copy, not the whole envelope: this
+    // value is compared on every poll.
+    //
+    // The host envelope (`UnityMediaHost.settingsSnapshot`) nests all of those
+    // **inside** the dictionary it publishes as `settings`: on the wire the
+    // settings dictionary is `settings.settings`, the stage is
+    // `settings.settings.stage` and only `supportedCommands` sits beside it. So
+    // `envelope["stage"]`, `envelope["presence"]`, `envelope["spaceLibrary"]`,
+    // `envelope["characterPosition"]` and `envelope["generation"]` are all null
+    // — reading them made the StagePanelsPane render an empty stage and refused
+    // seven stage ops inside the window (2026-10-09). Every field below is read
+    // from the dictionary, never from the envelope root.
+    let settings=&envelope["settings"];
+    let presence=&settings["presence"];
+    json!({"settings":settings,"stage":settings["stage"],
+        "characterPosition":settings["characterPosition"],
+        "spaceLibrary":settings["spaceLibrary"],
+        "generation":settings["generation"],
         "presence":{"motions":presence["motions"],"activeMotionID":presence["activeMotionID"],
             "working":presence["working"],"notice":presence["notice"],"hasError":presence["hasError"]},
         "supportedCommands":envelope["supportedCommands"]})
@@ -784,7 +798,9 @@ mod chat_transport_tests {
         let mut diagnostics=original.clone();
         diagnostics["settings"]=json!({"runtimeDiagnostics":{"frame":999}});
         assert_eq!(visual_projection(&original),visual_projection(&diagnostics));
-        diagnostics["settings"]["stage"]=json!({"player":{"lyricID":"dots"}});
+        // Real envelope nesting: the stage lives inside the settings dictionary
+        // the host publishes as `settings` (`settings.settings.stage`).
+        diagnostics["settings"]=json!({"settings":{"stage":{"player":{"lyricID":"dots"}}}});
         assert_ne!(visual_projection(&original),visual_projection(&diagnostics));
         diagnostics["settings"]=json!({"supportedCommands":["tts.stop"]});
         assert_ne!(visual_projection(&original),visual_projection(&diagnostics));

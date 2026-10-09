@@ -61,26 +61,65 @@ enum SettingsRoute {
     LocalEditCancel,
 }
 
+/// The adapter's contract with one host poll. `UnityMediaHost.settingsSnapshot`
+/// publishes `{"settings":{"settings":{…catalogs…},"supportedCommands":[…]}}`,
+/// so the window stores *this* projection and translates against it: the
+/// translator and the panes can then never disagree about where a catalog
+/// lives.
+fn settings_projection_from_snapshot(snapshot: &Value) -> Value {
+    crate::settings_projection(&snapshot["settings"])
+}
+
+/// One local refusal, in the same shape `services/gmgn-taskd` prints for a
+/// refused presence request: `{"event":"rejected","code":…}` plus the fields a
+/// host can actually check. Without it a click that never left the window left
+/// the person with a generic line and no trace to read anywhere (2026-10-09
+/// 「选定动作」: the host's `settings_command_rejected` was the only thing that
+/// ever appeared).
+fn rejection_record(op: &str, code: &str, command: &Value) -> Value {
+    json!({
+        "event": "rejected",
+        "code": code,
+        "op": op,
+        "surface": "settings",
+        "id": command["id"].as_str().unwrap_or(""),
+        "axis": command["axis"].as_str().unwrap_or(""),
+        "requestID": command["requestID"].as_str().unwrap_or(""),
+    })
+}
+
+/// Print one refusal. Never a success: the notice still shows the same code.
+fn log_rejection(op: &str, code: &str, command: &Value) {
+    eprintln!("gmgn-gpui-overlay: {}", rejection_record(op, code, command));
+}
+
 /// Translate one UI settings command onto its real production entry.
 ///
-/// A command that cannot be translated on the current snapshot returns the
+/// `projection` is [`settings_projection_from_snapshot`]'s output, never the
+/// raw host envelope: the host nests the settings dictionary under
+/// `settings.settings` and the stage under `settings.settings.stage`, so a
+/// root read on the envelope finds no catalog and refused every stage op
+/// locally (`motion_not_available`, `world_not_in_library`,
+/// `scene_preset_unknown`, `activity_not_runnable`,
+/// `character_position_unavailable`, `generation_not_configured`).
+///
+/// A command that cannot be translated on the current projection returns the
 /// named `code` that the notice shows. Nothing here invents a second world,
 /// role, activity or credential store: every field is read from the same
 /// envelope the host publishes.
 fn translate_settings_command(
     command: &Value,
-    snapshot: &Value,
+    projection: &Value,
     draft: &mut Option<PositionDraft>,
 ) -> Result<SettingsRoute, &'static str> {
     let op = command["op"].as_str().ok_or("settings_command_malformed")?;
-    let setting = &snapshot["settings"];
-    let stage = &setting["stage"];
+    let stage = &projection["stage"];
     match op {
         // UnityHost owns this dispatch; the id must name a world package that
         // actually exists in the published library.
         "stage.world.enter" => {
             let id = command["id"].as_str().filter(|id| !id.is_empty()).ok_or("world_id_required")?;
-            let known = setting["spaceLibrary"]["worlds"]
+            let known = projection["spaceLibrary"]["worlds"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -111,13 +150,13 @@ fn translate_settings_command(
         "stage.avatar.position" => {
             let axis = command["axis"].as_str().ok_or("avatar_axis_required")?;
             let value = command["value"].as_f64().filter(|value| value.is_finite()).ok_or("avatar_value_required")?;
-            presence_position_command(axis, value, command, snapshot, draft)
+            presence_position_command(axis, value, command, projection, draft)
         }
-        "stage.avatar.reset" => presence_position_command("", 0., command, snapshot, draft),
+        "stage.avatar.reset" => presence_position_command("", 0., command, projection, draft),
         "stage.motion.refresh" => Ok(SettingsRoute::Host(json!({"op": "presence.load"}))),
         "stage.motion.activate" => {
             let id = command["id"].as_str().filter(|id| !id.is_empty()).ok_or("motion_id_required")?;
-            let known = setting["presence"]["motions"]
+            let known = projection["presence"]["motions"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -149,7 +188,7 @@ fn translate_settings_command(
             if endpoint.is_empty() {
                 return Err("generation_endpoint_required");
             }
-            match setting["generation"]["configured"].as_bool() {
+            match projection["generation"]["configured"].as_bool() {
                 Some(_) => {}
                 None => return Err("generation_unavailable"),
             }
@@ -157,7 +196,7 @@ fn translate_settings_command(
             Ok(SettingsRoute::Host(json!({"op": "generation.save", "endpoint": endpoint, "token": token})))
         }
         "space.prop.check" => {
-            if setting["generation"]["configured"].as_bool() != Some(true) {
+            if projection["generation"]["configured"].as_bool() != Some(true) {
                 return Err("generation_not_configured");
             }
             Ok(SettingsRoute::Host(json!({"op": "generation.check"})))
@@ -188,11 +227,10 @@ fn presence_position_command(
     axis: &str,
     value: f64,
     command: &Value,
-    snapshot: &Value,
+    projection: &Value,
     draft: &mut Option<PositionDraft>,
 ) -> Result<SettingsRoute, &'static str> {
-    let setting = &snapshot["settings"];
-    let character = &setting["characterPosition"];
+    let character = &projection["characterPosition"];
     let world_id = character["worldID"].as_str().filter(|id| !id.is_empty()).ok_or("character_position_unavailable")?;
     let revision = character["revision"].as_u64().ok_or("character_position_unavailable")?;
     let layout = character["layoutRevision"].as_u64().ok_or("character_position_unavailable")?;
@@ -292,10 +330,12 @@ pub struct SettingsPane {
     loaded: bool,
     notice: String,
     last_envelope: Value,
-    /// The full Unity settingsSnapshot envelope, kept so the adapter can build
-    /// a real `presence.position` (CAS revisions + full coordinate) or resolve a
-    /// world/motion/activity id against the host's own catalogs.
-    snapshot: Value,
+    /// The window's own projection of the host envelope (see
+    /// [`settings_projection_from_snapshot`]): the settings dictionary the panes
+    /// render plus `stage`, `spaceLibrary`, `presence`, `characterPosition` and
+    /// `generation`. This is the only shape the translator reads — the raw host
+    /// envelope would miss every catalog.
+    projection: Value,
     /// The unconfirmed coordinate edit, cleared by a reset (see
     /// [`PositionDraft`]).
     draft_position: Option<PositionDraft>,
@@ -324,7 +364,7 @@ impl SettingsPane {
             loaded: false,
             notice: String::new(),
             last_envelope: Value::Null,
-            snapshot: Value::Null,
+            projection: Value::Null,
             draft_position: None,
         }
     }
@@ -334,6 +374,9 @@ impl SettingsPane {
         incoming.extend(self.stage.update(cx, |view, _| view.take_commands()));
         for command in incoming {
             if self.waiting.len() >= MAX_PENDING {
+                // The dropped command is named too: it is the same class of
+                // silent loss the rejection log exists to end.
+                log_rejection(command["op"].as_str().unwrap_or(""), "settings_queue_full", &command);
                 self.notice = "待保存操作已满，请等待当前操作完成后再试。".into();
                 continue;
             }
@@ -343,6 +386,7 @@ impl SettingsPane {
 
     fn dispatch(&mut self) {
         if self.instance.is_empty() {
+            log_rejection("", "settings_session_unavailable", &Value::Null);
             self.notice = "无法创建设置请求，请重新打开设置。".into();
             return;
         }
@@ -351,19 +395,26 @@ impl SettingsPane {
         }
         while let Some(command) = self.waiting.pop_front() {
             let Some(op) = command["op"].as_str() else {
+                log_rejection("", "settings_command_malformed", &command);
                 self.notice = "设置操作格式无效，未提交。".into();
                 continue;
             };
             if !self.supported.iter().any(|candidate| candidate == op) {
+                // Same code the host uses for an op no owner exists for
+                // (`UnityMediaHost.command(_:)`: `settings_command_not_supported`).
+                log_rejection(op, "settings_command_not_supported", &command);
                 self.notice = format!("当前运行时不支持此操作：{op}");
                 continue;
             }
-            let route = match translate_settings_command(&command, &self.snapshot, &mut self.draft_position) {
+            let route = match translate_settings_command(&command, &self.projection, &mut self.draft_position) {
                 Ok(route) => route,
                 Err(code) => {
-                    // A refused request is never reported as a save. The code is
+                    // A refused request is never reported as a save, and it is
+                    // never silent: the named code goes to the log (op + the
+                    // identifying field) as well as to the notice. The code is
                     // the same shape the host's `settingsCommandResult` uses
                     // (`settings_command_rejected`, `…_unavailable`, …).
+                    log_rejection(op, code, &command);
                     self.notice = format!("设置未提交（{code}），请检查对应项目的状态后重试。");
                     continue;
                 }
@@ -399,14 +450,17 @@ impl SettingsPane {
                 self.notice = "正在等待保存确认…".into();
             } else {
                 // Keep the user's original draft. No automatic command replay.
+                log_rejection(op, "settings_transport_full", &command);
                 self.notice = "操作队列已满，这次尚未提交，请稍后重试。".into();
             }
             return;
         }
     }
 
-    /// `settings` is the unchanged full Unity settingsSnapshot envelope, not a
-    /// locally synthesized candidate. All subpanes use the same main poll.
+    /// `snapshot` is the unchanged full host poll projection, not a locally
+    /// synthesized candidate. All subpanes use the same main poll. The window
+    /// keeps its own [`settings_projection_from_snapshot`] of it, which is both
+    /// what the panes render and what [`translate_settings_command`] reads.
     /// Returns `true` when a command asked the window to land on 角色管理 and
     /// the caller (`lib.rs`, owner of the real window) must perform it.
     pub fn update_snapshot(
@@ -415,14 +469,17 @@ impl SettingsPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let envelope = &snapshot["settings"];
         let before=(self.pending.clone(),self.notice.clone(),self.waiting.len());
-        let projection=crate::settings_projection(envelope);
+        // One shape for both halves of this window. The host nests the settings
+        // dictionary (and with it `stage`) under `settings.settings`; reading
+        // `stage` or any catalog off the envelope root left the StagePanelsPane
+        // empty and refused seven ops locally.
+        let projection=settings_projection_from_snapshot(snapshot);
         let envelope_changed=self.last_envelope!=projection;
-        if envelope_changed && envelope["settings"].is_object() {
-            self.last_envelope=projection;
+        if envelope_changed && projection["settings"].is_object() {
+            self.last_envelope=projection.clone();
             self.loaded = true;
-            self.supported = envelope["supportedCommands"]
+            self.supported = projection["supportedCommands"]
                 .as_array()
                 .map(|items| {
                     items
@@ -439,13 +496,15 @@ impl SettingsPane {
             self.supported = settings_supported_ops(&self.supported);
             self.controls.update(cx, |view, cx| {
                 view.set_supported_ops(self.supported.clone(), cx);
-                view.update_snapshot(envelope["settings"].clone(), window, cx)
+                view.update_snapshot(projection["settings"].clone(), window, cx)
             });
             self.stage.update(cx, |view, cx| {
                 view.set_supported_ops(self.supported.clone(), cx);
-                view.update_snapshot(envelope["stage"].clone(), window, cx)
+                view.update_snapshot(projection["stage"].clone(), window, cx)
             });
-            self.snapshot = snapshot.clone();
+            // The translator reads exactly this value (`dispatch`), so the
+            // projection is stored rather than the raw host envelope.
+            self.projection = projection;
         }
         let receipt = &snapshot["settingsCommandResult"];
         if self
@@ -571,42 +630,54 @@ mod settings_translation_tests {
     use super::*;
     use core::prelude::v1::test;
 
-    /// The host snapshot shape is the Unity envelope: every root the adapter
-    /// reads hangs off `settings` (see `lib.rs::settings_projection`).
-    fn envelope() -> Value {
+    /// The **real** host poll (`UnityMediaHost.settingsSnapshot`): the whole
+    /// settings dictionary — `stage`, `characterPosition`, `spaceLibrary`,
+    /// `presence`, `generation` — is nested one level down, under
+    /// `settings.settings`; only `supportedCommands` sits beside it. Reading a
+    /// catalog off this root is the 2026-10-09 defect (seven stage ops refused
+    /// locally, StagePanelsPane always empty).
+    fn host_snapshot() -> Value {
         json!({
+            "version": 1,
+            "revision": 9,
             "settings": {
-                "stage": {
-                    "space": {
-                        "presets": [{"id": "snow", "name": "雪原"}],
-                        "isVisible": true,
-                        "isRequested": true,
-                        "selectedWorldID": "world.living-pod"
+                "settings": {
+                    "stage": {
+                        "space": {
+                            "presets": [{"id": "snow", "name": "雪原"}],
+                            "isVisible": true,
+                            "isRequested": true,
+                            "selectedWorldID": "world.living-pod"
+                        },
+                        "activities": {
+                            "items": [{"id": "life.coffee", "name": "冲泡一杯咖啡"}],
+                            "canRun": true
+                        }
                     },
-                    "activities": {
-                        "items": [{"id": "life.coffee", "name": "冲泡一杯咖啡"}],
-                        "canRun": true
-                    }
+                    "characterPosition": {
+                        "worldID": "world.living-pod",
+                        "revision": 41,
+                        "layoutRevision": 7,
+                        "position": [0.5, -1.25, 2.0],
+                        "available": true
+                    },
+                    "spaceLibrary": {
+                        "worlds": [{"id": "world.living-pod", "name": "生活舱"}],
+                        "selectedID": "world.living-pod"
+                    },
+                    "presence": {
+                        "motions": [{"id": "gmgn.motion.wave", "name": "挥手", "compatible": true}]
+                    },
+                    "generation": {"configured": true, "checking": false}
                 },
-                "characterPosition": {
-                    "worldID": "world.living-pod",
-                    "revision": 41,
-                    "layoutRevision": 7,
-                    "position": [0.5, -1.25, 2.0],
-                    "available": true
-                },
-                "spaceLibrary": {
-                    "worlds": [{"id": "world.living-pod", "name": "生活舱"}],
-                    "selectedID": "world.living-pod"
-                },
-                "presence": {
-                    "motions": [{"id": "gmgn.motion.wave", "name": "挥手", "compatible": true}]
-                },
-                "generation": {"configured": true, "checking": false}
+                "supportedCommands": ["settings.load", "presence.motion", "generation.check"]
             },
-            "supportedCommands": ["settings.load"]
+            "settingsCommandResult": {"requestID": "", "status": "idle"}
         })
     }
+
+    /// Exactly what `SettingsPane` stores from one poll and translates with.
+    fn projection() -> Value { settings_projection_from_snapshot(&host_snapshot()) }
 
     /// Every capability is reached through the published whitelist — the same
     /// gate `SettingsPane::dispatch` applies before it translates anything. A
@@ -619,7 +690,7 @@ mod settings_translation_tests {
             "{op} is not published by the window ⇒ its control would be hidden"
         );
         let mut draft = None;
-        translate_settings_command(&command, &envelope(), &mut draft)
+        translate_settings_command(&command, &projection(), &mut draft)
     }
 
     fn wire(command: Value) -> Value {
@@ -651,10 +722,10 @@ mod settings_translation_tests {
         assert_eq!(wire(json!({"op": "stage.scene.activate", "id": "snow"})),
             json!({"op": "stage.scene.activate", "id": "snow"}));
         assert_eq!(route(json!({"op": "stage.scene.activate", "id": "rain"})), Err("scene_preset_unknown"));
-        let mut hidden = envelope();
-        hidden["settings"]["stage"]["space"]["isVisible"] = json!(false);
+        let mut hidden = host_snapshot();
+        hidden["settings"]["settings"]["stage"]["space"]["isVisible"] = json!(false);
         let mut draft = None;
-        assert_eq!(translate_settings_command(&json!({"op": "stage.scene.activate", "id": "snow"}), &hidden, &mut draft),
+        assert_eq!(translate_settings_command(&json!({"op": "stage.scene.activate", "id": "snow"}), &settings_projection_from_snapshot(&hidden), &mut draft),
             Err("scene_requires_visible_world"));
     }
 
@@ -666,7 +737,7 @@ mod settings_translation_tests {
     fn avatar_position_carries_the_full_coordinate_and_cas_revisions() {
         // One adapter session: the draft has to persist between two axis edits.
         let mut draft = None;
-        let envelope = envelope();
+        let envelope = projection();
         let first = match translate_settings_command(&json!({"op": "stage.avatar.position", "axis": "X", "value": 3.5}), &envelope, &mut draft) {
             Ok(SettingsRoute::Host(value)) => value,
             other => panic!("expected a host command, got {other:?}"),
@@ -703,11 +774,11 @@ mod settings_translation_tests {
     /// half request that the bridge would reject.
     #[test]
     fn avatar_position_refuses_when_the_host_has_no_pose() {
-        let mut missing = envelope();
-        missing["settings"]["characterPosition"] = json!({});
+        let mut missing = host_snapshot();
+        missing["settings"]["settings"]["characterPosition"] = json!({});
         let mut draft = None;
         assert_eq!(
-            translate_settings_command(&json!({"op": "stage.avatar.position", "axis": "Y", "value": 1.0}), &missing, &mut draft),
+            translate_settings_command(&json!({"op": "stage.avatar.position", "axis": "Y", "value": 1.0}), &settings_projection_from_snapshot(&missing), &mut draft),
             Err("character_position_unavailable")
         );
     }
@@ -764,10 +835,10 @@ mod settings_translation_tests {
     /// must say so instead of querying nothing.
     #[test]
     fn wish_machine_check_refuses_when_nothing_is_saved() {
-        let mut unconfigured = envelope();
-        unconfigured["settings"]["generation"] = json!({"configured": false, "checking": false});
+        let mut unconfigured = host_snapshot();
+        unconfigured["settings"]["settings"]["generation"] = json!({"configured": false, "checking": false});
         let mut draft = None;
-        assert_eq!(translate_settings_command(&json!({"op": "space.prop.check"}), &unconfigured, &mut draft),
+        assert_eq!(translate_settings_command(&json!({"op": "space.prop.check"}), &settings_projection_from_snapshot(&unconfigured), &mut draft),
             Err("generation_not_configured"));
     }
 
@@ -827,7 +898,7 @@ mod settings_translation_tests {
             let op = command["op"].as_str().unwrap().to_owned();
             assert!(STAGE_OPS.contains(&op.as_str()), "{op} missing from STAGE_OPS");
             let mut draft = None;
-            let routed = translate_settings_command(&command, &envelope(), &mut draft)
+            let routed = translate_settings_command(&command, &projection(), &mut draft)
                 .unwrap_or_else(|code| panic!("{op} was refused: {code}"));
             // A UI op may keep its name only when a real host arm owns that
             // name; everything else has to be rewritten onto one.
@@ -841,5 +912,108 @@ mod settings_translation_tests {
                 SettingsRoute::PresenceSettings | SettingsRoute::LocalEditCancel => {}
             }
         }
+    }
+
+    /// The projection carries the roots the adapter reads, taken from the
+    /// dictionary the host nests one level down. `stage` is the one the
+    /// StagePanelsPane renders: read off the envelope root it is always null, so
+    /// the 场景/活动 surface drew nothing.
+    #[test]
+    fn the_projection_carries_the_stage_and_generation_the_host_nests() {
+        let host = host_snapshot();
+        // The defect itself: none of these exist at the envelope root.
+        for key in ["stage", "presence", "spaceLibrary", "characterPosition", "generation"] {
+            assert!(host["settings"][key].is_null(), "{key} must not sit at the envelope root");
+            assert!(!host["settings"]["settings"][key].is_null(), "{key} must sit in the settings dictionary");
+        }
+        let projection = projection();
+        assert_eq!(projection["stage"], host["settings"]["settings"]["stage"]);
+        assert_eq!(projection["stage"]["space"]["presets"][0]["id"], "snow");
+        assert_eq!(projection["stage"]["activities"]["items"][0]["id"], "life.coffee");
+        assert_eq!(projection["generation"], host["settings"]["settings"]["generation"]);
+        assert_eq!(projection["characterPosition"]["revision"], 41);
+        assert_eq!(projection["spaceLibrary"]["worlds"][0]["id"], "world.living-pod");
+        assert_eq!(projection["presence"]["motions"][0]["id"], "gmgn.motion.wave");
+        assert_eq!(projection["settings"], host["settings"]["settings"]);
+        assert_eq!(projection["supportedCommands"], host["settings"]["supportedCommands"]);
+    }
+
+    /// Driven by the **real** host envelope, every one of the seven ops that
+    /// used to be refused inside the window reaches a host owner. The list is
+    /// the 2026-10-09 defect, op by op: the local code each one used to return
+    /// is the second column.
+    #[test]
+    fn the_real_host_envelope_reaches_the_host_for_every_stage_op() {
+        let cases = [
+            (json!({"op": "stage.world.enter", "id": "world.living-pod"}), "world_not_in_library", "stage.world.enter"),
+            (json!({"op": "stage.scene.activate", "id": "snow"}), "scene_preset_unknown", "stage.scene.activate"),
+            (json!({"op": "stage.avatar.position", "axis": "X", "value": 3.5}), "character_position_unavailable", "presence.position"),
+            (json!({"op": "stage.avatar.reset"}), "character_position_unavailable", "presence.position.reset"),
+            (json!({"op": "stage.motion.activate", "id": "gmgn.motion.wave"}), "motion_not_available", "presence.motion"),
+            (json!({"op": "stage.activity.run", "id": "life.coffee"}), "activity_not_runnable", "stage.activity.run"),
+            (json!({"op": "space.prop.check"}), "generation_not_configured", "generation.check"),
+        ];
+        for (command, was_refused_as, wire_op) in cases {
+            let op = command["op"].as_str().unwrap().to_owned();
+            let mut draft = None;
+            let route = translate_settings_command(&command, &projection(), &mut draft)
+                .unwrap_or_else(|code| panic!("{op} refused locally ({code}); it used to be {was_refused_as}"));
+            match route {
+                SettingsRoute::Host(wire) => assert_eq!(wire["op"], wire_op, "{op} must reach its owner"),
+                other => panic!("{op} must reach the host, got {other:?}"),
+            }
+            // Negative control, same envelope: handed the raw host poll (the
+            // pre-fix argument) the translator returns exactly the code this op
+            // used to show, so this test cannot pass by accident and cannot be
+            // satisfied by adding a root fallback.
+            let mut draft = None;
+            assert_eq!(translate_settings_command(&command, &host_snapshot(), &mut draft), Err(was_refused_as),
+                "{op} must not resolve against the raw envelope");
+        }
+    }
+
+    /// The two halves of the window must agree on one shape: `update_snapshot`
+    /// stores the projection built from the poll and `dispatch` translates
+    /// against exactly that value. Handing the translator the raw host snapshot
+    /// is the pre-fix wiring that produced the seven local refusals, so the
+    /// wiring itself is pinned here (a revert of the hierarchy turns this red).
+    #[test]
+    fn the_window_translates_the_projection_it_stored_not_the_raw_host_snapshot() {
+        let source = include_str!("settings_ui.rs");
+        let code = source.split("\n#[cfg(test)]").next().expect("library source before tests");
+        let compact: String = code.chars().filter(|character| !character.is_whitespace()).collect();
+        assert!(compact.contains("letprojection=settings_projection_from_snapshot(snapshot);"),
+            "update_snapshot must build the projection from the poll");
+        assert!(compact.contains("view.update_snapshot(projection[\"stage\"].clone(),window,cx)"),
+            "the StagePanelsPane must render the projection's stage");
+        assert!(compact.contains("translate_settings_command(&command,&self.projection,"),
+            "dispatch must translate against the stored projection");
+        assert!(!compact.contains("self.snapshot"),
+            "the raw host snapshot must never be the value the adapter reads");
+        assert!(!compact.contains("envelope[\"stage\"]") && !compact.contains("envelope[\"presence\"]"),
+            "no catalog may be read off the envelope root");
+    }
+
+    /// Every local refusal is one named, readable record — op + code + the
+    /// identifying field — the same shape `gmgn-taskd` prints for a refused
+    /// presence request. `dispatch` is what prints it; this pins the record.
+    #[test]
+    fn a_local_refusal_names_its_op_code_and_field_in_one_record() {
+        let record = rejection_record(
+            "stage.motion.activate",
+            "motion_not_available",
+            &json!({"op": "stage.motion.activate", "id": "gmgn.motion.wave", "requestID": "r-1"}),
+        );
+        assert_eq!(record["event"], "rejected");
+        assert_eq!(record["code"], "motion_not_available");
+        assert_eq!(record["op"], "stage.motion.activate");
+        assert_eq!(record["id"], "gmgn.motion.wave");
+        assert_eq!(record["requestID"], "r-1");
+        assert_eq!(record["surface"], "settings");
+        // A named code is required: the notice and the log carry the same one.
+        assert_eq!(
+            translate_settings_command(&json!({"op": "stage.motion.activate", "id": "missing"}), &projection(), &mut None),
+            Err("motion_not_available")
+        );
     }
 }
