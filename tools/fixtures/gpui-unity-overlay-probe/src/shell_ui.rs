@@ -1560,6 +1560,14 @@ mod tests {
     }
 
     /// 小窗 renders the column **instead of** the wide bar and the destination
+    /// The probe's own control set, measured against the derivation.
+    ///
+    /// `transport_rows` is 13 controls — twelve 44 pt slots and the 68 pt 设置
+    /// slot — with [`super::transport_group_ends_after`] ending two groups, so
+    /// the bar places 13 slots + 2 hairlines = 15 flex children and gaps the 14
+    /// pairs between them. The reading is spelled out instead of derived, so a
+    /// wrong `transport_width` cannot make this agree with itself: the old
+    /// "two group gaps" reading derives 691 - 72 = 619 for the same bar.
     #[test]
     fn the_transport_width_counts_every_flex_child_the_bar_places() {
         use gmgn_gpui_ui::shell::{self, TransportControl};
@@ -1573,10 +1581,6 @@ mod tests {
             })
             .collect();
 
-        // 13 controls, two of them ending a group, so the bar places
-        // 13 slots + 2 hairlines = 15 flex children and gaps the 14 pairs
-        // between them. The reading is spelled out instead of derived so a
-        // wrong `transport_width` cannot make this agree with itself.
         let slots = 12. * 44. + 68.;
         let dividers = 2. * 1.;
         let insets = 2. * 4.;
@@ -1584,17 +1588,26 @@ mod tests {
         let width = slots + dividers + insets + gaps + 1.;
         assert_eq!(controls.len(), 13);
         assert_eq!(
+            controls.iter().filter(|control| control.ends_group).count(),
+            2,
+            "音量 and 电视 end the bar's two groups"
+        );
+        assert_eq!(
             shell::transport_width(&controls),
             width,
             "the derivation must count a gap between every neighbouring pair of \
              the bar's real children, not two group gaps"
         );
-        assert_eq!(width, 699.);
-        // Still wider than the probe's own 720 pt Unity sample canvas once the
-        // bar is pinned 22 pt from the right edge, which is why the leftmost
-        // 音乐与节目 entry is clipped there. Recorded, not hidden: the product
-        // window's 760 pt floor is what keeps it inside in the shipped app.
-        assert!(width > 720., "the probe sample canvas is narrower than the bar");
+        assert_eq!(width, 691.);
+        // 691 + the 1 pt rounding term is 692 pt of bar pinned 22 pt from the
+        // right edge of the probe's 720 pt Unity sample: `x = 6`, i.e. it fits.
+        // The defect was never that this bar overflowed — it is that the host
+        // placed it by a derivation that **understated** it (the old reading is
+        // 619 for this set, and 529 vs a real 584 for the product's), so the
+        // number the placement trusted was smaller than the thing it placed.
+        // `apps/gpui-ui/tests/transport_popover_geometry.rs` pins that equality
+        // in real pixels; this pins the probe's own arithmetic.
+        assert!(width + 1. + 22. <= 720., "the probe's bar fits its sample canvas");
     }
 
     /// 小窗 renders the column **instead of** the wide bar and the destination
