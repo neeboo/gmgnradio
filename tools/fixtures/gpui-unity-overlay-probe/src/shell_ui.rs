@@ -5,7 +5,7 @@ use gmgn_gpui_ui::shell::{self, TransportControl};
 use gmgn_gpui_ui::ui_tokens::{chat, scene, shell as metrics, stage};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, WindowExt,
+    WindowExt,
     menu::{DropdownMenu, PopupMenuItem},
     slider::{SliderEvent, SliderState},
 };
@@ -856,7 +856,12 @@ impl Render for ShellPane {
         let mut root = div()
             .relative()
             .size_full()
-            .text_color(cx.theme().foreground)
+            // The root's text colour is the overlay's own, not the system
+            // theme's: this layer floats over the rendered space and its
+            // palette is fixed (`ui_tokens::scene`). `cx.theme()` here made the
+            // probe's text follow the OS appearance while every panel around it
+            // stayed dark.
+            .text_color(rgba(scene::TEXT))
             .on_children_prepainted(|bounds, window, cx| {
                 if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
                     crate::report_ui_hit_bounds(&[Bounds::new(
@@ -1007,8 +1012,13 @@ impl Render for ShellPane {
                     .bottom(px(bottom))
                     .w(px(width))
                     .p_2()
-                    .bg(cx.theme().background)
-                    .text_color(cx.theme().danger)
+                    // The queue/notice toast is an overlay surface: its card and
+                    // its words come from the fixed palette, like every other
+                    // panel in this layer. `cx.theme()` painted it with the
+                    // system appearance (`theme.background` /
+                    // `theme.danger`) — a second palette inside one window.
+                    .bg(rgba(scene::CARD_BG))
+                    .text_color(rgba(scene::WARNING))
                     .child(notice),
             );
         }

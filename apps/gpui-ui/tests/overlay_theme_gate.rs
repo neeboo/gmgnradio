@@ -55,7 +55,8 @@ const BANNED: &[&str] = &[
 
 /// One reviewed exemption: `needle` may appear in `file` at most `max` times.
 struct Allowance {
-    /// Path relative to `apps/gpui-ui/src`.
+    /// Full path from the repository root, e.g. `apps/gpui-ui/src/primitives.rs`
+    /// (the gate scans more than one tree — see [`scan_roots`]).
     file: &'static str,
     needle: &'static str,
     max: usize,
@@ -66,7 +67,7 @@ struct Allowance {
 /// for staleness (an exemption nothing matches fails too), so it cannot rot.
 const ALLOWED: &[Allowance] = &[
     Allowance {
-        file: "primitives.rs",
+        file: "apps/gpui-ui/src/primitives.rs",
         needle: ".custom(",
         max: 1,
         reason: "`primary_circle_button` builds its one custom variant from the fixed \
@@ -74,14 +75,14 @@ const ALLOWED: &[Allowance] = &[
                  stays banned in this file like every other.",
     },
     Allowance {
-        file: "settings.rs",
+        file: "apps/gpui-ui/src/settings.rs",
         needle: ".custom(",
         max: 1,
         reason: "the shortcut cell's recording tint: four `rgba(scene::ACCENT…)` values at fixed \
                  alphas, so nothing is inherited from the theme.",
     },
     Allowance {
-        file: "stage_panels.rs",
+        file: "apps/gpui-ui/src/stage_panels.rs",
         needle: ".custom(",
         max: usize::MAX,
         reason: "`stage_panels/**` is owned by another line and outside this change's edit scope; \
@@ -89,19 +90,19 @@ const ALLOWED: &[Allowance] = &[
                  tokens, and a theme read would still be caught above.",
     },
     Allowance {
-        file: "stage_panels/props.rs",
+        file: "apps/gpui-ui/src/stage_panels/props.rs",
         needle: ".custom(",
         max: usize::MAX,
         reason: "same `scene_variant(cx, ..)` recipe as `stage_panels.rs`.",
     },
     Allowance {
-        file: "stage_panels/program.rs",
+        file: "apps/gpui-ui/src/stage_panels/program.rs",
         needle: ".custom(",
         max: usize::MAX,
         reason: "same `scene_variant(cx, ..)` recipe as `stage_panels.rs`.",
     },
     Allowance {
-        file: "stage_panels/props.rs",
+        file: "apps/gpui-ui/src/stage_panels/props.rs",
         needle: ".danger()",
         max: 1,
         reason: "the 永久删除 confirm dialog's kit Danger variant. `stage_panels/**` is outside \
@@ -112,6 +113,34 @@ const ALLOWED: &[Allowance] = &[
 
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Every tree that **ships the overlay**: the layer itself, and the Unity
+/// overlay probe, which embeds the same panels in the same window.
+///
+/// The probe used to sit outside this gate, and that is exactly where three
+/// `cx.theme()` reads survived the 主题 cleanup: the root's text colour and the
+/// queue-error toast's background/danger. A palette rule that only covers half
+/// of the surfaces the product renders is a rule with a hole, so the probe is
+/// scanned too.
+///
+/// The probe needs **no** exemption: it names none of the banned control
+/// variants and, after the 2026-10-09 fix, no bare `cx.theme()` in code. If a
+/// real need appears, it is recorded in [`ALLOWED`] with a reason like any
+/// other.
+fn scan_roots() -> Vec<(PathBuf, &'static str)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = root
+        .parent()
+        .and_then(Path::parent)
+        .expect("apps/gpui-ui lives in <repo>/apps");
+    vec![
+        (src_dir(), "apps/gpui-ui/src/"),
+        (
+            repo.join("tools/fixtures/gpui-unity-overlay-probe/src"),
+            "tools/fixtures/gpui-unity-overlay-probe/src/",
+        ),
+    ]
 }
 
 fn collect_rust(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -288,42 +317,51 @@ fn mask(source: &str) -> String {
 /// token like `ui_tokens::stage::DANGER_TEXT`.
 #[test]
 fn overlay_layer_has_no_theme_derived_controls() {
-    let src = src_dir();
-    let mut files = Vec::new();
-    collect_rust(&src, &mut files);
-    files.sort();
-    assert!(
-        files.len() >= 10,
-        "the gate must actually read the layer; found {} file(s) under {}",
-        files.len(),
-        src.display()
-    );
-
-    // (file, needle, line, raw line)
+    let roots = scan_roots();
+    // (display path from the repo root, needle, line, raw line)
     let mut hits: Vec<(String, &'static str, usize, String)> = Vec::new();
-    for path in &files {
-        let relative = path
-            .strip_prefix(&src)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let source = fs::read_to_string(path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let code = mask(&source);
-        let raw: Vec<&str> = source.lines().collect();
-        for (index, line) in code.lines().enumerate() {
-            for needle in BANNED {
-                if line.contains(needle) {
-                    hits.push((
-                        relative.clone(),
-                        needle,
-                        index + 1,
-                        raw.get(index).copied().unwrap_or_default().trim().to_owned(),
-                    ));
+    let mut scanned = 0usize;
+    for (src, prefix) in &roots {
+        let mut files = Vec::new();
+        collect_rust(src, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "the gate must actually read `{prefix}`; no Rust source under {}",
+            src.display()
+        );
+        scanned += files.len();
+        for path in &files {
+            let relative = format!(
+                "{prefix}{}",
+                path.strip_prefix(src)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            let source = fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let code = mask(&source);
+            let raw: Vec<&str> = source.lines().collect();
+            for (index, line) in code.lines().enumerate() {
+                for needle in BANNED {
+                    if line.contains(needle) {
+                        hits.push((
+                            relative.clone(),
+                            needle,
+                            index + 1,
+                            raw.get(index).copied().unwrap_or_default().trim().to_owned(),
+                        ));
+                    }
                 }
             }
         }
     }
+    assert!(
+        scanned >= 10,
+        "the gate must actually read the layer; it read {scanned} file(s) across {} root(s)",
+        roots.len()
+    );
 
     let mut failures = Vec::new();
     for (file, needle, line, text) in &hits {
@@ -331,9 +369,7 @@ fn overlay_layer_has_no_theme_derived_controls() {
             .iter()
             .any(|allowance| allowance.file == file && allowance.needle == *needle)
         {
-            failures.push(format!(
-                "apps/gpui-ui/src/{file}:{line}: `{needle}` in `{text}`"
-            ));
+            failures.push(format!("{file}:{line}: `{needle}` in `{text}`"));
         }
     }
     for allowance in ALLOWED {
@@ -347,14 +383,14 @@ fn overlay_layer_has_no_theme_derived_controls() {
         let needle = allowance.needle;
         if count == 0 {
             failures.push(format!(
-                "stale exemption: apps/gpui-ui/src/{file} no longer uses `{needle}`; delete the \
-                 entry (its recorded reason was: {})",
+                "stale exemption: {file} no longer uses `{needle}`; delete the entry \
+                 (its recorded reason was: {})",
                 allowance.reason
             ));
         } else if count > allowance.max {
             failures.push(format!(
-                "apps/gpui-ui/src/{file}: {count} × `{needle}` exceeds the {} recorded — a new \
-                 theme-derived control has no exemption: {}",
+                "{file}: {count} × `{needle}` exceeds the {} recorded — a new theme-derived \
+                 control has no exemption: {}",
                 allowance.max, allowance.reason
             ));
         }

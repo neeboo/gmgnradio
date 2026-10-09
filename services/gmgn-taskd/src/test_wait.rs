@@ -64,3 +64,68 @@ impl StallWatch {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StallWatch;
+    use serde_json::json;
+    use std::time::Duration;
+
+    /// 回归：看门狗判的是**没进展**，不是**没跑够快**。
+    ///
+    /// 2026-10-09 的修法（`media.rs` / `agent_chat.rs` / `agent_cli.rs` /
+    /// `agent_dsh.rs` 的等待）只做过重复跑验证，没有常驻测试。旧写法是固定墙钟
+    /// 上限（6s / 5s / 10s），比被测作业自己的契约（解析 90s、下载 600s）还紧，
+    /// 并行跑满时作业健康、测试先超时。这里把新语义用**常数时间**钉住：
+    ///
+    /// * 只要观测到的状态在变，就永远不算卡住——不管机器上的作业跑得多慢；
+    /// * 只有状态在 `stall` 窗口内**一动不动**才返回 false。
+    #[test]
+    fn progress_resets_the_stall_window_and_a_still_state_does_not() {
+        let mut moving = StallWatch::new("测试作业", Duration::from_secs(30));
+        for tick in 0..40 {
+            // 40 × 5ms = 200ms 的观测跨度，窗口是 30s：一直在动就必须一直 true。
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(
+                moving.observe(&json!({"state": "running", "tick": tick})),
+                "a changing state is progress, however slow the machine is"
+            );
+        }
+
+        let mut still = StallWatch::new("静止作业", Duration::from_millis(40));
+        let frozen = json!({"state": "downloading", "bytes": 1024});
+        assert!(still.observe(&frozen), "the first observation is always progress");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            still.observe(&frozen),
+            "inside the window an unchanged state is not yet a stall"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !still.observe(&frozen),
+            "an unchanging state past the stall window must report no progress"
+        );
+        let message = still.stalled();
+        assert!(
+            message.contains("静止作业") && message.contains("1024"),
+            "the failure message must name the job and the last state it saw: {message}"
+        );
+    }
+
+    /// 回归：窗口重置必须是**真重置**——停滞窗口从最后一次变化算起，而不是从构造
+    /// 时刻算起。否则「动不动地跑了很久才停」会被误判成一开始就卡住。
+    #[test]
+    fn a_change_moves_the_window_start_forward() {
+        let mut watch = StallWatch::new("测试作业", Duration::from_millis(80));
+        assert!(watch.observe(&json!({"state": "a"})));
+        // 先让首个窗口几乎走完。
+        std::thread::sleep(Duration::from_millis(70));
+        // 变化把窗口起点推到现在（而不是留在构造时刻）。
+        assert!(watch.observe(&json!({"state": "b"})));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            watch.observe(&json!({"state": "b"})),
+            "40ms after the last change is still inside the 80ms window"
+        );
+    }
+}

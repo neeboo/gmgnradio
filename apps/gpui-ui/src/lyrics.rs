@@ -3790,6 +3790,116 @@ mod tests {
         );
     }
 
+    /// 回归：等待是**事件**驱动的，不是**墙钟**驱动的。
+    ///
+    /// 2026-10-09 的缺陷修法（只做过重复跑验证，没有常驻测试）：`wait_ready` 里
+    /// 曾是 3s 固定墙钟 + `yield_now` 自旋，而单个冷帧实测 461–1608 ms、并行跑满
+    /// 时翻几倍就越过 3s，于是作业完全健康、测试却先超时。
+    ///
+    /// 这里刻意让 worker 比那个已经删掉的 3s 上限**慢**：它在 channel 上阻塞 3.5s
+    /// 才发布结果，等待侧的 guard 给到 10s（远大于作业耗时，符合「guard 只是挂死
+    /// 保护，不是作业时限」）。返回即证明等待方是被 `notify_all` 叫醒的。
+    ///
+    /// 会失败的方向是明确的：把固定 3s 上限写回来，本测试在 ~3s 处返回 false 而
+    /// 不是等到 3.5s 的真实发布 —— 这正是缺陷本身。
+    #[test]
+    fn wait_ready_waits_for_the_publication_event_not_a_wall_clock_deadline() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = super::LatestWorker::new(move |input: u32| {
+            entered_tx.send(input).unwrap();
+            // 比旧 3s 墙钟更久；3.5s 仍远小于 10s 的挂死保护。
+            released.recv_timeout(std::time::Duration::from_millis(3500)).ok();
+            input * 2
+        });
+        worker.submit(7, 21);
+        assert_eq!(
+            entered
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("the worker must pick the frame up promptly"),
+            21
+        );
+        let started = std::time::Instant::now();
+        assert!(
+            worker.wait_ready(std::time::Duration::from_secs(10), |queue| {
+                queue.completed.is_some()
+            }),
+            "a wait that is event-driven must survive a publication later than the \
+             old 3 s wall clock"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(3000),
+            "the assertion is only meaningful if the wait really outlived the old \
+             3 s deadline; it returned after {waited:?}"
+        );
+        release.send(()).unwrap();
+        assert_eq!(worker.take(7), Some(42));
+        worker.close();
+        wait_until(&worker, |queue| queue.stopped);
+    }
+
+    /// 回归：进展事件一到，等待方**立刻**返回——它是被 `notify_all` 叫醒的，不是
+    /// 按某个轮询间隔去查的。
+    ///
+    /// 旧写法（3s 墙钟 + `yield_now` 自旋）里等待方一直在跑，这条测不出差别；它的
+    /// 价值在于钉住**唤醒语义**这一侧：等待方必须 parked 在 condvar 上，并由通知
+    /// 立刻叫醒。真的 3s 上限回归由
+    /// [`wait_ready_waits_for_the_publication_event_not_a_wall_clock_deadline`]
+    /// 直接抓住（那里作业比 3s 慢）。这里补的是另一半：窗口 30s、发布发生在
+    /// 300ms 后，等待方必须在通知后的极短时间内返回，而不是等到窗口边界或者某个
+    /// 轮询周期。
+    #[test]
+    fn wait_ready_returns_promptly_when_the_progress_event_fires() {
+        let shared: std::sync::Arc<(
+            std::sync::Mutex<super::LatestQueue<u32, u32>>,
+            std::sync::Condvar,
+        )> = std::sync::Arc::new((
+            std::sync::Mutex::new(super::LatestQueue {
+                pending: None,
+                completed: None,
+                generation: 0,
+                closed: false,
+                stopped: false,
+                inflight: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let wake = shared.clone();
+        let (done_tx, done) = std::sync::mpsc::channel::<bool>();
+        let waiter = std::thread::spawn(move || {
+            let worker = super::LatestWorker { shared: wake };
+            // `stopped` 由持锁方置真；这里只等它，不发布任何结果。
+            let ready = worker.wait_ready(std::time::Duration::from_secs(30), |queue| {
+                queue.stopped
+            });
+            done_tx.send(ready).unwrap();
+        });
+        // 持锁 300ms 再发布：一个 parked 的等待方会一直睡着，直到这一下通知。
+        let mut queue = shared.0.lock().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            done.try_recv().is_err(),
+            "the waiter must still be parked before the progress event fires"
+        );
+        queue.stopped = true;
+        let notified = std::time::Instant::now();
+        shared.1.notify_all();
+        drop(queue);
+        assert!(
+            done.recv_timeout(std::time::Duration::from_millis(250))
+                .expect("the waiter must be woken by the progress event, promptly"),
+            "the waiter must observe the state the notifier published"
+        );
+        let latency = notified.elapsed();
+        assert!(
+            latency < std::time::Duration::from_millis(250),
+            "the wait must end on the event, not on a polling interval: it returned \
+             {latency:?} after notify_all"
+        );
+        waiter.join().unwrap();
+    }
+
     #[test]
     fn lyric_worker_bounds_pending_and_publishes_under_continuous_input() {
         let (entered_tx, entered) = std::sync::mpsc::channel();
