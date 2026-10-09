@@ -932,23 +932,25 @@ for line in sys.stdin:
     }
 
     async fn wait(service: &DshService, p: &Value, want: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let read = service.request("agent_dsh_read", p).await.unwrap();
-                if read["state"] == want
-                    || read["pendingTools"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|v| v["phase"] == want)
-                {
-                    return read;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // 等进展，不等墙钟（原来是 10s 固定上限，并行跑满时会先于被测作业超时）。
+        let mut watch =
+            crate::test_wait::StallWatch::new("agent_dsh 会话", Duration::from_secs(60));
+        loop {
+            let read = service.request("agent_dsh_read", p).await.unwrap();
+            if read["state"] == want
+                || read["pendingTools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["phase"] == want)
+            {
+                return read;
             }
-        })
-        .await
-        .unwrap()
+            if !watch.observe(&read) {
+                panic!("{}", watch.stalled());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

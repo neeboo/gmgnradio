@@ -61,6 +61,9 @@ mod generation_configuration;
 
 #[cfg(test)]
 mod rpc_wiring_tests;
+// 测试等待的公共部件（停滞看门狗）：让测试等**进展**而不是等墙钟。
+#[cfg(test)]
+mod test_wait;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

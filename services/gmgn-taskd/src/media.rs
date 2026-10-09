@@ -2819,8 +2819,12 @@ mod tests {
             self.media.request("media_prepare",json!({"pageURL":format!("https://youtu.be/{id}"),"maxHeight":2160,"consumerID":owner})).await.unwrap()
         }
         async fn terminal(&self, key: &str) -> Value {
-            let mut last = Value::Null;
-            for _ in 0..300 {
+            // 等进展，不等墙钟：原来是 300 × 20ms = 6s 的固定上限，比生产管线自己
+            // 的解析上限（90s）还紧，于是并行跑满时会先于被测作业超时。现在只在
+            // 「状态 60s 一动不动」时才判失败——60s 是实测并行峰值（6.3s）的约
+            // 10 倍，且远低于生产自己的 600s 下载上限。
+            let mut watch = crate::test_wait::StallWatch::new("media 作业", Duration::from_secs(60));
+            loop {
                 let value = self
                     .media
                     .request("media_status", json!({"cacheKey":key}))
@@ -2831,13 +2835,11 @@ mod tests {
                 {
                     return value;
                 }
-                last = value;
+                if !watch.observe(&value) {
+                    panic!("{} root={}", watch.stalled(), self.root.display());
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            panic!(
-                "media job did not reach a terminal state: root={} last={last}",
-                self.root.display()
-            );
         }
         fn helper_calls(&self) -> usize {
             std::fs::read(self.root.join("helper-count"))

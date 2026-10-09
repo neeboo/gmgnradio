@@ -658,6 +658,10 @@ const CATALOG_ONLY: &[(&str, &str)] = &[
         "the original's speaker.wave.2.fill while speaking; the default bundle has no volume icon",
     ),
     (
+        "VolumeX",
+        "the 音量 popover's muted face (volume-x); gpui-kit's default component bundle has no volume glyph at all, so the mute icon can only come from the catalog",
+    ),
+    (
         "Archive",
         "the ownership row's ended/archived status glyph; the default bundle has no archive",
     ),

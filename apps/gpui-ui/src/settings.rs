@@ -734,6 +734,28 @@ fn check_icon(checked: bool) -> Icon {
     .size(px(metrics::NOTICE_ICON))
 }
 
+/// The face of one [`AgentSettingsPane::command_button`].
+///
+/// Every name is from gpui-kit's **default component bundle** (the source the
+/// product registers), so a command control never depends on the full catalog
+/// and never needs a packaging exemption. The op picks the glyph; the words the
+/// original drew on the button live in its tooltip and accessibility label.
+fn command_icon(operation: &str) -> IconName {
+    match operation {
+        "video.choose" => IconName::FolderOpen,
+        "video.stop" => IconName::Square,
+        "video.recoverStop" => IconName::TriangleAlert,
+        "video.bind" => IconName::Plus,
+        "video.unbind" => IconName::Minus,
+        "video.bound.play" => IconName::Play,
+        "video.bound.dismiss" => IconName::Close,
+        "space.key.clear" => IconName::Delete,
+        "space.library.load" => IconName::RefreshCw,
+        "shortcuts.reset" => IconName::Undo2,
+        _ => IconName::Play,
+    }
+}
+
 fn orb_preview() -> impl IntoElement {
     div()
         .size(px(metrics::PREVIEW_SIZE))
@@ -981,13 +1003,16 @@ impl AgentSettingsPane {
                                 }),
                         )
                         .child(
-                            Button::new("import-link")
-                                .label(settings_copy(
+                            ui::icon_button(
+                                "import-link",
+                                IconName::ArrowDown,
+                                settings_copy(
                                     locale,
                                     if working { "正在下载…" } else { "下载并安装" },
-                                ))
-                                .primary()
-                                .disabled(disabled)
+                                ),
+                                false,
+                            )
+                            .disabled(disabled)
                                 .on_click(move |_, _, cx| {
                                     _ = submit.update(cx, |this, cx| {
                                         this.commands.push(json!({"op":"presence.import.link","url":this.extra_inputs[4].read(cx).value().to_string()}));
@@ -1764,6 +1789,16 @@ impl AgentSettingsPane {
         self.commands.push(tts);
     }
 
+    /// One host command as an icon control for the row it belongs to.
+    ///
+    /// This helper used to draw the original's words on the button and carry
+    /// kit's `.danger()` variant for `space.key.clear`. Both are theme-derived
+    /// surfaces (`Button`'s `Default` fill is `cx.theme().tokens.button`, and
+    /// `danger()` reads the same token family), so the face is now the shared
+    /// [`crate::primitives::icon_button`] over the fixed `scene` palette: the op
+    /// picks the glyph, the words move to the tooltip and the accessibility
+    /// label, and the one irreversible action expresses danger with
+    /// `ui_tokens::stage::DANGER_TEXT` instead of a kit variant.
     fn command_button(
         &self,
         id: impl Into<ElementId>,
@@ -1773,11 +1808,17 @@ impl AgentSettingsPane {
     ) -> AnyElement {
         let label: SharedString = label.into();
         let label = settings_copy(UiLocale::from_settings(&self.snapshot), label.as_ref()).to_owned();
-        Button::new(id)
-            .label(label)
-            .when(command["op"] == "space.key.clear", |button| button.danger())
+        let operation = command["op"].as_str().unwrap_or_default().to_owned();
+        // Clearing the stored Marble key is the one irreversible action behind
+        // this helper: it also arms the pending-mutation guard the host answers.
+        let clears_key = operation == "space.key.clear";
+        let mut button = ui::icon_button(id, command_icon(&operation), label, false);
+        if clears_key {
+            button = button.text_color(rgba(tokens::stage::DANGER_TEXT));
+        }
+        button
             .on_click(cx.listener(move |this, _, _, cx| {
-                if command["op"] == "space.key.clear" {
+                if clears_key {
                     this.pending_marble = Some((
                         this.snapshot["space"]["marbleMutationRevision"]
                             .as_u64()
@@ -2205,13 +2246,13 @@ impl AgentSettingsPane {
                                 })),
                         )
                         .child(
-                            Button::new("generation-save")
-                                .small()
-                                .primary()
-                                .icon(IconName::Check)
-                                .tooltip(settings_copy(locale, "保存"))
-                                .accessibility_label(settings_copy(locale, "保存"))
-                                .accessibility_id("settings.space.generation.save")
+                            ui::icon_button(
+                                "generation-save",
+                                IconName::Check,
+                                settings_copy(locale, "保存"),
+                                false,
+                            )
+                            .accessibility_id("settings.space.generation.save")
                                 .disabled(!generation_save_enabled(
                                     self.extra_inputs[5].read(cx).value().as_str(),
                                     checking,
@@ -2294,12 +2335,13 @@ impl AgentSettingsPane {
             })
             .when(prop_save_supported, |row| {
                 row.child(
-                    Button::new("prop-save")
-                        .primary()
-                        .icon(IconName::Check)
-                        .tooltip(settings_copy(locale, "保存"))
-                        .accessibility_label(settings_copy(locale, "保存"))
-                        .accessibility_id("settings.space.prop.save")
+                    ui::icon_button(
+                        "prop-save",
+                        IconName::Check,
+                        settings_copy(locale, "保存"),
+                        false,
+                    )
+                    .accessibility_id("settings.space.prop.save")
                         .disabled(!prop_save_enabled(
                             self.extra_inputs[5].read(cx).value().as_str(),
                         ))
@@ -2995,12 +3037,13 @@ impl AgentSettingsPane {
                                 ))
                             })
                             .child(
-                                Button::new("marble-save")
-                                    .primary()
-                                    .icon(IconName::Check)
-                                    .tooltip(settings_copy(locale, "保存 Key"))
-                                    .accessibility_label(settings_copy(locale, "保存 Key"))
-                                    .accessibility_id("settings.space.marble.save")
+                                ui::icon_button(
+                                    "marble-save",
+                                    IconName::Check,
+                                    settings_copy(locale, "保存 Key"),
+                                    false,
+                                )
+                                .accessibility_id("settings.space.marble.save")
                                     .disabled(!marble_save_enabled(
                                         self.extra_inputs[2].read(cx).value().as_str(),
                                     ))
@@ -3597,13 +3640,14 @@ impl AgentSettingsPane {
                             ))),
                     )
                     .child(
-                        Button::new("save-dj")
-                            .flex_shrink_0()
-                            .primary()
-                            .icon(IconName::Check)
-                            .tooltip(settings_copy(locale, "保存"))
-                            .accessibility_label(settings_copy(locale, "保存"))
-                            .accessibility_id("settings.agent.persona.save")
+                        ui::icon_button(
+                            "save-dj",
+                            IconName::Check,
+                            settings_copy(locale, "保存"),
+                            false,
+                        )
+                        .flex_shrink_0()
+                        .accessibility_id("settings.agent.persona.save")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.commands.push(json!({"op":"agent.save","hostPrompt":this.personas[1].read(cx).value().to_string()}))
                             })),
@@ -3640,13 +3684,14 @@ impl AgentSettingsPane {
                             ))),
                     )
                     .child(
-                        Button::new("save-resident")
-                            .flex_shrink_0()
-                            .primary()
-                            .icon(IconName::Check)
-                            .tooltip(settings_copy(locale, "保存"))
-                            .accessibility_label(settings_copy(locale, "保存"))
-                            .accessibility_id("settings.agent.resident-persona.save")
+                        ui::icon_button(
+                            "save-resident",
+                            IconName::Check,
+                            settings_copy(locale, "保存"),
+                            false,
+                        )
+                        .flex_shrink_0()
+                        .accessibility_id("settings.agent.resident-persona.save")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.commands.push(json!({"op":"agent.save","residentPersona":this.personas[0].read(cx).value().to_string()}))
                             })),
@@ -3901,11 +3946,12 @@ impl AgentSettingsPane {
                 settings_copy(locale, "该服务尚未配置凭据，请填写后保存")
             }))
             .child(
-                Button::new("save-tts")
-                    .primary()
-                    .icon(IconName::Check)
-                    .tooltip(settings_copy(locale, "保存配置"))
-                    .accessibility_label(settings_copy(locale, "保存配置"))
+                ui::icon_button(
+                    "save-tts",
+                    IconName::Check,
+                    settings_copy(locale, "保存配置"),
+                    false,
+                )
                     .accessibility_id("settings.tts.save")
                     .disabled(!tts_save_enabled(valid_model))
                     .on_click(cx.listener(|this, _, _, cx| this.tts_action("tts.save", cx))),
@@ -3966,11 +4012,12 @@ impl AgentSettingsPane {
                 },
             )
             .child(
-                Button::new("save-asr")
-                    .primary()
-                    .icon(IconName::Check)
-                    .tooltip(settings_copy(locale, "保存配置"))
-                    .accessibility_label(settings_copy(locale, "保存配置"))
+                ui::icon_button(
+                    "save-asr",
+                    IconName::Check,
+                    settings_copy(locale, "保存配置"),
+                    false,
+                )
                     .accessibility_id("settings.asr.save")
                     .disabled(!asr_save_enabled(asr_valid))
                     .on_click(cx.listener(|this, _, _, cx| {

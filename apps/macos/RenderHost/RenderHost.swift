@@ -15,6 +15,11 @@ final class GPUIRenderHost {
     let controller: StageRenderSurfaceController
     let defaults: UserDefaults
     let dataRoot: URL
+    /// 与 `StageRenderSurfaceController` 里那份**同一个**设置客户端实例。
+    /// 会话桥（`gmgn_render_host_chat_configure`）必须复用它：`RustProductSettingsClient`
+    /// 自己缓存 `confirmed` 快照，走 `.shared` 就等于同一个权威上有两份 revision
+    /// 缓存，一份写成功后另一份的 `expectedRevision` 就过期了。
+    let settings: RustProductSettingsClient
     var chat: RenderHostResidentConversation?
 
     init(dataRoot: URL, defaults: UserDefaults) {
@@ -23,6 +28,7 @@ final class GPUIRenderHost {
         let settings = RustProductSettingsClient(
             root: WorldAuthorityEndpoint.taskServiceRoot(applicationSupportBase: dataRoot),
             allowsLaunching: false)
+        self.settings = settings
         let stage = SpatialStageStore(defaults: defaults, settings: settings)
         // A local selection prevents catalog prewarming/network downloads.
         stage.selectWorld(id: LivingPodScene.worldID)

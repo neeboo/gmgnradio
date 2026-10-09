@@ -302,6 +302,22 @@ pub mod props {
     pub const PANEL_WIDTH: f32 = super::stage::PROP_EDITOR_WIDTH;
     /// `.frame(maxHeight: 390)` on the panel body.
     pub const PANEL_MAX_HEIGHT: f32 = 390.;
+    /// The same body once 「还有 N 件」 is clicked: the pane may claim the whole
+    /// extent the shell measured for it, and the shell's own ceiling for a
+    /// non-chat pane is [`stage::PANEL_MAX_HEIGHT`]. Declared as that ceiling
+    /// instead of a new number, so the window (小窗 / 全屏) still decides how
+    /// tall the panel may become (`shell_ui.rs::panel_extent`).
+    pub const PANEL_MAX_HEIGHT_EXPANDED: f32 = super::stage::PANEL_MAX_HEIGHT;
+    /// The vertical band a bottom-right pane must stay out of: two
+    /// [`super::shell::TRANSPORT_INSET`]s, the bar itself and the composer gap —
+    /// the same subtraction `shell_ui.rs::panel_extent` makes before it caps the
+    /// pane's container. The pane keeps its own copy because it must never draw
+    /// taller than the box the shell clips it to: a panel that overflows the
+    /// extent loses exactly its **bottom**, which is where the 「还有 N 件」
+    /// footer lives (measured at 720×482: pane 390 pt inside a 374 pt box).
+    pub const PANEL_VIEWPORT_BOTTOM_BAND: f32 = super::shell::TRANSPORT_INSET * 2.
+        + super::shell::TRANSPORT_HEIGHT
+        + super::shell::COMPOSER_GAP;
     /// `.padding(16)` on the content.
     pub const PANEL_PADDING: f32 = 16.;
     /// `RoundedRectangle(cornerRadius: 16)`.
@@ -520,12 +536,11 @@ pub mod inbox {
     /// The list column's preferred width in the pane's own 720×460 window.
     pub const LIST_WIDTH: f32 = 300.;
     /// Its floor when the pane is mounted in a narrower surface than that
-    /// window — the 590 pt media panel. The detail column keeps its
-    /// [`DETAIL_MIN_WIDTH`] floor, so the two floors have to sum to at most
-    /// the media panel's inner width
-    /// (`stage::PANEL_MAX_WIDTH` − 2 × [`PANEL_INSET`] − [`DETAIL_TRAILING`]
-    /// = 562 pt): 240 + 320 = 560 ≤ 562. The standalone window still shows the
-    /// full [`LIST_WIDTH`], because 720 pt has room for both.
+    /// window — the media panel. The detail column keeps its
+    /// [`DETAIL_MIN_WIDTH`] floor, so the list is the column that gives way
+    /// (see [`PANE_MIN_WIDTH`] for the width the host has to hand the pane).
+    /// The standalone 720×460 window still shows the full [`LIST_WIDTH`],
+    /// because 720 pt has room for both.
     pub const LIST_MIN_WIDTH: f32 = 240.;
 
     /// The split's insets inside the content view (`:170-173`).
@@ -566,6 +581,17 @@ pub mod inbox {
     pub const DETAIL_MIN_WIDTH: f32 = 320.;
     pub const DETAIL_MIN_HEIGHT: f32 = 220.;
     pub const PLACEHOLDER_SIZE: f32 = 11.;
+
+    /// The pane's own horizontal demand: both column floors plus the split's
+    /// insets (240 + 320 + 2 × 10 = 580 pt). The pane's own 720 pt window has
+    /// room to spare; **a host that mounts the pane has to hand it at least
+    /// this much**, because the detail keeps its floor and the list will not go
+    /// below its own. The media panel's floor is this plus the media surface's
+    /// padding and its 1 pt border on both sides
+    /// (`media_ui::PANEL_CONTENT_FLOOR` = 614), and that is the width the
+    /// shell's panel extent really asks for — before it, the panel handed the
+    /// pane 558 pt and the pane could not fit.
+    pub const PANE_MIN_WIDTH: f32 = LIST_MIN_WIDTH + DETAIL_MIN_WIDTH + 2. * PANEL_INSET;
 
     /// The window forces `NSAppearance(named: .darkAqua)` (`:112`), so these
     /// stay fixed: the `systemBlue` badge (`:222`), a white title (`:226`),
@@ -884,12 +910,23 @@ mod tests {
         assert_eq!([stage::PROGRAM_CARD_WIDTH, stage::PROGRAM_CARD_HEIGHT], [294., 76.]);
         assert_eq!([stage::PROGRAM_EMPTY_WIDTH, stage::PROGRAM_EMPTY_HEIGHT], [142., 64.]);
         assert_eq!([inbox::WINDOW_WIDTH, inbox::WINDOW_HEIGHT, inbox::LIST_WIDTH], [720., 460., 300.]);
-        // InboxPane is also mounted in the 590 pt media panel; its two column
-        // floors must fit that panel's inner width.
+        // The pane's own floor is a derivation, and it is the number a host has
+        // to hand the pane: both column floors plus the split's insets.
         assert_eq!(inbox::LIST_MIN_WIDTH, 240.);
+        assert_eq!(inbox::DETAIL_MIN_WIDTH, 320.);
+        assert_eq!(inbox::PANE_MIN_WIDTH, 580.);
+        assert_eq!(
+            inbox::PANE_MIN_WIDTH,
+            inbox::LIST_MIN_WIDTH + inbox::DETAIL_MIN_WIDTH + 2. * inbox::PANEL_INSET
+        );
+        // The media panel is the narrow host of this pane, and its own floor is
+        // the pane's demand plus the media surface's padding and border:
+        // 580 + 2 × 16 + 2 × 1 = 614 pt, which is *wider* than the original
+        // stage panel's 590 pt ceiling. The two column floors must never be
+        // asked to fit less.
         assert!(
-            inbox::LIST_MIN_WIDTH + inbox::DETAIL_MIN_WIDTH
-                <= stage::PANEL_MAX_WIDTH - 2. * inbox::PANEL_INSET - inbox::DETAIL_TRAILING
+            inbox::PANE_MIN_WIDTH > stage::PANEL_MAX_WIDTH - 2. * inbox::PANEL_INSET,
+            "the pane needs more than the original panel's outer width can give it"
         );
         assert_eq!([settings::WINDOW_WIDTH, settings::WINDOW_HEIGHT], [580., 500.]);
         assert_eq!([settings::MIN_WIDTH, settings::MIN_HEIGHT], [540., 440.]);
@@ -928,6 +965,10 @@ mod tests {
         // stage_panels::metrics::props → props (PANEL_WIDTH aliases stage)
         assert_eq!(props::PANEL_WIDTH, stage::PROP_EDITOR_WIDTH);
         assert_eq!([props::PANEL_MAX_HEIGHT, props::PANEL_PADDING, props::PANEL_RADIUS], [390., 16., 16.]);
+        // 「还有 N 件」 expands to the shell's own ceiling for this pane — the
+        // 390 pt body is the *collapsed* frame, never the ceiling.
+        assert_eq!(props::PANEL_MAX_HEIGHT_EXPANDED, stage::PANEL_MAX_HEIGHT);
+        assert!(props::PANEL_MAX_HEIGHT_EXPANDED > props::PANEL_MAX_HEIGHT);
         assert_eq!([props::ROW_GAP, props::ROW_PADDING, props::ROW_RADIUS], [3., 9., 8.]);
         assert_eq!(props::SIZE_DELTAS, [-0.10, -0.01, 0.01, 0.10]);
         assert_eq!([props::TINT_AWAITING_CLAIM, props::TINT_IN_INVENTORY, props::TINT_FAILED], [0x22d3ee, 0xff9500e6, 0xff5a52e6]);

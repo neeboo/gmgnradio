@@ -16,3 +16,11 @@ futures = "0.3"
 raw-window-handle = "0.6"
 gmgn-gpui-ui = { path = "../../../apps/gpui-ui" }
 serde_json = "=1.0.151"
+
+# The panel-geometry tests lay the real shell out in a real (headless) GPUI
+# window and read the prepared boxes back (`TestAppContext` / `try_find`), which
+# is what `test-support` carries. It is a **dev**-dependency: the shipped
+# `cdylib` keeps its own feature set (resolver 3), so nothing the host mounts
+# changes.
+[dev-dependencies]
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f46266991a230ae94f749af496af2a", features = ["gpui-fast", "test-support"] }

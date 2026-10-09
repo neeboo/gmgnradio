@@ -2270,11 +2270,48 @@ impl<P: Send + 'static, R: Send + 'static> LatestWorker<P, R> {
                     if generation == queue.generation {
                         queue.completed = Some((generation, result));
                     }
+                    // 发布完成 = 到达边界：唤醒等着这件事的人（测试等的是这个事件，
+                    // 不是墙钟）。`process` 是冷帧（`Scene::new().finish_gpu()` +
+                    // 逐 glyph 栅格化），耗时随机器负载浮动，所以不能拿固定时限去赌。
+                    state.1.notify_all();
                 }
-                state.0.lock().unwrap().stopped = true;
+                let mut queue = state.0.lock().unwrap();
+                queue.stopped = true;
+                state.1.notify_all();
             })
             .expect("stage lyric worker creation failed");
         Self { shared }
+    }
+    /// 阻塞等待 `ready` 成立（worker 每次发布结果、以及进入 `stopped` 时都会
+    /// `notify_all`）。正常路径由**事件**唤醒，与机器负载无关；`guard` 只是挂死
+    /// 保护，不是被测作业的时限。
+    ///
+    /// 旧写法（`wait_until` 里 3s 墙钟 + `yield_now` 自旋）有两个问题：
+    /// ① 冷帧实测 461–1608 ms，满载时翻几倍就越过 3s；② 自旋本身在跟 worker 抢
+    /// CPU，越是满载越慢。改成 condvar 阻塞后这两点同时消失。
+    #[cfg(test)]
+    fn wait_ready(
+        &self,
+        guard: std::time::Duration,
+        mut ready: impl FnMut(&LatestQueue<P, R>) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + guard;
+        let (lock, wake) = &*self.shared;
+        let mut queue = lock.lock().unwrap();
+        loop {
+            if ready(&queue) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timeout) = wake.wait_timeout(queue, remaining).unwrap();
+            queue = next;
+            if timeout.timed_out() && !ready(&queue) {
+                return false;
+            }
+        }
     }
     fn submit(&self, generation: u64, input: P) {
         let mut queue = self.shared.0.lock().unwrap();
@@ -3476,6 +3513,19 @@ mod tests {
         );
         cx.update_window(handle.into(), |_, window, cx| {
             pane.update(cx, |pane, _| {
+                // 夹具要**替换** worker 的结果，所以先等真帧落地：发布发生在与
+                // `inflight = false` 同一把锁里，所以「当前 generation 已有结果」
+                // 一旦成立，worker 就没有任何东西还能覆盖下面这次注入了。少了这
+                // 一步就是一次竞态——满载时真帧会在注入之后才发布，把注入顶掉，
+                // 于是 draw 取到的是真帧（空 batches），`render_error()` 变 None。
+                wait_until(pane.worker.as_ref().unwrap(), |queue| {
+                    queue.pending.is_none()
+                        && !queue.inflight
+                        && queue
+                            .completed
+                            .as_ref()
+                            .is_some_and(|(epoch, _)| *epoch == queue.generation)
+                });
                 let mut queue = pane.worker.as_ref().unwrap().shared.0.lock().unwrap();
                 // This fixture injects a worker result without its normal wakeup.
                 // The manual frame below refreshes Fast's cached entity tree.
@@ -3656,7 +3706,7 @@ mod tests {
                     gpu: true,
                 },
             );
-            wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
+            wait_until(&worker, |queue| queue.completed.is_some());
             let super::LyricOutput::Gpu(frame) = worker
                 .take(generation)
                 .unwrap()
@@ -3684,7 +3734,7 @@ mod tests {
             }
         }
         worker.close();
-        wait_until(|| worker.stopped());
+        wait_until(&worker, |queue| queue.stopped);
     }
 
     #[cfg(target_os = "macos")]
@@ -3708,7 +3758,7 @@ mod tests {
                 gpu: false,
             },
         );
-        wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
+        wait_until(&worker, |queue| queue.completed.is_some());
         let output = worker
             .take(1)
             .expect("completed frame")
@@ -3718,18 +3768,26 @@ mod tests {
         };
         assert_eq!(image.frame_count(), 1);
         worker.close();
-        wait_until(|| worker.stopped());
+        wait_until(&worker, |queue| queue.stopped);
     }
 
-    fn wait_until(mut ready: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !ready() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "worker did not reach boundary"
-            );
-            std::thread::yield_now();
-        }
+    /// 等到 worker 到达边界（发布完成结果，或停止）。
+    ///
+    /// 等的是 [`super::LatestWorker::wait_ready`] 里的 **condvar 事件**：worker 每次
+    /// 发布结果 / 进入 `stopped` 都会 `notify_all`。120s 只是挂死保护——它不是被测
+    /// 作业的时限，正常路径根本不会用到它。旧写法是 3s 墙钟 + `yield_now` 自旋，
+    /// 而单个冷帧实测 461–1608 ms，满载时越界，且自旋还在跟 worker 抢 CPU。
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
+    fn wait_until<P: Send + 'static, R: Send + 'static>(
+        worker: &super::LatestWorker<P, R>,
+        mut ready: impl FnMut(&super::LatestQueue<P, R>) -> bool,
+    ) {
+        assert!(
+            worker.wait_ready(HANG_GUARD, &mut ready),
+            "worker did not reach boundary within the {:?} hang guard",
+            HANG_GUARD
+        );
     }
 
     #[test]
@@ -3767,7 +3825,7 @@ mod tests {
             "newer input must not starve completed same-scope frames"
         );
         release.send(()).unwrap();
-        wait_until(|| worker.shared.0.lock().unwrap().completed.is_some());
+        wait_until(&worker, |queue| queue.completed.is_some());
         assert_eq!(worker.take(1), Some(9999));
     }
 
@@ -3800,7 +3858,7 @@ mod tests {
         worker.close();
         assert!(worker.shared.0.lock().unwrap().pending.is_none());
         release.send(()).unwrap();
-        wait_until(|| worker.stopped());
+        wait_until(&worker, |queue| queue.stopped);
         assert_eq!(worker.take(2), None);
         assert!(
             entered.try_recv().is_err(),

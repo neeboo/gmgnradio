@@ -20,10 +20,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use gmgn_gpui_ui::primitives as ui;
 use gmgn_gpui_ui::shell::{self, TransportControl};
 use gmgn_gpui_ui::ui_tokens::shell as m;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::slider::{Slider, SliderState};
+use gpui_kit::component::slider::SliderState;
 use gpui_kit::prelude::*;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::*;
@@ -41,6 +42,12 @@ struct Facts {
 /// The product's control table, in the product's order (`shell_ui.rs`), so the
 /// 音量 slot is where it really is — a one-control bar would place the popover
 /// at the bar's left edge and measure the wrong rectangle.
+///
+/// The open panel is the **production** content: [`ui::volume_slider`]'s
+/// vertical track above [`ui::volume_mute_button`]'s icon, built exactly as
+/// `shell_ui.rs` builds it. The track's axis is what this harness measures in
+/// pixels below, so substituting a horizontal `Slider` here is what turns the
+/// vertical assertions red.
 fn controls(volume: Entity<SliderState>, open: bool) -> Vec<TransportControl> {
     let mut rows: Vec<TransportControl> = vec![
         TransportControl::new("program", "program", IconName::FileText, "音乐与节目"),
@@ -55,7 +62,18 @@ fn controls(volume: Entity<SliderState>, open: bool) -> Vec<TransportControl> {
     let mut volume_control = TransportControl::new("volume", "volume", IconName::Volume2, "音量");
     if open {
         volume_control = volume_control.popover(move |_, _| {
-            shell::transport_popover(Slider::new(&volume)).into_any_element()
+            // The panel's **content** only: `shell::transport_popover` is the one
+            // surface the bar itself draws it in (`transport_bar_slots`), so
+            // wrapping it here as well nests a second, empty card under the
+            // panel — the stray strip that used to sit right above the bar.
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(6.))
+                .child(ui::volume_slider(&volume, true))
+                .child(ui::volume_mute_button(false, true))
+                .into_any_element()
         });
     }
     rows.push(volume_control);
@@ -112,9 +130,12 @@ struct Frame {
     viewport: Size<Pixels>,
 }
 
-fn frame(cx: &mut HeadlessAppContext, volume: Entity<SliderState>, open: bool) -> Frame {
+fn frame(cx: &mut HeadlessAppContext, volume: Entity<SliderState>, open: bool, level: f32) -> Frame {
     let facts = Rc::new(RefCell::new(Facts::default()));
     let state = facts.clone();
+    // The handle the level is set through after the window exists; the harness
+    // owns its own clone.
+    let level_entity = volume.clone();
     let (width, height) = WINDOW;
     let handle = cx
         .update(|cx| {
@@ -141,6 +162,9 @@ fn frame(cx: &mut HeadlessAppContext, volume: Entity<SliderState>, open: bool) -
         .expect("headless window")
         .0;
     cx.update_window(handle, |_, window, cx| {
+        // The track's level before the frame is painted, so two frames of the
+        // same open panel differ in exactly the slider's own pixels.
+        level_entity.update(cx, |slider, cx| slider.set_value(level, window, cx));
         window.render_frame(cx);
     })
     .unwrap();
@@ -182,14 +206,16 @@ fn diff(before: &image::RgbaImage, after: &image::RgbaImage) -> Option<(u32, u32
 fn main() {
     let mut cx = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
-        Arc::new(gpui_kit::assets::Assets),
+        // The product registers the whole catalog (`AllAssets`), which is what
+        // makes 静音's `volume-x` glyph paint rather than an empty square.
+        Arc::new(gpui_kit::assets::AllAssets),
         gpui_kit::platform::current_headless_renderer,
     );
     cx.update(gpui_kit::init);
     let volume = cx.update(|cx| cx.new(|_| SliderState::new().min(0.).max(1.).step(0.01)));
 
-    let closed = frame(&mut cx, volume.clone(), false);
-    let open = frame(&mut cx, volume.clone(), true);
+    let closed = frame(&mut cx, volume.clone(), false, 0.5);
+    let open = frame(&mut cx, volume.clone(), true, 0.5);
     let scale = closed.shot.width() as f32 / f32::from(closed.viewport.width);
     let to_device = |value: Pixels| (f32::from(value) * scale).round() as i32;
     eprintln!(
@@ -272,14 +298,47 @@ fn main() {
                     closed.shot.height()
                 ));
             }
-            // The panel itself: a 132 pt wide card with a slider in it, not a
-            // stray anti-aliased pixel. The bar's own icon highlight is below
-            // `bar_top` and is already excluded by the bound above.
+            // The panel's bottom edge sits **exactly** one
+            // `TRANSPORT_POPOVER_GAP` above the bar's top edge. Its containing
+            // block is the bar's own box (the slot spans `TRANSPORT_HEIGHT`), so
+            // `bottom = TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP` really is
+            // measured from the bar's bottom. A slot that stops at the 44 pt
+            // control face sits 2 pt inside the bar and lifts the whole panel
+            // with it (a 10 pt gap instead of 8), which is what this pins.
+            let expected_bottom = bar_top - (shell::TRANSPORT_POPOVER_GAP * scale).round() as i32;
+            let painted_bottom = max_y as i32 + 1;
+            if painted_bottom != expected_bottom {
+                failures.push(format!(
+                    "the panel's bottom edge must sit exactly {} pt above the bar's top \
+                     ({expected_bottom}); the painted bottom edge is {painted_bottom} \
+                     (bbox bottom {max_y}, bar top {bar_top})",
+                    shell::TRANSPORT_POPOVER_GAP
+                ));
+            }
+            // The panel is the **vertical card**: as wide as its content column
+            // plus padding (the derived token, read back off the painted
+            // pixels) and taller than it is wide. The rejected horizontal
+            // popover was a 132 pt strip — wider than tall.
             let (width, height) = (max_x - min_x + 1, max_y - min_y + 1);
-            if count <= 500 || width < (100. * scale) as u32 || height < (20. * scale) as u32 {
+            let painted_width = width as f32 / scale;
+            let painted_height = height as f32 / scale;
+            if count <= 500 || width < (40. * scale) as u32 || height < (150. * scale) as u32 {
                 failures.push(format!(
                     "the popover must paint a real panel above the bar, painted \
                      {count} px in {width}x{height} (bbox=({min_x},{min_y})-({max_x},{max_y}))"
+                ));
+            }
+            if (painted_width - shell::TRANSPORT_POPOVER_WIDTH).abs() > 1.5 {
+                failures.push(format!(
+                    "the panel's painted width is {painted_width} pt, not the vertical \
+                     card's {} pt (the horizontal strip the person rejected was 132 pt)",
+                    shell::TRANSPORT_POPOVER_WIDTH
+                ));
+            }
+            if painted_height <= painted_width {
+                failures.push(format!(
+                    "音量's panel must be taller than it is wide — a column around a \
+                     vertical track — but it painted {painted_width}x{painted_height} pt"
                 ));
             }
             let clearance =
@@ -299,6 +358,47 @@ fn main() {
                     closed.shot.width(),
                     closed.shot.height()
                 );
+            }
+        }
+    }
+
+    // 3. The track's own direction, in pixels. Between a 20% and an 80% level the
+    //    **filled** part of a vertical track grows upward, so the changed
+    //    rectangle is taller than it is wide; a horizontal slider inside the same
+    //    box would repaint a wide, short strip instead. This is why the axis is
+    //    asserted here rather than only in `primitives.rs`: it is the painted
+    //    result, not the builder flag, that the person sees.
+    let low = frame(&mut cx, volume.clone(), true, 0.2);
+    let high = frame(&mut cx, volume.clone(), true, 0.8);
+    match diff(&low.shot, &high.shot) {
+        None => failures.push(
+            "dragging 音量 from 20% to 80% painted nothing: the panel is not showing \
+             the slider it owns"
+                .to_string(),
+        ),
+        Some((min_x, min_y, max_x, max_y, count)) => {
+            let (width, height) = (max_x - min_x + 1, max_y - min_y + 1);
+            eprintln!(
+                "[probe] volume level 20%→80% changed bbox=({min_x},{min_y})-({max_x},{max_y}) \
+                 {width}x{height} count={count}"
+            );
+            if count < 100 {
+                failures.push(format!(
+                    "a level change must repaint a real track, not {count} px"
+                ));
+            }
+            if height <= width {
+                failures.push(format!(
+                    "音量's track is vertical: 20%→80% must paint a taller-than-wide strip, \
+                     but it changed {width}x{height} px (a horizontal bar changes a wide, \
+                     short one)"
+                ));
+            }
+            if (max_y as i32) >= bar_top {
+                failures.push(format!(
+                    "the track's fill must stay inside the panel above the bar: changed \
+                     pixels reach y={max_y}, bar top {bar_top}"
+                ));
             }
         }
     }

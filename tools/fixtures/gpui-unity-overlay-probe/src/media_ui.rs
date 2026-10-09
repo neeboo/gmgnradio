@@ -56,6 +56,38 @@ const ROUTE_PROGRAMS: &str = "programs";
 const ROUTE_TRACKS: &str = "tracks";
 const ROUTE_PLAYLIST_TRACKS: &str = "playlistTracks";
 
+/// The id of the box the media panel hands the shared `InboxPane` (the 消息
+/// section arm below). The geometry test reads this box's **real prepared
+/// bounds**, so the width the panel gives the pane is never a copy of the width
+/// in the test. (`the_inbox_body_is_clipped_inside_the_panel_box` scans the
+/// source around the section arm; this comment must not repeat that marker.)
+pub(crate) const INBOX_HOST_ID: &str = "media.inbox.host";
+
+/// [`media_surface`]'s padding on every side — the document scale's `.p_4()`.
+/// Named because the panel's own content floor is a sum that includes it.
+pub(crate) const SURFACE_PADDING: f32 = 16.;
+
+/// [`media_surface`]'s own border (`ui::scene_card()`'s `.border_1()`), one on
+/// each side. The pane is laid out inside it, so the panel's content floor has
+/// to carry it too: without it the pane is handed 578 pt of the 580 it needs
+/// and the row overflows by exactly the border.
+pub(crate) const SURFACE_BORDER: f32 = 1.;
+
+/// The narrowest media panel box that can still show 「消息」 whole.
+///
+/// The pane is a complete surface of its own (see [`INBOX_HOST_ID`]): inside it
+/// the list keeps `inbox::LIST_MIN_WIDTH` and the detail keeps
+/// `inbox::DETAIL_MIN_WIDTH`, and the split adds `inbox::PANEL_INSET` on both
+/// sides — `inbox::PANE_MIN_WIDTH` (580 pt). The media panel hosts the pane
+/// inside [`media_surface`]'s own padding, so the panel needs
+/// `PANEL_CONTENT_FLOOR = 580 + 2 × 16 + 2 × 1 = 614` pt (the card carries a 1 pt
+/// border on each side). That is **wider** than the
+/// stage panel's 590 pt ceiling: hosting a pane whose own floor is 580 pt means
+/// the panel has to be able to be that wide, or one of the two columns is cut
+/// off (「消息面板没显示完整，左边缺一块」).
+pub(crate) const PANEL_CONTENT_FLOOR: f32 =
+    ui_tokens::inbox::PANE_MIN_WIDTH + 2. * SURFACE_PADDING + 2. * SURFACE_BORDER;
+
 fn media_surface() -> Div {
     ui::scene_card()
         .size_full()
@@ -65,7 +97,7 @@ fn media_surface() -> Div {
         .flex()
         .flex_col()
         .gap_3()
-        .p_4()
+        .p(px(SURFACE_PADDING))
         .font_family(ui_tokens::FONT_FAMILY)
         .text_size(px(ui_tokens::BODY))
         .text_color(rgba(scene::TEXT))
@@ -737,12 +769,27 @@ impl Render for MediaPane {
             1 => (self.queue(cx), true),
             3 => (self.screen(cx), true),
             4 => (
+                // `InboxPane` itself is the shared surface and is mounted whole,
+                // so its own box is the only place its content can be stopped:
+                // the media panel is 590×`panel_extent` and the extent it hands
+                // this body is shorter than the detail column's floor (see
+                // `the_media_body_is_shorter_than_the_inbox_detail_floor`), so
+                // without this clip the column paints over the panel's pinned
+                // notice row below it. Clipping here leaves the list's own
+                // scrolling and the detail's hit-testing untouched.
+                //
+                // The id is what the geometry test reads: this box is the width
+                // the panel really hands the pane, and the one the two columns
+                // have to fit inside.
                 div()
+                    .id(INBOX_HOST_ID)
                     .w_full()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
+                    .overflow_hidden()
                     .child(self.inbox_pane.clone())
+                    .test_support()
                     .into_any_element(),
                 false,
             ),
@@ -1008,5 +1055,236 @@ mod tests {
         // The panel header is exactly the readout plus its refresh action.
         assert!(production.contains("ui::card_title(section_title(self.section))"));
         assert!(production.contains("\"media-refresh\""));
+    }
+
+    /// The shared `InboxPane` is mounted whole, so its host box is the only
+    /// place its content can be stopped. The panel gives that box less height
+    /// than the pane's detail column needs (next test), so the host must clip;
+    /// without `.overflow_hidden()` the column paints out of the pane, over the
+    /// panel's pinned notice row below it. The scan drops the test module, so
+    /// only the production arm can satisfy it.
+    #[test]
+    fn the_inbox_body_is_clipped_inside_the_panel_box() {
+        let source = include_str!("media_ui.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes the test module");
+        let body = production
+            .split("4 => (")
+            .nth(1)
+            .expect("the inbox section still has its own arm")
+            .split(", false,")
+            .next()
+            .expect("the arm still carries its non-scrolling flag");
+        assert!(
+            body.contains(concat!(".overflow", "_hidden()")),
+            "the inbox body must clip content to its own box, otherwise the pane \
+             paints over the panel's notice row"
+        );
+        assert!(
+            body.contains("self.inbox_pane.clone()"),
+            "the clip must sit on the element that hosts the shared inbox pane"
+        );
+    }
+
+    /// The clip above is load-bearing, and this is the arithmetic that says so:
+    /// on the product's 720×482 window the media panel is `panel_extent` tall,
+    /// and after the surface's padding, header and pinned notice row this body
+    /// is shorter than the inbox detail column's own floor — so before the clip
+    /// the column painted below itself and over that notice row. Every term is a
+    /// shared token or a documented literal from `media_surface()`, so moving
+    /// either side of the comparison moves the assertion.
+    #[test]
+    fn the_media_body_is_shorter_than_the_inbox_detail_floor() {
+        use ui_tokens::{inbox, shell as bar, stage};
+        // `panel_extent` at 720×482, then the media panel's own ceiling.
+        let panel_height = (482.
+            - bar::TRANSPORT_INSET * 2.
+            - bar::TRANSPORT_HEIGHT
+            - bar::COMPOSER_GAP)
+            .min(stage::PANEL_MAX_HEIGHT);
+        assert_eq!(panel_height, 374.);
+        // `media_surface()`: `.p_4()` (16) all round, `.gap_3()` (12) between
+        // the header, the body and the notice row. The header is the refresh
+        // control; the notice row is one `CAPTION` line.
+        let body_height = panel_height
+            - 2. * 16.
+            - scene::CONTROL_HEIGHT
+            - 2. * 12.
+            - ui_tokens::CAPTION * 1.25;
+        // The detail column's floor with the empty state the inbox opens in:
+        // the pane's own inset, the empty block's padding and icon, the
+        // placeholder line, and the read-only detail's `DETAIL_MIN_HEIGHT`.
+        // (The empty block's title only makes this floor larger.)
+        let detail_floor = inbox::PANEL_INSET * 2.
+            + 2. * inbox::STACK_GAP
+            + 16.
+            + inbox::STACK_GAP
+            + inbox::PLACEHOLDER_SIZE * 1.25
+            + inbox::STACK_GAP
+            + inbox::DETAIL_MIN_HEIGHT;
+        assert!(
+            body_height < detail_floor,
+            "the media body ({body_height} pt) must stay shorter than the inbox detail floor \
+             ({detail_floor} pt); if that ever stops being true, the clip in the section arm is \
+             no longer the thing keeping the content inside the panel"
+        );
+    }
+
+    /// The whole chain in a real GPUI window: the shell's panel at the report's
+    /// 720×482 window, 「消息」 selected, and the **real prepared bounds** of the
+    /// box the panel hands the pane ([`INBOX_HOST_ID`]) together with both
+    /// `InboxPane` columns inside it.
+    ///
+    /// The defect this pins (2026-10-09, 「消息面板没显示完整，左边缺一块」):
+    /// `panel_extent` gave the media panel
+    /// `min(viewport − 2 × TRANSPORT_INSET, stage::PANEL_MAX_WIDTH)` = 590 pt,
+    /// `media_surface`'s own 16 pt padding took that to 558 pt for the pane, and
+    /// the pane's two column floors need `inbox::PANE_MIN_WIDTH` (580 pt). The
+    /// panel could not show both columns at once, and because its content is
+    /// pinned to the bottom-right corner (`panel_container`'s `items_end`) the
+    /// missing strip came off the **left** of the message surface.
+    ///
+    /// Nothing here reads a constant as the measured width: `host`, `list` and
+    /// `detail` are the boxes GPUI really laid out in the window this test
+    /// opened.
+    #[test]
+    fn the_media_panel_hands_the_inbox_a_box_that_holds_both_columns() {
+        use gmgn_gpui_ui::ui_tokens::inbox;
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext};
+        let commands: UiCommandQueue = std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::VecDeque::new(),
+        ));
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(720.), px(482.)), move |window, cx| {
+            let media = cx.new(|cx| MediaPane::new(window, cx, commands.clone()));
+            media.update(cx, |pane, cx| {
+                pane.update_snapshot(
+                    &json!({"world":{"worldID":"world-a"},
+                        "inbox":{"status":"completed","pending":false,"entries":[
+                            {"taskKey":"t1","lastEventID":"e1","title":"生成完成","status":"3/3",
+                             "detail":"已完成 3/3","isRead":false,"updatedAt":1_700_000_000}]}}),
+                    window,
+                    cx,
+                );
+                pane.select_section("inbox", cx);
+            });
+            let panes = vec![("音乐与空间".to_string(), media.into())];
+            let shell = cx.new(|cx| crate::shell_ui::ShellPane::new(window, cx, commands.clone(), panes));
+            shell.update(cx, |shell, cx| shell.open_panel("音乐与空间", window, cx));
+            gpui_kit::base::Root::new(shell, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let host = window.find(INBOX_HOST_ID).bounds();
+            let list = window.find("resident.system-inbox.list").bounds();
+            let detail = window.find("resident.system-inbox.detail").bounds();
+            eprintln!(
+                "[inbox-fit] viewport=720x482 host={:?} list={:?} detail={:?}",
+                (
+                    f32::from(host.origin.x),
+                    f32::from(host.origin.y),
+                    f32::from(host.size.width),
+                    f32::from(host.size.height)
+                ),
+                (
+                    f32::from(list.origin.x),
+                    f32::from(list.origin.y),
+                    f32::from(list.size.width),
+                    f32::from(list.size.height)
+                ),
+                (
+                    f32::from(detail.origin.x),
+                    f32::from(detail.origin.y),
+                    f32::from(detail.size.width),
+                    f32::from(detail.size.height)
+                ),
+            );
+            // 1. The panel really gave the pane the box it derived: the width
+            //    `panel_box` decided, minus the media surface's own padding, at
+            //    the panel's own left edge. This is the assertion the old width
+            //    policy fails — the panel was 590 pt, so the box the pane could
+            //    have had is 558 pt, and it measured 640 (its own content width)
+            //    instead, hanging 83 pt off the panel's left.
+            let (panel_width, _) = crate::shell_ui::panel_box(
+                size(px(720.), px(482.)),
+                false,
+                "音乐与空间",
+            );
+            let panel_right = 720. - gmgn_gpui_ui::ui_tokens::shell::TRANSPORT_INSET;
+            let inner_width = panel_width - 2. * SURFACE_PADDING - 2. * SURFACE_BORDER;
+            assert_eq!(
+                f32::from(host.size.width),
+                inner_width,
+                "the message body must be the panel's inner width ({inner_width} pt), not its \
+                 own content width: host={:?}",
+                f32::from(host.size.width)
+            );
+            assert_eq!(
+                f32::from(host.origin.x),
+                panel_right - panel_width + SURFACE_PADDING + SURFACE_BORDER,
+                "the message body must start at the panel's left padding, not left of the \
+                 panel: host={:?}",
+                f32::from(host.origin.x)
+            );
+            // …which is at least the pane's own floor: both column floors plus
+            // the split's insets.
+            assert!(
+                host.size.width >= px(inbox::PANE_MIN_WIDTH),
+                "the panel hands the inbox {} pt, but the pane's own floor is {} pt \
+                 (list floor {} + detail floor {} + split insets {})",
+                f32::from(host.size.width),
+                inbox::PANE_MIN_WIDTH,
+                inbox::LIST_MIN_WIDTH,
+                inbox::DETAIL_MIN_WIDTH,
+                2. * inbox::PANEL_INSET,
+            );
+            // 2. The two columns really fit that box: the list gives way down to
+            //    its floor, the detail keeps its own, and neither is painted
+            //    outside the host box (which is what clips them).
+            assert!(
+                list.origin.x >= host.origin.x,
+                "the list starts inside the host box: host={host:?} list={list:?}"
+            );
+            assert!(
+                list.size.width >= px(inbox::LIST_MIN_WIDTH),
+                "the list keeps its floor: list={:?}",
+                f32::from(list.size.width)
+            );
+            assert!(
+                detail.size.width >= px(inbox::DETAIL_MIN_WIDTH),
+                "the detail keeps its floor: detail={:?}",
+                f32::from(detail.size.width)
+            );
+            assert!(
+                detail.origin.x >= list.origin.x + list.size.width,
+                "the two columns do not overlap: list={list:?} detail={detail:?}"
+            );
+            assert!(
+                detail.origin.x + detail.size.width <= host.origin.x + host.size.width,
+                "the detail column is painted inside the panel's host box: \
+                 detail ends at {} but the host box ends at {}",
+                f32::from(detail.origin.x + detail.size.width),
+                f32::from(host.origin.x + host.size.width),
+            );
+            // 3. The box is inside the panel *and* the panel is inside the
+            //    window. The panel is pinned to the bottom-right corner, so an
+            //    over-wide pane used to take its right edge from that corner and
+            //    push the box off the panel's left — the strip the report saw
+            //    missing.
+            assert!(
+                f32::from(host.origin.x) >= panel_right - panel_width,
+                "the message surface must not start left of the panel's own left edge: host={:?}",
+                f32::from(host.origin.x)
+            );
+            assert!(
+                host.origin.x + host.size.width <= px(panel_right),
+                "the message surface must stay inside the window's right inset: host={host:?}"
+            );
+        })
+        .unwrap();
     }
 }

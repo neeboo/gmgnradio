@@ -650,17 +650,19 @@ done
         let service = ChatService::new(db.clone());
         let mut p = json!({"backend":"dsh","scopeID":"ordinary-photo","hostSessionID":"host","requestID":"one","input":"look","executable":mock,"dshEntryPoint":entry,"images":[image],"environment":{}});
         async fn finish(service: &ChatService, p: &Value) -> Value {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let v = service.request("agent_chat_read", p).await.unwrap();
-                    if v["state"] != "running" {
-                        return v;
-                    }
-                    tokio::task::yield_now().await;
+            // 等进展，不等墙钟（原来是 5s 固定上限，并行跑满时会先于被测作业超时）。
+            let mut watch =
+                crate::test_wait::StallWatch::new("agent_chat 会话", Duration::from_secs(60));
+            loop {
+                let v = service.request("agent_chat_read", p).await.unwrap();
+                if v["state"] != "running" {
+                    return v;
                 }
-            })
-            .await
-            .unwrap()
+                if !watch.observe(&v) {
+                    panic!("{}", watch.stalled());
+                }
+                tokio::task::yield_now().await;
+            }
         }
         service.request("agent_chat_start", &p).await.unwrap();
         assert_eq!(finish(&service, &p).await["state"], "completed");
@@ -757,17 +759,19 @@ done
         let service = ChatService::new(db.clone());
         let mut p = json!({"backend":"codex","scopeID":"ordinary","hostSessionID":"host","requestID":"first","input":"hi","executable":mock,"environment":{"PATH":"/usr/bin:/bin"}});
         service.request("agent_chat_start", &p).await.unwrap();
-        let finish = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let state = service.request("agent_chat_read", &p).await.unwrap();
-                if state["state"] != "running" {
-                    break state;
-                }
-                tokio::task::yield_now().await;
+        // 等进展，不等墙钟（原来是 5s 固定上限，并行跑满时会先于被测作业超时）。
+        let mut watch =
+            crate::test_wait::StallWatch::new("agent_chat 会话", Duration::from_secs(60));
+        let finish = loop {
+            let state = service.request("agent_chat_read", &p).await.unwrap();
+            if state["state"] != "running" {
+                break state;
             }
-        })
-        .await
-        .unwrap();
+            if !watch.observe(&state) {
+                panic!("{}", watch.stalled());
+            }
+            tokio::task::yield_now().await;
+        };
         assert_eq!(finish["state"], "completed");
         assert_eq!(finish["reply"], "hello");
         assert_eq!(finish["sessionID"], "native-one");

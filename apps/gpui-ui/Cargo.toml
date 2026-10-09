@@ -35,3 +35,11 @@ harness = false
 name = "transport_popover_geometry"
 harness = false
 
+# 「我的物件」's 「还有 N 件」 control: the panel's real prepared-layout rect and
+# every delivered row's real visible flag in a viewport-sized shell, before and
+# after the control is clicked. GPUI's macOS platform must run on the main
+# thread, so this is a `harness = false` binary test too.
+[[test]]
+name = "props_remaining_toggle"
+harness = false
+

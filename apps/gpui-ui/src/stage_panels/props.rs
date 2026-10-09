@@ -9,13 +9,17 @@
 //!   「房间里」 are the same list seen through `showsPlacedOnly`; the pair is
 //!   decided once by [`ownership_scope`] instead of being re-spelled at the picker,
 //!   at the empty state and at every row.
-//! - **One content scroll, fixed header.** The title row (the current scope's
-//!   name, [`panel_title`], + collapse) never scrolls, so the collapse control
-//!   cannot be pushed out of the panel;
-//!   everything below it scrolls inside the original 390 pt cap. The original
-//!   nested a second 190 pt scroll around the ownership list; this layer keeps a
-//!   single scroll region (the layer-wide rule), which the host's bounded row
-//!   projection plus the 「还有 N 件」 line already keeps in reach.
+//! - **One content scroll, fixed header and fixed footer.** The title row (the
+//!   current scope's name, [`panel_title`], + collapse) never scrolls, so the
+//!   collapse control cannot be pushed out of the panel; everything below it
+//!   scrolls inside the original 390 pt cap. The 「还有 N 件」 control is the
+//!   footer, **outside** that scroll ([`ResidentPropEditorPane::remaining_toggle`]):
+//!   it used to be a plain line after the last row inside the scroll, so on a
+//!   small window it sat below the fold, had no click handler at all, and the
+//!   pane's own 390 pt frame was 16 pt taller than the box the shell clips it to.
+//!   One click now lifts the frame to the extent the window allows
+//!   ([`m::PANEL_MAX_HEIGHT_EXPANDED`]); the single scroll still reaches the last
+//!   row either way, and the host's own row budget is what the count states.
 //! - **A built-in device is an object, not a second surface.** 音乐播放器 /
 //!   许愿机 arrive as rows of the same list, in the same groups and with the
 //!   same status words; the one difference the projection can state is that the
@@ -267,6 +271,11 @@ pub struct ResidentPropEditorPane {
     /// The object the slider value currently belongs to — the original
     /// `sizeDraftObjectID` (`:17`). Cleared when the draft is committed.
     draft_object: Option<String>,
+    /// Whether 「还有 N 件」 has been clicked. The panel's own click state, like
+    /// [`Self::draft_object`]: it changes the frame's height ceiling
+    /// ([`m::PANEL_MAX_HEIGHT`] ⇄ [`m::PANEL_MAX_HEIGHT_EXPANDED`]) and nothing
+    /// else, so it never travels to the host as an invented command.
+    list_expanded: bool,
     _subscriptions: Vec<Subscription>,
 }
 impl ResidentPropEditorPane {
@@ -318,6 +327,7 @@ impl ResidentPropEditorPane {
             confirming_delete: None,
             size,
             draft_object: None,
+            list_expanded: false,
             _subscriptions: vec![subscription, escape],
         }
     }
@@ -735,6 +745,56 @@ impl ResidentPropEditorPane {
                 .child(div().flex_1())
                 .into_any_element(),
         )
+    }
+
+    /// 「还有 N 件」 as the control it reads like.
+    ///
+    /// The host's row budget is what produces `remainingCount`, and it publishes
+    /// no "give me the rest" op (`apps/macos/.../GMGNRadioApp.swift::gpuiPropCommand`
+    /// has no budget arm, so an invented op would be an op the host refuses) —
+    /// therefore the one honest, in-panel expansion is height: one click lifts
+    /// this pane's ceiling from the original's `.frame(maxHeight: 390)` to the
+    /// extent the shell measured for it ([`m::PANEL_MAX_HEIGHT_EXPANDED`]), so
+    /// every row the projection delivered is on screen at once and the existing
+    /// scroll can reach the last one. A second click puts the frame back.
+    ///
+    /// The count is never recomputed here: it stays the host's own statement
+    /// about rows it withheld. Nothing is cut either way — the collapsed panel
+    /// keeps the same scroll, so all delivered rows stay reachable.
+    fn remaining_toggle(&self, count: u64, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = self.list_expanded;
+        let text = format!("还有 {count} 件");
+        let action = if expanded { "收起列表" } else { "展开列表" };
+        Button::new("props-remaining-toggle")
+            .custom(scene_variant(cx, 0x00000000, 0xffffff14, s::TEXT_MUTED))
+            .small()
+            .w_full()
+            .rounded(px(m::ROW_RADIUS))
+            .text_size(px(m::HEADING_SIZE))
+            .text_color(rgba(s::TEXT_MUTED))
+            .tooltip(action)
+            .accessibility_id("resident.ownership.remaining")
+            .accessibility_label(format!("{text}，{action}"))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(m::LEGEND_ENTRY_GAP))
+                    .child(
+                        Icon::new(if expanded {
+                            AssetIcon::ChevronUp
+                        } else {
+                            AssetIcon::ChevronDown
+                        })
+                        .size(px(m::STATUS_SIZE))
+                        .text_color(rgba(s::TEXT_MUTED)),
+                    )
+                    .child(text),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.list_expanded = !this.list_expanded;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// The hold-point picker (`slotPicker`, `:314-327`): one segmented control,
@@ -1324,7 +1384,7 @@ mod tests {
 }
 
 impl Render for ResidentPropEditorPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let placed_only = self.snapshot["placedOnly"].as_bool() == Some(true);
         let scope = ownership_scope(placed_only);
         let saving = self.snapshot["isSaving"].as_bool() == Some(true);
@@ -1361,6 +1421,12 @@ impl Render for ResidentPropEditorPane {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        // Rows the projection withheld (`inventory_ui.rs`'s row budget). The
+        // number is the host's own statement, so it stays; what changed is that
+        // it is now the face of a control, not a sentence inside the scroll.
+        let remaining = self.snapshot["remainingCount"]
+            .as_u64()
+            .filter(|count| *count > 0);
         if self.snapshot["rowCount"].as_u64() == Some(0) {
             let message = self.snapshot["emptyMessage"]
                 .as_str()
@@ -1379,16 +1445,6 @@ impl Render for ResidentPropEditorPane {
                     block = block.child(self.ownership_row(row, cx));
                 }
                 content = content.child(block);
-            }
-            if let Some(count) = self.snapshot["remainingCount"].as_u64().filter(|v| *v > 0) {
-                content = content.child(
-                    div()
-                        .id("resident.ownership.remaining")
-                        .px(px(m::ROW_PADDING))
-                        .text_size(px(m::HEADING_SIZE))
-                        .text_color(rgba(s::TEXT_MUTED))
-                        .child(format!("还有 {count} 件")),
-                );
             }
         }
         let selected = self.snapshot["selected"].clone();
@@ -1661,10 +1717,34 @@ impl Render for ResidentPropEditorPane {
         // `bottom == transportControls.top - 12`). Stretching to the container's
         // full height is what used to push the panel's content to the window's
         // top-left. `max_h` + the inner scroll still bound a long list.
-        v_flex()
-            .w_full()
-            .max_w(px(m::PANEL_WIDTH))
-            .max_h(px(m::PANEL_MAX_HEIGHT))
+        //
+        // The cap is also the *live viewport's* band: the shell clips this pane
+        // to `panel_extent(viewport)`, so a pane taller than that loses its
+        // bottom — which is where the 「还有 N 件」 footer sits. 390 pt inside the
+        // 374 pt box of a 720×482 window was exactly that case (measured), which
+        // is why the line could not be clicked even when scrolled to.
+        let viewport_band = (f32::from(window.viewport_size().height)
+            - m::PANEL_VIEWPORT_BOTTOM_BAND)
+            .max(0.);
+        let panel_max_height = if self.list_expanded {
+            m::PANEL_MAX_HEIGHT_EXPANDED
+        } else {
+            m::PANEL_MAX_HEIGHT
+        }
+        .min(viewport_band);
+        let mut panel = v_flex()
+            // The original's `propEditorPanel.widthAnchor.constraint(
+            // equalToConstant: 340)` is a *width*, not a ceiling. With `max_w`
+            // alone the pane shrink-to-fit itself inside the shell's content
+            // wrapper (measured: 190 pt wide), which is the reported
+            // 「窗口很小」; the shell's container still clips anything wider than
+            // the extent it measured.
+            .w(px(m::PANEL_WIDTH))
+            // Collapsed is the original's `.frame(maxHeight: 390)`. 「还有 N 件」
+            // lifts the panel to the ceiling the shell allows this pane, which is
+            // the extent the window's own size produced — never a number the pane
+            // invents for a window it cannot see.
+            .max_h(px(panel_max_height))
             .gap(px(m::GROUP_GAP))
             .p(px(m::PANEL_PADDING))
             .rounded(px(m::PANEL_RADIUS))
@@ -1724,6 +1804,28 @@ impl Render for ResidentPropEditorPane {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .child(content),
-            )
+            );
+        // 「还有 N 件」 is a control in the panel's own footer, **outside** the
+        // scroll. It used to be a plain `div` sitting after the last row inside
+        // the scroll content: on a small window it was below the fold and could
+        // not be reached at all, and even in view it had no click handler. A
+        // fixed footer can never be scrolled away — the same argument that keeps
+        // the title row out of the scroll.
+        if let Some(count) = remaining {
+            panel = panel.child(self.remaining_toggle(count, cx));
+        }
+        // The shell's content box (`shell_ui.rs::panel_content`) is 100 % of the
+        // panel box, and a 340 pt card inside a 590 pt box must still take its
+        // trailing edge from the bottom-right corner — the original's
+        // `propEditorPanel.trailing == transportControls.trailing`
+        // (`StageWindowController.swift:1521-1523`). One row wrapper ends the card
+        // at that corner whether the box hugs its child or spans the extent
+        // (measured 2026-10-09: a box pinned to 100 % left the card at x=108 in a
+        // 1280 pt-wide window instead of x=358, 250 pt off the corner).
+        h_flex()
+            .w_full()
+            .justify_end()
+            .child(panel)
+            .into_any_element()
     }
 }

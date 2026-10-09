@@ -30,9 +30,12 @@ use crate::ui_tokens::stage;
 /// **bottom** edge: the panel sits one hairline gap above the bar's top and
 /// never overlaps the panel area above it.
 pub const TRANSPORT_POPOVER_GAP: f32 = 8.;
-/// Width of a popover that carries a horizontal slider (three 44 pt slots, so
-/// it reads as a bar segment rather than a card).
-pub const TRANSPORT_POPOVER_WIDTH: f32 = 132.;
+/// Width of a transport popover: the widest control it carries (the 音量 track's
+/// own box, [`crate::primitives::VOLUME_TRACK_THICKNESS`]) plus the panel's
+/// padding on both sides, so the card is a **column** around a vertical track
+/// rather than a horizontal bar segment.
+pub const TRANSPORT_POPOVER_WIDTH: f32 =
+    crate::primitives::VOLUME_TRACK_THICKNESS + 2. * TRANSPORT_POPOVER_PADDING;
 /// Inner padding of a transport popover.
 pub const TRANSPORT_POPOVER_PADDING: f32 = 9.;
 
@@ -44,12 +47,17 @@ pub const TRANSPORT_POPOVER_PADDING: f32 = 9.;
 /// system theme (the inbox's white button is that bug). An overlay surface that
 /// floats over the rendered space must keep the fixed dark palette (see
 /// `ui_tokens::scene`).
+///
+/// The panel is a **column**: its content stacks (音量's vertical track above
+/// its mute icon), which is the shape the person asked for. A row layout here
+/// is what made the panel read as a horizontal bar.
 pub fn transport_popover(content: impl IntoElement) -> Div {
     div()
         .absolute()
         .bottom(px(m::TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP))
         .right(px(0.))
         .flex()
+        .flex_col()
         .items_center()
         .gap(px(s::PANEL_GAP / 2.))
         .w(px(TRANSPORT_POPOVER_WIDTH))
@@ -344,13 +352,15 @@ fn transport_bar_slots(
                 .on_click(move |_, window, cx| click(action.as_ref(), window, cx))
                 .into_any_element()
         };
-        let mut slot = div()
+        // The control's own 44 pt face. Kept as its own box so the badge's
+        // offsets stay measured from the face, not from the taller slot below.
+        let mut face = div()
             .relative()
             .w(px(width))
             .h(px(stage::CONTROL_SIZE))
             .child(element);
         if let Some(badge) = &control.badge {
-            slot = slot.child(
+            face = face.child(
                 div()
                     .absolute()
                     .top(px(m::BADGE_TOP))
@@ -367,10 +377,26 @@ fn transport_bar_slots(
                     .child(badge.clone()),
             );
         }
+        // One slot's containing block is the **bar's own box**, not the 44 pt
+        // face: the slot is `TRANSPORT_HEIGHT` tall (the row centers the face
+        // inside it, so the control does not move) and therefore its bottom edge
+        // is the bar's bottom edge. The popover below hangs off *this* box, so
+        // its `bottom` anchor — [`m::TRANSPORT_HEIGHT`] + [`TRANSPORT_POPOVER_GAP`]
+        // — really is measured from the bar's bottom edge, exactly as
+        // [`transport_popover`] documents. A slot that stops at the face would
+        // sit 2 pt inside the bar (the row centers a 44 pt face in a 48 pt bar)
+        // and push the panel 2 pt further up than the gap says.
+        let mut slot = div()
+            .relative()
+            .w(px(width))
+            .h(px(m::TRANSPORT_HEIGHT))
+            .flex()
+            .items_center()
+            .child(face);
         // A control with an open panel paints it from its own slot, so the
         // panel tracks the control it belongs to; its anchor is the bar's box
-        // (`absolute` under the bar's padding box), which is what puts it above
-        // the bar instead of inside it. A host that mounted the bar without a
+        // (an `absolute` child of the slot), which is what puts it above the
+        // bar instead of inside it. A host that mounted the bar without a
         // window cannot build a panel, so it is skipped rather than faked.
         if let Some(popover) = &control.popover {
             if let Some((window, cx)) = live.as_mut() {
@@ -459,6 +485,54 @@ mod tests {
         assert!(transport_width(&controls[..controls.len() - 1]) < m::TRANSPORT_WIDTH);
     }
 
+    /// An open panel hangs off the **bar's own box**, not the 44 pt control
+    /// face.
+    ///
+    /// [`transport_popover`]'s `bottom` is `TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP`
+    /// measured from its containing block, and the panel is documented to land
+    /// exactly one gap above the bar's top edge. That only holds while the
+    /// popover's parent spans the bar's full height: the bar centers a 44 pt
+    /// face inside its 48 pt box, so a slot that stops at the face sits 2 pt
+    /// inside the bar and lifts the panel with it (the 音量 panel used to open
+    /// with a 10 pt gap instead of the 8 pt one). The face keeps its own 44 pt
+    /// box, so the badge's offsets are measured from the face they belong to.
+    ///
+    /// The assertions slice the real builder, so restoring the old 44 pt slot
+    /// turns this red instead of passing on a constant.
+    #[test]
+    fn an_open_panel_hangs_off_the_bar_height_slot_not_the_control_face() {
+        let source = include_str!("shell.rs");
+        let builder = &source[source.find("fn transport_bar_slots").unwrap()..];
+        let builder = &builder[..builder.find("bar.into_any_element()").unwrap()];
+        let bodies = &builder[builder.find("let mut face = div()").expect(
+            "the control's face must stay its own box, or the badge offsets move",
+        )..];
+        let split = bodies
+            .find("let mut slot = div()")
+            .expect("the popover needs a slot spanning the bar, not the face");
+        let (face, slot) = bodies.split_at(split);
+        assert!(
+            face.contains(".h(px(stage::CONTROL_SIZE))"),
+            "the control's face keeps its own 44 pt box: {face}"
+        );
+        assert!(
+            slot.contains(".h(px(m::TRANSPORT_HEIGHT))"),
+            "the slot the panel hangs off must span the bar's own height: {slot}"
+        );
+        assert!(
+            slot.contains(".items_center()"),
+            "the face must stay centered in the taller slot, or the control moves: {slot}"
+        );
+        let popover = &slot[..slot.find("bar = bar.child(slot)").unwrap()];
+        assert!(
+            popover.contains("slot = slot.child(transport_popover("),
+            "the panel must hang off that slot: {popover}"
+        );
+        // The anchor is the bar plus the hairline gap; the slot's bottom edge is
+        // the bar's bottom edge, so the panel lands one gap above the bar's top.
+        assert_eq!(m::TRANSPORT_HEIGHT + TRANSPORT_POPOVER_GAP, 56.);
+    }
+
     /// A bar's popover opens **above** the bar, not below it.
     ///
     /// This is the geometry of 音量's slider: the panel's `bottom` is the bar's
@@ -508,6 +582,42 @@ mod tests {
         // would not satisfy both.
         assert!(s::CARD_BG < 0x80000000, "dark surface");
         assert!(s::CARD_BG & 0xff < 0xff, "translucent surface");
+    }
+
+    /// The panel is a **column around a vertical track**, not a horizontal bar
+    /// segment: it stacks its content and its width is the track's own box plus
+    /// the padding, so it cannot be the wide strip a horizontal slider needs.
+    ///
+    /// Both numbers are read off the element the bar really mounts, and the
+    /// track's axis is the same value the panel's only control lays itself out
+    /// with, so putting 音量 back on a horizontal track turns this red.
+    #[test]
+    fn the_popover_is_a_column_around_a_vertical_track() {
+        assert_eq!(
+            crate::primitives::volume_track_axis(),
+            gpui_kit::Axis::Vertical,
+            "the panel is a column around a *vertical* track; a horizontal track \
+             is the wide strip that was rejected"
+        );
+        assert_eq!(
+            TRANSPORT_POPOVER_WIDTH,
+            crate::primitives::VOLUME_TRACK_THICKNESS + 2. * TRANSPORT_POPOVER_PADDING
+        );
+        let mut popover = transport_popover(div());
+        let style = popover.style();
+        assert_eq!(
+            style.flex_direction,
+            Some(gpui_kit::FlexDirection::Column),
+            "the panel stacks its controls; a row is the horizontal bar that was rejected"
+        );
+        assert_eq!(
+            style.size.width,
+            Some(gpui_kit::Length::Definite(px(TRANSPORT_POPOVER_WIDTH).into()))
+        );
+        // A vertical track (24 pt across) plus padding is a narrow card; the
+        // rejected horizontal slider's panel had to be 132 pt wide to hold it.
+        assert!(TRANSPORT_POPOVER_WIDTH < 132.);
+        assert!(TRANSPORT_POPOVER_WIDTH > crate::primitives::VOLUME_TRACK_THICKNESS);
     }
 
     /// The open/closed state is the presence of the panel, and a control that

@@ -650,7 +650,14 @@ func gmgnRenderHostChatConfigure(_ pointer: UnsafeMutableRawPointer?, _ backendP
         let host = Unmanaged<GPUIRenderHost>.fromOpaque(UnsafeMutableRawPointer(bitPattern: address)!).takeUnretainedValue()
         do {
             host.chat?.close()
-            host.chat = try RenderHostResidentConversation(backend: backend, dataRoot: host.dataRoot, defaults: host.defaults)
+            // 必须传宿主自建的那个客户端：不传就走 `productSettings: .shared`，
+            // 于是 RenderHost 里的 `SpatialStageStore` 和这里的会话各持一份
+            // `RustProductSettingsClient`（各有一份 `confirmed` revision 缓存），
+            // 一边写成功后另一边的 `expectedRevision` 就过期——正是
+            // `product_settings_revision_conflict` 的制造机。
+            host.chat = try RenderHostResidentConversation(
+                backend: backend, dataRoot: host.dataRoot, defaults: host.defaults,
+                productSettings: host.settings)
             return 1
         } catch { return 0 }
     }

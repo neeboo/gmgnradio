@@ -32,6 +32,7 @@
 //! an id is what makes a `Div` interactive in GPUI.
 use gpui::{Div, ElementId, MouseButton, MouseDownEvent, MouseUpEvent, SharedString, Stateful, px, rgba};
 use gpui_kit::component::button::*;
+use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::{InteractiveElement as _, StatefulInteractiveElement as _};
@@ -294,6 +295,105 @@ pub fn h_strip(id: impl Into<ElementId>) -> Stateful<Div> {
         .w_full()
 }
 
+// ---------------------------------------------------------------------------
+// 音量 — the transport bar's one slider, and its mute face
+// ---------------------------------------------------------------------------
+
+/// Thickness of the 音量 track's own box, across its axis.
+///
+/// 24 pt is kit's own vertical track width (`SliderTrack` is `w_6` in the
+/// vertical mode), so the layer does not invent a second geometry for it.
+pub const VOLUME_TRACK_THICKNESS: f32 = 24.;
+
+/// Length of the 音量 track along its axis (kit's vertical mode is 120 pt long).
+pub const VOLUME_TRACK_LENGTH: f32 = 120.;
+
+/// The direction the 音量 track runs: **vertical, growing upward**.
+///
+/// This one value decides both the box the track is laid out in
+/// ([`volume_track_box`]: longer than it is wide) and the mode kit's slider is
+/// built in ([`volume_slider`]), so a horizontal 音量 bar cannot be built by
+/// changing only one of them. Vertical is bottom-up because kit measures the
+/// pointer from the track's **bottom** edge on the vertical axis
+/// (`SliderState::update_value_by_position`), so dragging up raises the level.
+pub const fn volume_track_axis() -> Axis {
+    Axis::Vertical
+}
+
+/// The box a 音量 track is laid out in when it runs along `axis`: the long side
+/// is always [`VOLUME_TRACK_LENGTH`], so a vertical track's resolved style is
+/// taller than it is wide.
+pub fn volume_track_box(axis: Axis) -> Div {
+    let (width, height) = match axis {
+        Axis::Vertical => (VOLUME_TRACK_THICKNESS, VOLUME_TRACK_LENGTH),
+        Axis::Horizontal => (VOLUME_TRACK_LENGTH, VOLUME_TRACK_THICKNESS),
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(width))
+        .h(px(height))
+}
+
+/// The 音量 popover's slider: kit's [`Slider`] in the track's own direction,
+/// sized to the track's box.
+///
+/// `enabled` is the host's connectivity — the level cannot be published while
+/// the music host is gone, so the control is disabled rather than silently
+/// ignored. Dragging still reports through `SliderEvent`, which the caller
+/// turns into the one `music.volume` command.
+pub fn volume_slider(state: &gpui_kit::Entity<SliderState>, enabled: bool) -> impl IntoElement {
+    let axis = volume_track_axis();
+    let slider = match axis {
+        Axis::Vertical => Slider::new(state).vertical(),
+        Axis::Horizontal => Slider::new(state).horizontal(),
+    };
+    volume_track_box(axis).child(
+        slider
+            .w(px(VOLUME_TRACK_THICKNESS))
+            .h(px(VOLUME_TRACK_LENGTH))
+            .disabled(!enabled),
+    )
+}
+
+/// The glyph a 音量 mute control paints: lucide's `volume-x` while muted and
+/// `volume-2` while not.
+///
+/// Both are names the product's asset source embeds
+/// (`gpui_kit::assets::AllAssets` in `apps/gpui-app/src/main.rs`), so neither
+/// face paints an empty square — and both are glyphs, never a switch, a track
+/// or a bar.
+pub fn volume_mute_icon(muted: bool) -> gpui_kit::assets::IconName {
+    if muted {
+        gpui_kit::assets::IconName::VolumeX
+    } else {
+        gpui_kit::assets::IconName::Volume2
+    }
+}
+
+/// The 音量 popover's mute control: a **small square icon button**, the same
+/// [`icon_button`] every other control in this layer is — never a switch and
+/// never a bar.
+///
+/// The words are only the tooltip and the accessibility label; the face is
+/// [`volume_mute_icon`]'s glyph, which is what makes the muted and unmuted
+/// states tell apart at a glance. It is one track wide
+/// ([`VOLUME_TRACK_THICKNESS`]) rather than the bar's own control height, so the
+/// popover stays a narrow column around its track. `enabled` follows the
+/// slider's: the levels it writes are the same one `music.volume` command.
+pub fn volume_mute_button(muted: bool, enabled: bool) -> Button {
+    icon_button(
+        "volume-mute",
+        volume_mute_icon(muted),
+        if muted { "取消静音" } else { "静音" },
+        muted,
+    )
+    .w(px(VOLUME_TRACK_THICKNESS))
+    .h(px(VOLUME_TRACK_THICKNESS))
+    .disabled(!enabled)
+}
+
 #[cfg(test)]
 mod tests {
     // gpui re-exports a `test` attribute macro; `super::*` would shadow the
@@ -318,5 +418,80 @@ mod tests {
     fn emphasis_fill_distinguishes_enabled_from_disabled() {
         assert_ne!(s::FILL, s::FILL_DISABLED);
         assert!(s::FILL_DISABLED & 0xff < s::FILL & 0xff);
+    }
+
+    /// A style length as the pixels the element really resolves to, so an
+    /// assertion reads the shape that was built rather than a copied constant.
+    fn definite(length: Option<gpui_kit::Length>) -> gpui_kit::Pixels {
+        match length {
+            Some(gpui_kit::Length::Definite(value)) => {
+                value.to_pixels(gpui_kit::AbsoluteLength::Pixels(px(0.)), px(16.))
+            }
+            other => panic!("expected a definite length, got {other:?}"),
+        }
+    }
+
+    /// 音量 is a **vertical** slider: the box the track is laid out in resolves
+    /// to a shape that is taller than it is wide, and the track's own axis is
+    /// the vertical one. Turning it back into the rejected horizontal bar
+    /// (`volume_track_axis` → `Axis::Horizontal`) flips both, and moving only
+    /// kit's slider to its horizontal mode without the box is caught by the
+    /// pixel harness in `tests/transport_popover_geometry.rs`.
+    #[test]
+    fn the_volume_track_is_vertical_and_bottom_up() {
+        assert_eq!(
+            volume_track_axis(),
+            Axis::Vertical,
+            "音量 is a vertical slider, not a horizontal bar"
+        );
+        let mut track = volume_track_box(volume_track_axis());
+        let style = track.style();
+        let width = definite(style.size.width);
+        let height = definite(style.size.height);
+        assert!(
+            height > width,
+            "a vertical 音量 track is taller than it is wide: {width:?} x {height:?}"
+        );
+        assert_eq!(height, px(VOLUME_TRACK_LENGTH));
+        assert_eq!(width, px(VOLUME_TRACK_THICKNESS));
+        // The other axis is a real, different shape, so the assertion above is
+        // not true of any box this helper can build.
+        let mut horizontal = volume_track_box(Axis::Horizontal);
+        let horizontal = horizontal.style();
+        assert!(definite(horizontal.size.width) > definite(horizontal.size.height));
+    }
+
+    /// 静音 is a **small icon button**, not a switch and not a bar: the two
+    /// states are two different glyphs of the layer's square icon control
+    /// (`icon_button`: 30 pt, icon face, words only in the tooltip).
+    #[test]
+    fn the_volume_mute_control_is_a_small_icon_not_a_switch() {
+        let muted = volume_mute_icon(true);
+        let unmuted = volume_mute_icon(false);
+        assert_eq!(muted, gpui_kit::assets::IconName::VolumeX);
+        assert_eq!(unmuted, gpui_kit::assets::IconName::Volume2);
+        assert_ne!(muted, unmuted, "the two states must be distinguishable");
+        let mut button = volume_mute_button(true, true);
+        let style = button.style();
+        assert_eq!(style.size.width, style.size.height, "square, not a bar");
+        assert_eq!(definite(style.size.width), px(VOLUME_TRACK_THICKNESS));
+        assert!(
+            definite(style.size.height) < px(s::CONTROL_HEIGHT),
+            "静音 is a small icon, not a bar-sized control"
+        );
+        // The very same control shape the layer's other icon controls have:
+        // 静音 is a control of this layer, not a settings row's switch.
+        let mut reference = icon_button("reference", unmuted, "音量", false);
+        let reference = reference.style();
+        assert_eq!(style.corner_radii, reference.corner_radii);
+        // 静音 is the asserted state, so it takes the accent glyph colour; the
+        // unmuted face keeps the resting one — the two states are visible.
+        let mut resting = volume_mute_button(false, true);
+        assert_eq!(resting.style().text.color, reference.text.color);
+        assert_ne!(
+            style.text.color,
+            resting.style().text.color,
+            "静音 and 取消静音 must not look the same"
+        );
     }
 }

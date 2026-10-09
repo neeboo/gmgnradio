@@ -125,15 +125,40 @@ final class RustProductSettingsClient {
         let task = Task { [self] in
             if let prior { _ = try? await prior.value }
             if confirmed == nil { try await reload() }
-            guard let confirmed else { throw SettingsError.unavailable }
-            var requestPayload = payload
-            requestPayload["requestID"] = id.uuidString; requestPayload["expectedRevision"] = confirmed.revision
-            let result = try await request(method, requestPayload)
-            publish(result); return result
+            do {
+                return try await send(method, payload: payload, requestID: id)
+            } catch let WorldAuthorityError.daemon(code)
+                where code == "product_settings_revision_conflict" {
+                // 权威用 `expectedRevision` 做乐观并发控制。另一个写者（另一个窗口 /
+                // Unity 宿主）先提交时，这里拿到的是 `product_settings_revision_conflict`。
+                // 旧行为是直接抛出：用户这一次改动就丢了，而且本地 `confirmed.revision`
+                // 仍是旧的，之后每次保存都会再冲突一次（界面看着像"设置保存不了"）。
+                //
+                // 按权威的要求**重读一次最新快照再重放一次**。`requestID` 原样复用：
+                // 冲突是在 request 记录落库**之前**返回的（product_settings.rs 先比
+                // `expectedRevision` 再 INSERT），所以这个 id 在权威那边还没有记录，
+                // 重放不会撞 `product_settings_request_conflict`。
+                //
+                // 只重试一次：第二次仍冲突说明又有人抢先，如实把这个错误抛出去，
+                // 不吞、不循环、不降级写本地。
+                try await reload()
+                return try await send(method, payload: payload, requestID: id)
+            }
         }
         mutation = task; mutationID = id
         defer { if mutationID == id { mutation = nil; mutationID = nil } }
         return try await task.value
+    }
+    /// 用**当前** `confirmed.revision` 提交一次写。冲突恢复路径会先 `reload()` 再调它，
+    /// 所以两次调用读到的 `expectedRevision` 一定不同。
+    private func send(_ method: String, payload: [String: Any], requestID: UUID) async throws -> Snapshot {
+        guard let confirmed else { throw SettingsError.unavailable }
+        var requestPayload = payload
+        requestPayload["requestID"] = requestID.uuidString
+        requestPayload["expectedRevision"] = confirmed.revision
+        let result = try await request(method, requestPayload)
+        publish(result)
+        return result
     }
     func bindWorldCatalog(_ ids: [String]) async throws { publish(try await request("product_settings_bind_catalog", ["worldIDs": ids])) }
     func selectWorld(_ id: String?) async throws { _ = try await apply(["selectedWorldID": id as Any? ?? NSNull()]) }

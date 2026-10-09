@@ -407,7 +407,12 @@ impl InboxPane {
             }
             list = list.child(self.row(&row, now, cx));
         }
-        list.vertical_scrollbar(&self.scroll).into_any_element()
+        // Registered for the layout tests (`try_find` reads the real painted
+        // box); a no-op in a build without gpui-kit's `test-support` feature,
+        // and never a second description of the column's style.
+        list.vertical_scrollbar(&self.scroll)
+            .test_support()
+            .into_any_element()
     }
 
     /// The right column: empty state, placeholder and the read-only detail
@@ -446,6 +451,12 @@ impl InboxPane {
 
         let mut column = v_flex()
             .id("resident.system-inbox.detail")
+            // `flex_1` plus the detail's own `min_w`: the row's free space goes
+            // to the detail, and taffy clamps its base size up to that floor
+            // before the line is resolved, so a narrow host shrinks the *list*
+            // towards `LIST_MIN_WIDTH` instead of letting the detail's floor
+            // push the row out of the panel. The standalone 720 pt window is
+            // unchanged (the detail still grows into all the slack).
             .flex_1()
             .min_w(px(m::DETAIL_MIN_WIDTH))
             .h_full()
@@ -501,7 +512,9 @@ impl InboxPane {
         if let Some(error) = persistence_error {
             column = column.child(ui::notice(error));
         }
-        column.into_any_element()
+        // Registered for the layout test below, which reads this column's real
+        // painted box next to the list's.
+        column.test_support().into_any_element()
     }
 }
 impl Focusable for InboxPane {
@@ -760,18 +773,21 @@ mod tests {
         );
         assert_eq!([m::DETAIL_MIN_WIDTH, m::DETAIL_MIN_HEIGHT], [320., 220.]);
         assert_eq!(m::LIST_MIN_WIDTH, 240.);
-        // The media panel is the narrow host of this pane; its inner width is
-        // `stage::PANEL_MAX_WIDTH` minus the inset on both sides and the
-        // detail's trailing gap.
-        let media_inner =
-            crate::ui_tokens::stage::PANEL_MAX_WIDTH - 2. * m::PANEL_INSET - m::DETAIL_TRAILING;
-        assert_eq!(media_inner, 562.);
+        // The media panel is the narrow host of this pane, and what it hands the
+        // pane is `PANE_MIN_WIDTH`: the two column floors plus the split's own
+        // insets. (The panel's *own* floor is this plus the media surface's
+        // padding; the fixture's `media_ui::PANEL_CONTENT_FLOOR` and the shell's
+        // panel extent pin that half.) The detail keeps its floor, so the list
+        // is the column that gives way.
+        assert_eq!(m::PANE_MIN_WIDTH, 580.);
+        assert_eq!(
+            m::PANE_MIN_WIDTH,
+            m::LIST_MIN_WIDTH + m::DETAIL_MIN_WIDTH + 2. * m::PANEL_INSET
+        );
         assert!(
-            m::LIST_MIN_WIDTH + m::DETAIL_MIN_WIDTH <= media_inner,
-            "the list floor ({} pt) + the detail floor ({} pt) must fit the media panel's \
-             {media_inner} pt inner width, otherwise the detail column is clipped",
-            m::LIST_MIN_WIDTH,
-            m::DETAIL_MIN_WIDTH
+            m::LIST_MIN_WIDTH + m::DETAIL_MIN_WIDTH <= m::PANE_MIN_WIDTH - 2. * m::PANEL_INSET,
+            "the two column floors must fit the pane's own demand, otherwise the \
+             detail column is clipped by whatever box the host gives the pane"
         );
         assert!(
             m::LIST_WIDTH + m::DETAIL_MIN_WIDTH <= m::WINDOW_WIDTH - 2. * m::PANEL_INSET,
@@ -780,8 +796,8 @@ mod tests {
         // The two columns really carry those constraints into layout: the list
         // has a 300 pt preferred width and a 240 pt floor, so it shrinks
         // instead of pushing the detail column past the panel edge. (The
-        // constants and the live style are asserted together, so editing only
-        // one of them still fails.)
+        // constants and the live styles are asserted together, so editing only
+        // one still fails.)
         let mut list = div()
             .w(px(m::LIST_WIDTH))
             .min_w(px(m::LIST_MIN_WIDTH));
@@ -796,9 +812,126 @@ mod tests {
                 Some(format!("{:?}", px(m::LIST_MIN_WIDTH))),
             )
         );
+        let mut detail = v_flex()
+            .flex_1()
+            .min_w(px(m::DETAIL_MIN_WIDTH));
+        let style = detail.style();
+        assert_eq!(
+            (
+                style.flex_grow,
+                style.flex_shrink,
+                style.min_size.width.map(|width| format!("{width:?}")),
+            ),
+            (
+                Some(1.),
+                Some(1.),
+                Some(format!("{:?}", px(m::DETAIL_MIN_WIDTH))),
+            ),
+            "the detail must take the row's slack and never go below its floor"
+        );
         assert_eq!(m::UNREAD_DOT, 0x0a84ffff);
         assert_ne!(m::TITLE_TEXT, m::STATUS_TEXT);
         assert_ne!(m::STATUS_TEXT, m::PLACEHOLDER_TEXT);
+    }
+
+    /// The pane's host in the media panel hands it exactly [`m::PANE_MIN_WIDTH`]
+    /// (the panel's own floor minus the media surface's padding); this test
+    /// mounts the real pane in that box and reads the **real prepared-layout
+    /// boxes** of both columns out of the last frame.
+    ///
+    /// This is the pane's half of the reported 「消息面板没显示完整，左边缺一块」:
+    /// the host had been handing the pane 558 pt (the media panel's 590 minus
+    /// its padding) while the two columns need [`m::PANE_MIN_WIDTH`], so the row
+    /// overflowed its box and was cut. Given the box the fix derives, the list
+    /// must give way down to [`m::LIST_MIN_WIDTH`], the detail must sit directly
+    /// beside it at [`m::DETAIL_MIN_WIDTH`], and nothing may be painted outside
+    /// the box. The box is the shared token, so a floor that no longer fits real
+    /// layout (or a `PANE_MIN_WIDTH` smaller than the columns really need) turns
+    /// this red instead of passing on arithmetic alone.
+    #[test]
+    fn both_columns_are_painted_inside_the_media_panels_inner_width() {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext};
+
+        /// The media panel's body box: the pane's own demand, and the height the
+        /// panel extent resolves to at the report's 720×482 window (the same
+        /// arithmetic `media_ui`'s own body test pins). Only the width matters
+        /// here.
+        struct PanelBody(Entity<InboxPane>);
+        impl Render for PanelBody {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(m::PANE_MIN_WIDTH))
+                    .h(px(374.))
+                    .overflow_hidden()
+                    .child(self.0.clone())
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.add_window(move |_window, cx| {
+            let pane = cx.new(InboxPane::new);
+            pane.update(cx, |pane, cx| {
+                pane.update_snapshot(
+                    json!({"scope":"world-a","entries":[
+                        {"id":"one","eventID":"event-one","isRead":false,
+                         "title":"生成完成","status":"已完成","relativeTimeText":"刚刚",
+                         "updatedAtText":"2026年10月4日 1:23","detail":"已完成 3/3"}
+                    ]}),
+                    cx,
+                );
+            });
+            PanelBody(pane)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let list = window.find("resident.system-inbox.list");
+            let detail = window.find("resident.system-inbox.detail");
+            let list = list.bounds();
+            let detail = detail.bounds();
+            let box_width = px(m::PANE_MIN_WIDTH);
+            // The list is the column that gives way, and it gives way exactly to
+            // its floor — not past it, and not only part of the way.
+            assert_eq!(
+                list.origin.x,
+                px(m::PANEL_INSET),
+                "the list starts at the split's own inset: list={list:?}"
+            );
+            assert_eq!(
+                list.size.width,
+                px(m::LIST_MIN_WIDTH),
+                "in a {} pt box the list must shrink to its {}-pt floor: list={list:?}",
+                m::PANE_MIN_WIDTH,
+                m::LIST_MIN_WIDTH
+            );
+            // The detail keeps its floor and is painted directly beside the list.
+            assert_eq!(
+                detail.origin.x,
+                list.origin.x + list.size.width,
+                "the two columns must touch: list={list:?} detail={detail:?}"
+            );
+            assert_eq!(
+                detail.size.width,
+                px(m::DETAIL_MIN_WIDTH),
+                "the detail keeps its own floor: detail={detail:?}"
+            );
+            // …and the whole row is inside the box the panel hands the pane, so
+            // nothing is cut off either side.
+            assert!(
+                list.origin.x >= px(0.)
+                    && detail.origin.x + detail.size.width <= box_width - px(m::PANEL_INSET),
+                "both columns must be painted inside the {box_width:?} box the media panel \
+                 gives the pane: list={list:?} detail={detail:?}"
+            );
+            // The pane really painted the projection, so the boxes above are the
+            // boxes of a live surface rather than an empty shell.
+            assert!(
+                window.try_find("one").is_some(),
+                "the projected row must be observable, otherwise this test is vacuous"
+            );
+        })
+        .unwrap();
     }
 
     /// The pane must survive real GPUI window draws, and while it draws a

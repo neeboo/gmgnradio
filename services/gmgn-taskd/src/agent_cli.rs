@@ -1090,28 +1090,30 @@ for line in sys.stdin:
         (CliService::new(db), p, root)
     }
     async fn wait(service: &CliService, p: &Value, phase: Option<&str>) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let state = service.request("agent_cli_read", p).await.unwrap();
-                if let Some(phase) = phase {
-                    if state["pendingTools"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|v| v["phase"] == phase)
-                    {
-                        return state;
-                    }
-                } else if ["completed", "failed", "cancelled", "unknown"]
-                    .contains(&state["state"].as_str().unwrap())
+        // 等进展，不等墙钟（原来是 10s 固定上限，并行跑满时会先于被测作业超时）。
+        let mut watch =
+            crate::test_wait::StallWatch::new("agent_cli 会话", Duration::from_secs(60));
+        loop {
+            let state = service.request("agent_cli_read", p).await.unwrap();
+            if let Some(phase) = phase {
+                if state["pendingTools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["phase"] == phase)
                 {
                     return state;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else if ["completed", "failed", "cancelled", "unknown"]
+                .contains(&state["state"].as_str().unwrap())
+            {
+                return state;
             }
-        })
-        .await
-        .unwrap()
+            if !watch.observe(&state) {
+                panic!("{}", watch.stalled());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
     fn pending(state: &Value, phase: &str) -> Value {
         state["pendingTools"]
