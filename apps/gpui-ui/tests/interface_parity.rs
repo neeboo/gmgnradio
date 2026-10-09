@@ -1290,6 +1290,9 @@ const OPS: &[OpContract] = &[
         op: "stage.props.undo",
         ui_fields: &[],
         rewrite_to: None,
+        // 宿主契约仍在（`GMGNRadioApp.swift:489` → `world.prop.command{op:"undo"}`），
+        // 但这一层已经不再发出它：面板里的「撤销上次」按钮撤掉了。见
+        // [`UI_RETIRED_OPS`] —— 该登记保证这条契约不会被误当成「仍然发出」。
         handlers: &[
             Handler { file: "apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift", ops: &["stage.props.undo"], func_anchor: "" },
         ],
@@ -1539,6 +1542,20 @@ const OPS: &[OpContract] = &[
     },
 ];
 
+/// `OPS` 里仍然保留、但这一层**不再发出**的 op。
+///
+/// 格式 `(op, 退役理由)`。两条断言把它钉死：登记的 op 必须仍在 `OPS` 表里
+/// （退役的是 UI 发出点，不是宿主契约 —— `op_coverage` 继续要求宿主有处理串），
+/// 且它必须**不在** production 源码的 op 字面量里（否则登记过期，说明按钮又回来了）。
+///
+/// 不许用删表的方式「修」这类过期：删掉就没有任何东西记得宿主还欠一个契约。
+const UI_RETIRED_OPS: &[(&str, &str)] = &[(
+    "stage.props.undo",
+    "面板里的「撤销上次」按钮撤掉了：它坐在正文里、读起来像第二个返回控件。宿主能力保留 —— \
+     `GMGNRadioApp.swift:489` 仍把 `stage.props.undo` 翻成 `world.prop.command{op:\"undo\"}`，\
+     Unity probe 仍翻译它（`inventory_ui.rs:699`），将来任何界面都能重新发出。",
+)];
+
 fn ui_emissions(root: &Path) -> Vec<Emission> {
     let mut files = Vec::new();
     collect(&root.join("apps/gpui-ui/src"), "rs", &mut files);
@@ -1628,15 +1645,31 @@ fn op_field_sets_match_the_source_and_are_read() {
     let stale: Vec<&str> = declared
         .iter()
         .copied()
-        .filter(|op| !live.contains_key(*op))
+        .filter(|op| !live.contains_key(*op) && !UI_RETIRED_OPS.iter().any(|(retired, _)| retired == op))
         .collect();
     assert!(
         stale.is_empty(),
         "OPS 表里这些 op 在 production 源码里已经不再发出（表过期）：{stale:?}"
     );
 
+    // 已退役的 op 只是不再由这一层发出：宿主处理者仍在（op_coverage 继续钉住），
+    // 所以这里既不能按「已发出」对字段面，也不能允许它悄悄回到 OPS 之外。
+    for (op, reason) in UI_RETIRED_OPS {
+        assert!(
+            declared.contains(op),
+            "UI_RETIRED_OPS 里 {op} 必须仍留在 OPS 表里（退役的是发出点，不是宿主契约）：{reason}"
+        );
+        assert!(
+            !live.contains_key(*op),
+            "UI_RETIRED_OPS 里的 {op} 又出现在 production 源码里了（退役登记过期）：{reason}"
+        );
+    }
+
     let mut failures: Vec<String> = Vec::new();
     for contract in OPS {
+        if UI_RETIRED_OPS.iter().any(|(retired, _)| *retired == contract.op) {
+            continue;
+        }
         let emitted = &live[contract.op];
         let declared_fields: BTreeSet<&str> = contract.ui_fields.iter().copied().collect();
         let extra: Vec<&str> = emitted
@@ -1705,6 +1738,9 @@ fn required_fields_are_emitted_by_the_ui() {
     }
     let mut failures = Vec::new();
     for contract in OPS {
+        if UI_RETIRED_OPS.iter().any(|(retired, _)| *retired == contract.op) {
+            continue;
+        }
         let Some(emitted) = live.get(contract.op) else { continue };
         let required = required_set(&root, contract, OPS);
         for (field, at) in &required {

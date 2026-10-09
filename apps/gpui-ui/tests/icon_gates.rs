@@ -710,6 +710,10 @@ const CATALOG_ONLY: &[(&str, &str)] = &[
         "the original's wifi.exclamationmark on the connectivity banner; no bundled equivalent",
     ),
     (
+        "Trash",
+        "the delete entry's bin (`Label(\"删除\", systemImage: \"trash\")` in the original); the default bundle ships only lucide's `delete`, which is a left-pointing tag/label outline — that is the glyph the delete entry was misread as 回退 through",
+    ),
+    (
         "X",
         "lucide's `x` close glyph; the default bundle's close icon is `close`",
     ),

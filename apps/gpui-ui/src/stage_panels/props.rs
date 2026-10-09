@@ -37,7 +37,13 @@
 //!   it belongs to the selected object, otherwise that object's own longest edge.
 //! - **Permanent delete asks once, in a real kit dialog** (`window.open_dialog`),
 //!   never an inline red block, and never emits the delete command when the
-//!   answer is 取消 or the host is saving.
+//!   answer is 取消 or the host is saving. Its face is the **bin**
+//!   ([`action_icon`]): lucide's `delete` name is a tag/label outline that reads
+//!   as 回退, which is how the entry was misread.
+//! - **No undo control.** 「撤销上次」 used to sit in the body and emit
+//!   `stage.props.undo`; it is removed from this layer (the host capability is
+//!   untouched — see `interface_parity.rs::UI_RETIRED_OPS`). Nothing in this pane
+//!   rewinds the layout as a whole.
 //! - **Nothing here reads `cx.theme()`** for panel chrome: colours and sizes come
 //!   from [`crate::ui_tokens::scene`], [`crate::primitives`] and
 //!   [`crate::ui_tokens::props`]. Controls are kit components with an explicit
@@ -120,6 +126,29 @@ pub fn ownership_tint(state: &str) -> u32 {
         "inInventory" => m::TINT_IN_INVENTORY,
         "failed" => m::TINT_FAILED,
         _ => m::TINT_NEUTRAL,
+    }
+}
+
+/// The glyph an ownership row's action wears.
+///
+/// `delete` is the one that matters: lucide's `delete` glyph is a
+/// **tag/label** outline — a left-pointing polygon with a ✕ in it — which in the
+/// running overlay reads as 回退, not as a bin. The original draws the bin
+/// (`Label("删除", systemImage: "trash")`, `ResidentPropEditorView.swift:78`), so
+/// the entry wears [`AssetIcon::Trash`]. That glyph is outside gpui-kit's default
+/// component bundle, so it is registered in `CATALOG_ONLY` with this reason
+/// (`apps/gpui-ui/tests/icon_gates.rs`).
+///
+/// A free function, not an inline `match`, because the icon is the whole face of
+/// the control: the mapping has to be assertable on its own, not only through a
+/// painted frame.
+pub fn action_icon(action: &str) -> AssetIcon {
+    match action {
+        "askResidentToFetch" => AssetIcon::User,
+        "retry" | "retryInventoryRegistration" => AssetIcon::RefreshCw,
+        "withdraw" => AssetIcon::Inbox,
+        "delete" => AssetIcon::Trash,
+        _ => AssetIcon::ArrowDown,
     }
 }
 
@@ -640,14 +669,8 @@ impl ResidentPropEditorPane {
                 _ => continue,
             };
             // The face is the icon only; `label` carries the words as tooltip and
-            // accessibility label.
-            let icon = match action {
-                "askResidentToFetch" => AssetIcon::User,
-                "retry" | "retryInventoryRegistration" => AssetIcon::RefreshCw,
-                "withdraw" => AssetIcon::Inbox,
-                "delete" => AssetIcon::Delete,
-                _ => AssetIcon::ArrowDown,
-            };
+            // accessibility label. [`action_icon`] owns which glyph that is.
+            let icon = action_icon(action);
             if action == "askResidentToFetch" {
                 // 「领取」够不到许愿机 ⇒ 按钮可见但置灰，并给出「让居民去取」。
                 actions = actions.child(
@@ -729,7 +752,9 @@ impl ResidentPropEditorPane {
                             h_flex()
                                 .items_center()
                                 .gap(px(m::LEGEND_ENTRY_GAP))
-                                .child(Icon::new(AssetIcon::Delete).size(px(m::STATUS_SIZE)))
+                                .child(
+                                    Icon::new(AssetIcon::Trash).size(px(m::STATUS_SIZE)),
+                                )
                                 .child("删除"),
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1133,6 +1158,87 @@ mod tests {
             }
         })
         .unwrap();
+    }
+
+    /// The panel has exactly **one** back/undo-looking control, and it is not a
+    /// back control: 删除 wears the bin.
+    ///
+    /// Two defects this pins, both reported from the running overlay:
+    ///
+    /// 1. the delete entry drew `AssetIcon::Delete` — lucide's **tag/label**
+    ///    outline, a left-pointing polygon with a ✕ in it, which reads as 回退.
+    ///    The product's own reference is `systemImage: "trash"`; `Trash` is the
+    ///    catalog-only bin now (see `CATALOG_ONLY`).
+    /// 2. 「撤销上次」 sat in the body above the sections and emitted
+    ///    `stage.props.undo`. It is gone from this layer. The host capability is
+    ///    deliberately **kept** (`GMGNRadioApp.swift:489` still answers
+    ///    `stage.props.undo` → `world.prop.command{op:"undo"}`), so the
+    ///    assertion is on this layer's emit point, not on the op's existence.
+    #[test]
+    fn the_panel_draws_no_undo_entry_and_the_delete_entry_wears_the_bin() {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext};
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let stored = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let entity = stored.clone();
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(|cx| super::ResidentPropEditorPane::new(window, cx));
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
+        });
+        let prop = json!({
+            "objectID": "o1", "name": "长剑", "held": false, "enabled": true,
+            "longestEdge": 1.4, "holdPoint": "hand", "actions": []
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            let pane = stored.borrow().as_ref().unwrap().clone();
+            pane.update(cx, |pane, cx| {
+                let mut snapshot = pane.snapshot.clone();
+                if !snapshot.is_object() {
+                    snapshot = json!({});
+                }
+                snapshot["selected"] = prop.clone();
+                snapshot["placedOnly"] = json!(false);
+                snapshot["isSaving"] = json!(false);
+                snapshot["rowCount"] = json!(1);
+                snapshot["sections"] = json!([]);
+                // The projection still says an undo is available: the point is
+                // that this layer no longer draws a control for it.
+                snapshot["canUndo"] = json!(true);
+                pane.update_snapshot(snapshot, window, cx);
+                let _ = pane.take_commands();
+            });
+            window.render_frame(cx);
+            // The delete entry this panel is supposed to draw is still there —
+            // the icon change must not have removed the control.
+            assert!(
+                window.try_find("prop-delete").is_some(),
+                "the delete entry must still be built for a generated prop"
+            );
+            assert!(
+                window.try_find("props-undo").is_none(),
+                "「撤销上次」 must not be drawn: no undo control belongs in this panel's body"
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    /// 删除's face is the bin, **never** lucide's `delete` — that name is a
+    /// left-pointing tag/label outline, which is the glyph the entry was misread
+    /// as 回退 through while the control itself was correct.
+    #[test]
+    fn the_delete_action_wears_the_bin_not_the_tag_glyph() {
+        assert_eq!(action_icon("delete"), AssetIcon::Trash);
+        assert_ne!(action_icon("delete"), AssetIcon::Delete);
+        // The rest of the row's actions keep their own glyphs, so the fix stays
+        // local to the entry that was misread.
+        assert_eq!(action_icon("withdraw"), AssetIcon::Inbox);
+        assert_eq!(action_icon("retry"), AssetIcon::RefreshCw);
+        assert_eq!(action_icon("retryInventoryRegistration"), AssetIcon::RefreshCw);
+        assert_eq!(action_icon("askResidentToFetch"), AssetIcon::User);
+        assert_eq!(action_icon("claim"), AssetIcon::ArrowDown);
     }
 
     /// The panel title is the content on screen, so it can never contradict the
@@ -1695,19 +1801,14 @@ impl Render for ResidentPropEditorPane {
                     .child(wall),
             );
         }
-        content = content.child(
-            h_flex()
-                .w_full()
-                .child(self.control(
-                    "props-undo",
-                    "撤销上次",
-                    AssetIcon::Undo2,
-                    json!({"op":"stage.props.undo"}),
-                    self.snapshot["canUndo"].as_bool() != Some(true),
-                    cx,
-                ))
-                .child(div().flex_1()),
-        );
+        // 「撤销上次」 is gone: the panel is not a place to rewind the whole
+        // layout from, and the button sat in the panel body reading like a
+        // second back control. The **host capability is untouched** — the
+        // product still answers `stage.props.undo`
+        // (`GMGNRadioApp.swift:489` → `world.prop.command{op:"undo"}`), and the
+        // Unity probe still translates it (`inventory_ui.rs:699`), so a future
+        // surface can emit it again without touching the host. What is removed
+        // is only this layer's emit point.
         // One panel, one content scroll: the title row never scrolls.
         //
         // No `.h_full()`: the panel is content-sized and the shell pins its
