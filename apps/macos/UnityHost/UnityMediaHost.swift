@@ -95,6 +95,12 @@ final class UnityMediaHost {
     private var worldSelection: [String: Any] = [:]
     private var pendingWorldPackage: BundledLivingWorldPackage?
     private var worldSelectionTask: Task<Void, Never>?
+    private var prepareWatchdogTask: Task<Void, Never>?
+    /// Backstop for a renderer receipt that never arrives. The renderer's own
+    /// prepare budget answers first; this only covers a lost or undeliverable
+    /// `world.selection.prepared`, which used to leave the product parked on
+    /// the player surface with `phase=prepare` and no named reason anywhere.
+    private static let prepareWatchdogDelay = Duration.seconds(180)
     /// 启动默认呈现面是**空间**。启动那一次的世界进入是一个事务，冷启动时它会
     /// 输给三种竞态，而以前每一种都让整场会话留在**播放器**上：
     /// 权威还没起来（`world_authority_unavailable`，helper 冷启动）、
@@ -767,6 +773,30 @@ final class UnityMediaHost {
             NSLog("[UnityMediaHost] space startup unavailable: %@; audio/chat retained", failureCode)
         }
     }
+    /// 渲染回执没来时的宿主兜底。渲染侧自己的准备预算先到期并给出具名失败；
+    /// 这一层只覆盖"回执丢失/送不到"，它以前会让整个产品停在播放器上，
+    /// `phase=prepare` 且任何日志里都没有具名原因。
+    private func schedulePrepareWatchdog(id: String, revision: UInt64) {
+        prepareWatchdogTask?.cancel()
+        prepareWatchdogTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.prepareWatchdogDelay)
+            guard let self, !self.closed else { return }
+            guard self.worldSelection["revision"] as? UInt64 == revision,
+                  self.worldSelection["worldID"] as? String == id,
+                  self.worldSelection["phase"] as? String == "prepare",
+                  self.pendingWorldPackage?.manifest.worldID == id else { return }
+            self.prepareWatchdogTask = nil
+            self.pendingWorldPackage = nil
+            self.worldSelection["phase"] = "failed"
+            self.worldSelection["code"] = "world_prepare_unanswered"
+            self.worldSelection["message"] = "空间画面没有回应，当前空间已保留。"
+            NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=world_prepare_unanswered", id)
+            // 迟到的成功回执会因为 `phase != prepare` 被 `completeWorldSelection`
+            // 拒绝，所以这里不会和渲染侧的成功重入打架。
+            _ = self.spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
+            if self.worldSession == nil { _ = self.scheduleStartupSpaceRetry(failureCode: "world_prepare_unanswered") }
+        }
+    }
     /// 启动默认落空间的**有界**重试。次数与间隔都是常量：权威一直不起来时
     /// 仍然给出真实失败（日志 + 红字），只是不再一次失败就整场会话停在播放器。
     private func scheduleStartupSpaceRetry(failureCode: String) -> Bool {
@@ -881,6 +911,7 @@ final class UnityMediaHost {
                 NSLog("[UnityMediaHost] world selection: world=%@ phase=prepare revision=%llu", id, revision)
                 NSLog("[UnityMediaHost] world selection assets: world=%@ entries=%ld", id,
                     (catalog.snapshot()["entries"] as? [[String: Any]])?.count ?? 0)
+                schedulePrepareWatchdog(id: id, revision: revision)
             } catch {
                 pendingWorldPackage = nil
                 worldSelection = ["revision": revision, "worldID": id, "phase": "failed", "message": "空间准备失败，当前空间已保留。"]
@@ -1045,11 +1076,16 @@ final class UnityMediaHost {
               let id = value["worldID"] as? String, id == worldSelection["worldID"] as? String,
               worldSelection["phase"] as? String == "prepare", let package = pendingWorldPackage,
               let success = value["success"] as? Bool else { return false }
+        prepareWatchdogTask?.cancel(); prepareWatchdogTask = nil
         if !success {
             pendingWorldPackage = nil; worldSelection["phase"] = "failed"
-            worldSelection["code"] = "world_renderer_prepare_failed"
+            // The renderer's own named reason (timeout, rejected step, load
+            // failure) travels with the receipt so a stuck prepare is never
+            // reported as an anonymous rejection.
+            let rendererCode = value["code"] as? String ?? "world_renderer_prepare_failed"
+            worldSelection["code"] = rendererCode
             worldSelection["message"] = value["message"] as? String ?? "空间画面未能载入，原空间已保留。"
-            NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=world_renderer_prepare_failed", id)
+            NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=%@", id, rendererCode)
             _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
             return true
         }
@@ -1647,6 +1683,7 @@ final class UnityMediaHost {
         chat.close()
         worldSession?.close()
         worldSelectionTask?.cancel(); pendingWorldPackage = nil; spaceLibrary.close()
+        prepareWatchdogTask?.cancel(); prepareWatchdogTask = nil
         devicePlacement?.close()
         generationConfiguration?.close()
         screenVideo.close()

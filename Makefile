@@ -332,6 +332,11 @@ e2e-acceptance:
 
 _test-harnesses:
 	swift tools/test-first-use-guidance.swift
+	# 设置快照的**代价**门禁：每行 `selectable` 不许再用 `canSelectMotion`（它会给
+	# 每一行重建一次 `availableMotions`，一次快照 O(rows²) 拷贝，2026-10-09 真机上
+	# 占 92 ms 主线程帧的 57%，渲染侧资产装载卡在同一根主线程上）。负对照就是改前
+	# 那一行，必须红。
+	swift tools/test-presence-snapshot-projection.swift
 	# 用户可见文案门禁（用户 2026-10-02：「所有的提示，所有的错误提示和 warning 都需要
 	# 简化」）：机械扫描全量中文文案，命中内部术语 / key=value / UUID / 文件路径 /
 	# 省略号堆叠 / 打勾打叉 / 超长（>60 汉字或 >2 句）⇒ 红。豁免逐条写明理由（日志出口、

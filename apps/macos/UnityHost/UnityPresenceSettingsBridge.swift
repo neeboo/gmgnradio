@@ -77,9 +77,16 @@ final class UnityPresenceSettingsBridge {
     /// refusal only became the anonymous `settings_command_rejected`
     /// (2026-10-09 report: 选定动作报错 with nothing in any log). Names follow
     /// the authority's own vocabulary (`presence_renderer_pending`).
-    func motionSelectionRefusal(_ id: String) -> String? {
+    /// The row-independent half of [`motionSelectionRefusal`]: the refusal that
+    /// does not depend on which motion is asked about. Hoisted so a projection
+    /// can answer it once instead of once per row.
+    var selectionRefusalCode: String? {
         if operation != nil || model.isWorking { return "presence_selection_busy" }
         if pendingSelection != nil { return "presence_renderer_pending" }
+        return nil
+    }
+    func motionSelectionRefusal(_ id: String) -> String? {
+        if let code = selectionRefusalCode { return code }
         guard let motion = model.availableMotions.first(where: { $0.id == id }) else {
             return "presence_motion_unavailable"
         }
@@ -111,6 +118,21 @@ final class UnityPresenceSettingsBridge {
     var snapshot: [String: Any] {
         let orb = model.orbAppearance
         let confirmedMotionID = selectionAuthority.confirmed?.confirmedMotionID
+        // One projection pass for the whole snapshot.
+        //
+        // The rows' `selectable` flag *is* `motionSelectionRefusal`, but asking
+        // that predicate per row made every row rebuild `model.availableMotions`
+        // — a filtered copy of every motion, with String/URL/ARC traffic — so
+        // one snapshot cost O(rows²) copies. Measured on the real machine
+        // 2026-10-09: 57 % of a 92 ms host frame inside `settingsSnapshot`
+        // (`sample` stack: `settingsSnapshot` → `presenceSettings.snapshot` →
+        // `motionSelectionRefusal` → `availableMotions`), up from ~52 ms
+        // frames, while the renderer's asset load stalled behind the same main
+        // thread. The rows below are drawn from this exact list, so the answer
+        // collapses to the hoisted refusal plus the row's own compatibility —
+        // same predicate, same codes, one pass.
+        let motions = model.availableMotions
+        let refusal = selectionRefusalCode
         return ["packages": model.packages.map { package in
             ["id": package.manifest.id, "name": package.manifest.name,
              "engine": package.manifest.engine.rawValue, "active": package.isActive, "isActive": package.isActive,
@@ -119,16 +141,19 @@ final class UnityPresenceSettingsBridge {
              "author": package.manifest.author as Any? ?? NSNull(), "version": package.manifest.version,
              "thumbnailPath": package.thumbnailPath.flatMap { FileManager.default.isReadableFile(atPath: $0) ? $0 : nil } as Any? ?? NSNull(),
              "rendererAvailable": package.rendererAvailable && supportedEngines.contains(package.manifest.engine.rawValue)] as [String: Any]
-        }, "motions": model.availableMotions.map { motion in
-            let compatible = model.motionCompatibility(motion) == .compatible
-            let reason: String? = { if case .incompatible(let reason) = model.motionCompatibility(motion) { return reason }; return nil }()
+        }, "motions": motions.map { motion in
+            let compatibility = model.motionCompatibility(motion)
+            let compatible = compatibility == .compatible
+            let reason: String? = { if case .incompatible(let reason) = compatibility { return reason }; return nil }()
             return ["id": motion.id, "name": motion.name, "format": motion.format.rawValue,
                     "active": motion.id == confirmedMotionID, "builtIn": model.isBuiltInMotion(motion), "isBuiltIn": model.isBuiltInMotion(motion),
                     "detail": motion.format.rawValue, "category": MotionLibraryCategory.category(forMotionID: motion.id)?.rawValue as Any? ?? NSNull(),
                     "compatible": compatible, "reason": reason as Any? ?? NSNull(),
                     // The host's own answer to "would 选定动作 start right now",
                     // so the row can never be drawn selectable and then be refused.
-                    "selectable": canSelectMotion(motion.id)] as [String: Any]
+                    // `motion.id` is in `motions` by construction, so the only
+                    // remaining refusals are the hoisted one and incompatibility.
+                    "selectable": refusal == nil && compatible] as [String: Any]
         }, "publishedMotions": model.availablePublishedMotions.map { motion in
             let state = model.publishedMotionInstallState(motion)
             let label: String = { switch state { case .installed: "已安装"; case .updateAvailable: "更新"; case .notInstalled: "安装" } }()

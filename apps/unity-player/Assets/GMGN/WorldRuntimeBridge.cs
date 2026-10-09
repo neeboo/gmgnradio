@@ -53,6 +53,11 @@ namespace GMGN.UnityPlayer
         GaussianWorldView gaussianBackground;
         bool backgroundEnabled;
         const string VerifiedCabinWorldID = "84503420-3010-4944-8fde-2f383cd08ebe";
+        /// Renderer preparation budget. Real packages on this machine complete
+        /// in ~24 s; 120 s leaves room for a slow disk without ever parking the
+        /// selection in `prepare` forever. Expiry is a named failure, not a
+        /// success and not a silent stall.
+        static readonly TimeSpan PrepareBudget = TimeSpan.FromSeconds(120);
         WorldCameraController cameraControls;
         AmbientMode playerAmbientMode;
         Color playerAmbientLight;
@@ -350,19 +355,35 @@ namespace GMGN.UnityPlayer
             if (phase != "prepare" || selectionLoading) return;
             selectionLoading = true;
             var receipt = new JObject { ["revision"] = selection["revision"], ["worldID"] = selection["worldID"], ["success"] = false };
+            // The prepare transaction is bounded and every step is named. A
+            // renderer preparation that cannot finish must therefore surface as
+            // `phase=failed` + a named code, never as a selection parked in
+            // `prepare` with an empty log (the 2026-10-09 report: `entries=7`,
+            // then nothing for 30+ minutes).
+            using var budget = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            budget.CancelAfter(PrepareBudget);
             try {
                 if (loading || refreshing || interactions?.OwnsPointer == true) throw new InvalidOperationException("请完成当前摆放后再切换空间。");
-                var requested = (JObject)selection.DeepClone(); var token = lifetime.Token;
+                var requested = (JObject)selection.DeepClone(); var token = budget.Token;
+                Debug.Log($"[WorldPrepare] step=open world={(string)requested["worldID"]} revision={(string)requested["revision"]}");
                 stagedPackage = await Task.Run(() => FormalWorldPackage.Open((string)requested["packageRoot"], (string)requested["worldID"], (string)requested["manifestSHA256"]), token);
                 if (!(requested["record"]?["state"] is JObject state) || (string)state["worldID"] != (string)requested["worldID"])
                     throw new InvalidDataException("空间权威快照身份不一致。");
                 stagedRoot = new GameObject("Prepared world " + (string)requested["worldID"]);
                 stagedRoot.SetActive(false);
-                var loader = new GltfWorldAssetLoader(); bool sceneLoaded = false;
-                if (stagedPackage.ReadMarbleRuntime() != null)
+                // The library's default defer agent answers from a frame budget
+                // refreshed by an implicitly created component; when that
+                // answer stays `true` its `while (ShouldDefer()) await
+                // Task.Yield();` gates never return. This agent owns its clock
+                // and cannot livelock.
+                var loader = new GltfWorldAssetLoader(new WorldPrepareDeferAgent()); bool sceneLoaded = false;
+                var marble = stagedPackage.ReadMarbleRuntime();
+                Debug.Log($"[WorldPrepare] step=scene world={(string)requested["worldID"]} marble={marble != null}");
+                if (marble != null)
                     sceneLoaded = await stagedRoot.AddComponent<GaussianWorldView>().ShowFormalMarble(stagedPackage, token);
                 else foreach (var resource in (JArray)stagedPackage.Manifest["resources"]) {
                     if ((string)resource["kind"] == "scene.glb") {
+                        Debug.Log($"[WorldPrepare] step=scene.glb id={(string)resource["id"]}");
                         var scene = await loader.LoadSceneAsset(stagedPackage.ResolveResource((string)resource["id"]), token);
                         scene.transform.SetParent(stagedRoot.transform, false); sceneLoaded = true;
                     }
@@ -375,18 +396,28 @@ namespace GMGN.UnityPlayer
                 if (!sceneLoaded) throw new NotSupportedException("这个空间的背景格式尚未接入运行时切换，当前空间已保留。");
                 var stagedAssets = new GeneratedAssetResolver(backend.DataRoot, (string)requested["worldID"]);
                 stagedAssets.SetCatalog((JObject)requested["generatedAssets"]);
+                Debug.Log($"[WorldPrepare] step=items world={(string)requested["worldID"]} entries={((JArray)requested["generatedAssets"]?["entries"])?.Count ?? 0}");
                 stagedItems = await new WorldSceneRecovery(loader).RestoreState(state, stagedRoot.transform,
                     async (prop, ct) => {
                         try { return stagedPackage.ResolveAssetID((string)prop["assetID"]); }
                         catch (InvalidDataException) { return await stagedAssets.Resolve(prop, ct); }
-                    }, token, true);
+                    }, token, true,
+                    step => Debug.Log($"[WorldPrepare] {step} world={(string)requested["worldID"]}"));
                 foreach (var item in stagedItems) if (item.Status == "failed") throw new InvalidDataException("空间物件尚未完整载入。");
                 token.ThrowIfCancellationRequested();
                 stagedRoot.SetActive(false); stagedSelection = requested; receipt["success"] = true;
+                Debug.Log($"[WorldPrepare] step=ready world={(string)requested["worldID"]} items={stagedItems.Count}");
+            } catch (OperationCanceledException) when (budget.IsCancellationRequested && !lifetime.IsCancellationRequested) {
+                Debug.LogWarning($"World selection prepare failed: world={(string)selection["worldID"]}; code=world_prepare_timeout");
+                if (stagedRoot != null) Destroy(stagedRoot); stagedRoot = null; stagedSelection = null;
+                receipt["code"] = "world_prepare_timeout";
+                receipt["message"] = "空间画面准备超时，当前空间已保留。";
             } catch (Exception error) {
                 Debug.LogWarning($"World selection prepare failed: world={(string)selection["worldID"]}; type={error.GetType().Name}");
                 if (stagedRoot != null) Destroy(stagedRoot); stagedRoot = null; stagedSelection = null;
-                receipt["message"] = error is InvalidDataException || error is NotSupportedException || error is InvalidOperationException ? error.Message : "空间载入失败，当前空间已保留。";
+                var named = error is InvalidDataException || error is NotSupportedException || error is InvalidOperationException;
+                receipt["code"] = named ? "world_prepare_rejected" : "world_prepare_failed";
+                receipt["message"] = named ? error.Message : "空间载入失败，当前空间已保留。";
             } finally { selectionLoading = false; }
             SelectionPrepared?.Invoke(receipt);
             Debug.Log($"World selection prepared: world={(string)receipt["worldID"]}; success={(bool)receipt["success"]}");

@@ -65,11 +65,12 @@ namespace GMGN.UnityPlayer.World
 
         public async Task<IReadOnlyList<RecoveryItem>> RestoreState(JObject state, Transform parent,
             Func<JObject, CancellationToken, Task<string>> resolveAsset, CancellationToken cancellation,
-            bool includeInventory = false)
+            bool includeInventory = false, Action<string> onStep = null)
         {
             var objects = state["objectStates"] as JObject ?? throw new InvalidDataException("空间缺少物件状态。");
             var heldID = WorldProjectionOptional.HeldID(state);
             var result = new List<RecoveryItem>();
+            onStep?.Invoke($"step=recover.begin objects={objects.Count}");
             foreach (var entry in objects.Properties())
             {
                 cancellation.ThrowIfCancellationRequested();
@@ -81,6 +82,9 @@ namespace GMGN.UnityPlayer.World
                 if (!enabled && !includeInventory && !held) { item.Status = "disabled"; item.Message = "物件仍在库存中。"; continue; }
                 GameObject loaded = null;
                 var phase = "metadata";
+                // Named per-object progress: an object that never finishes names
+                // itself instead of leaving the prepare silent.
+                onStep?.Invoke($"step=recover.object object={entry.Name} phase={phase}");
                 try
                 {
                     var raw = (string)entry.Value["metadata"]?["gmgn.generated-prop.v1"];
@@ -90,12 +94,14 @@ namespace GMGN.UnityPlayer.World
                     if ((string)prop["objectID"] != entry.Name) throw new InvalidDataException("物件资产身份不一致。");
                     if (loader == null) { item.Status = "unsupported"; item.Message = "物件数据已保留，模型加载器尚未接入。"; continue; }
                     phase = "resolve";
+                    onStep?.Invoke($"step=recover.object object={entry.Name} phase={phase}");
                     var path = await resolveAsset(prop, cancellation);
                     phase = "transform";
                     var transform = entry.Value["transform"];
                     var position = WorldCoordinates.Position(transform?["position"]);
                     var rotation = WorldCoordinates.Rotation(transform?["rotation"]);
                     phase = "load";
+                    onStep?.Invoke($"step=recover.object object={entry.Name} phase={phase}");
                     loaded = await loader.LoadPreparedAsset(path, prop, cancellation);
                     cancellation.ThrowIfCancellationRequested();
                     if (loaded == null) throw new InvalidDataException("模型没有成功加载。");
@@ -121,6 +127,7 @@ namespace GMGN.UnityPlayer.World
                     Debug.LogWarning("[WorldRecoveryFailure] object=" + entry.Name + " phase=" + phase + " code=" + code);
                 }
             }
+            onStep?.Invoke($"step=recover.done objects={result.Count}");
             return result;
         }
     }
