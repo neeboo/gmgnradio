@@ -10,6 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::prelude::FluentBuilder;
 use gmgn_gpui_ui::primitives as ui;
 use gmgn_gpui_ui::shell::{self, TransportControl};
+use gmgn_gpui_ui::startup::{StartupCommand, StartupGatePane, StartupPhase, StartupSignals};
 use gmgn_gpui_ui::ui_tokens::chat as chat_metrics;
 use gmgn_gpui_ui::ui_tokens::scene as scene_tokens;
 use gmgn_gpui_ui::ui_tokens::shell as shell_metrics;
@@ -267,6 +268,13 @@ struct GMGNProductUI {
     dismissed_reply_revision:Option<String>,
     player_menu_open:bool,
     program_visibility_reported:Option<bool>,
+    /// 进门前的那一屏。它盖住整个窗口，直到清单上每一项都就绪、或具名失败。
+    /// 见 `gmgn_gpui_ui::startup`：与其到处暴露"没 ready"，不如一开始做一个
+    /// 有步骤名、有上限、失败具名的加载态。
+    startup_pane: Entity<StartupGatePane>,
+    /// 加载态的单调时钟原点。它只用于"过了多久"，不参与任何判定。
+    startup_started: std::time::Instant,
+    startup_phase: StartupPhase,
     _poll: Task<()>,
 }
 
@@ -316,7 +324,50 @@ impl GMGNProductUI {
         self.pending = None;
         self.accepted = false;
     }
+    /// 把"能提前判定的都提前判定"：宿主自己的三个量 + 快照里已经投影出来的块。
+    ///
+    /// 三个信号今天还**没有**宿主投影（`PlacementGeometry` / `PhysicsProbe` /
+    /// `GenerationService`，见 `startup` 模块末尾的诚实边界）：它们不会被这里
+    /// 点亮，于是对应的项会在自己的上界到点后**具名**变成"本轮不可用"，而不是
+    /// 等用户点装修/许愿时才炸。这是刻意的——不发明真相。
+    fn startup_signals(&self) -> StartupSignals {
+        let mut signals = StartupSignals::new();
+        let core = self.host.borrow().is_some();
+        let snapshot = !self.runtime_state.is_null();
+        signals.observe_host(core, snapshot, self.surface_mounted);
+        signals.observe_snapshot(&self.runtime_state);
+        signals
+    }
+    /// 加载态的命令面：重试。
+    fn drain_startup_commands(&mut self, cx: &mut Context<Self>) {
+        let commands = self.startup_pane.update(cx, |pane, _| pane.take_commands());
+        for command in commands {
+            match command {
+                StartupCommand::Retry => {
+                    // 重试的含义是"把这一轮还能重来的证据重新采一次"，不是"假装
+                    // 什么都没发生过"：
+                    // - 已经就绪的项在加载态里**保持就绪**（重试不作废做好的事）；
+                    // - 宿主自己能重采的是渲染面（`surface_mounted` 置 false，下一次
+                    //   tick 会重新 `mount`）；
+                    // - 渲染侧那些项（世界准备/摆放网格）不归这一层重试：宿主自己的
+                    //   有界重试在 `UnityMediaHost.scheduleStartupSpaceRetry`（4 次、
+                    //   1.5 s 间隔），这里只是让界面重新等它们的结论——所以重试**不会**
+                    //   把一次真失败说成成功。
+                    self.surface_mounted = false;
+                    eprintln!("GMGN_STARTUP_RETRY");
+                }
+            }
+        }
+    }
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        {
+            let signals = self.startup_signals();
+            let now_ms = self.startup_started.elapsed().as_millis() as u64;
+            self.startup_phase = self
+                .startup_pane
+                .update(cx, |pane, cx| pane.observe(&signals, now_ms, cx));
+            self.drain_startup_commands(cx);
+        }
         if let Ok(handle)=HasWindowHandle::window_handle(window) {
             if let RawWindowHandle::AppKit(handle)=handle.as_raw() {
                 for _ in 0..4 {
@@ -810,6 +861,8 @@ enum OverlaySlot {
     BoundVideo,
     CompactControls,
     CompactReply,
+    /// 进门前的那一屏。**最后**一个槽位：它要盖住上面所有东西。
+    StartupGate,
 }
 
 impl OverlaySlot {
@@ -817,6 +870,8 @@ impl OverlaySlot {
     /// and the screen-operation banner (`StageScreenOperationBanner.hitTest`
     /// returns nil; `LiveCamPanel.isPassiveDecoration`).
     fn passive(self) -> bool {
+        // The gate is deliberately **not** passive: while the world is still being
+        // prepared nothing may reach the scene through it.
         matches!(self, Self::Lyrics | Self::ScreenBanner)
     }
 }
@@ -832,6 +887,7 @@ struct OverlayState {
     notices: bool,
     screen_active: bool,
     reply: bool,
+    startup_gate: bool,
 }
 
 /// The child order of the overlay root. One function so the render and the
@@ -842,6 +898,7 @@ fn overlay_plan(state: &OverlayState) -> Vec<OverlaySlot> {
         if state.notices { slots.push(OverlaySlot::Notices); }
         if state.chat_open { slots.push(OverlaySlot::Composer); }
         if state.reply { slots.push(OverlaySlot::CompactReply); }
+        if state.startup_gate { slots.push(OverlaySlot::StartupGate); }
         slots
     } else {
         let mut slots = vec![OverlaySlot::Lyrics, OverlaySlot::Transport, OverlaySlot::Destination];
@@ -852,6 +909,7 @@ fn overlay_plan(state: &OverlayState) -> Vec<OverlaySlot> {
         if state.program_open { slots.push(OverlaySlot::Program); }
         if state.props_open { slots.push(OverlaySlot::Props); }
         if state.bound_video { slots.push(OverlaySlot::BoundVideo); }
+        if state.startup_gate { slots.push(OverlaySlot::StartupGate); }
         slots
     }
 }
@@ -944,8 +1002,9 @@ impl Render for GMGNProductUI {
             .filter(|_|self.compact)
             .filter(|_|latest_reply_revision(&self.runtime_state)!=self.dismissed_reply_revision);
         let screen_active=self.runtime_state["screenOperation"]["active"].as_bool()==Some(true);
+        let startup_gate=self.startup_pane.read(cx).covers_window();
         let plan=overlay_plan(&OverlayState{compact:self.compact,chat_open:self.chat_open,stage_panel_open:self.stage_panel_open,
-            program_open:self.program_open,props_open:self.props_open,bound_video,notices:notice_count>0,screen_active,reply:reply.is_some()});
+            program_open:self.program_open,props_open:self.props_open,bound_video,notices:notice_count>0,screen_active,reply:reply.is_some(),startup_gate});
         for slot in &plan {
             root=match slot {
                 OverlaySlot::Lyrics=>root.child(div().absolute().size_full().child(self.lyrics_pane.clone())),
@@ -1045,6 +1104,8 @@ impl Render for GMGNProductUI {
                     root.child(div().absolute().right(px(22.)).bottom(px(82.)).w(px(stage_metrics::PROP_EDITOR_WIDTH)).h(px(panel_height)).child(self.prop_pane.clone()))
                 }
                 OverlaySlot::BoundVideo=>root.child(div().absolute().top(px(28.)).right(px(32.)).w(px(330.)).h(px(58.)).child(self.bound_video_pane.clone())),
+                // 进门前的那一屏：整窗、最上层，直到清单就绪或具名失败。
+                OverlaySlot::StartupGate=>root.child(div().id("startup.cover").absolute().size_full().child(self.startup_pane.clone())),
                 OverlaySlot::CompactReply=>match &reply {
                     Some(reply)=>{
                         // `LiveCamPanel.swift:828-834,902-918`: 12 pt radius,
@@ -1184,7 +1245,7 @@ mod layout_tests {
     use super::{scene_tokens,shell_metrics,stage_metrics};
     use super::IconName;
     fn overlay_state(compact:bool,chat_open:bool,notices:bool,screen_active:bool,reply:bool)->OverlayState {
-        OverlayState{compact,chat_open,stage_panel_open:false,program_open:false,props_open:false,bound_video:false,notices,screen_active,reply}
+        OverlayState{compact,chat_open,stage_panel_open:false,program_open:false,props_open:false,bound_video:false,notices,screen_active,reply,startup_gate:false}
     }
     #[test]
     fn stage_composer_preserves_original_margins_and_maximums() {
@@ -1252,6 +1313,11 @@ mod layout_tests {
             +2.*stage_metrics::SIDE_INSET+(children-1) as f32*stage_metrics::GROUP_GAP+shell_metrics::TRANSPORT_ROUNDING;
         assert_eq!(derived,shell_metrics::TRANSPORT_WIDTH);
         let mut controls=(0..10).map(|_|TransportControl::new("regular","regular",IconName::Music,"regular")).collect::<Vec<_>>();
+        // 下首 承载整条 bar 唯一的分组分隔线。产品路径在 `TRANSPORT_CONTROLS`
+        // 的循环里就是 `.ends_group(id=="next")`（本文件上方），shell 自己的
+        // 单测也把 `controls[3]` 标成 `ends_group(true)`。这个向量原先漏了这
+        // 一步，于是少算 1 pt 分隔线加它带来的一个 6 pt gap（577 而非 584）。
+        controls[3]=controls[3].clone().ends_group(true);
         controls.push(visual);
         assert_eq!(gmgn_gpui_ui::shell::transport_width(&controls),shell_metrics::TRANSPORT_WIDTH);
         assert_eq!([shell_metrics::TRANSPORT_WIDTH,shell_metrics::TRANSPORT_HEIGHT,scene_tokens::PANEL_RADIUS_SMALL],[584.,48.,16.]);
@@ -1299,6 +1365,31 @@ mod layout_tests {
         assert_eq!(passive,[0,3]);
         let plan=overlay_plan(&overlay_state(true,true,true,false,true));
         assert!(plan.iter().all(|slot|!slot.passive()));
+    }
+    /// 进门前那一屏是**最后一个**槽位，而且**不是**被动区。
+    ///
+    /// 两条都要：它不是最后就盖不住弹出面板/通知；它是被动区的话，世界还没准备好
+    /// 时指针会穿过加载态落到场景上。把这一项移出加载态（`startup_gate` 不再进
+    /// plan、或 `passive()` 把它算进去）在这里直接红。
+    #[test]
+    fn the_startup_gate_is_the_last_slot_and_eats_scene_input() {
+        use OverlaySlot::*;
+        assert!(!StartupGate.passive(), "the gate must not pass pointer events to the scene");
+        assert!(Lyrics.passive() && ScreenBanner.passive());
+        let mut state=overlay_state(false,true,true,true,false);
+        state.startup_gate=true;
+        let plan=overlay_plan(&state);
+        assert_eq!(plan.last(),Some(&StartupGate));
+        // 它出现时前面一个都不许动：composer 的下拉区索引仍然对。
+        assert_eq!(plan.iter().position(|slot|*slot==Composer),Some(5));
+        assert_eq!(plan.iter().filter(|slot|**slot==StartupGate).count(),1);
+        let mut compact=overlay_state(true,true,true,false,true);
+        compact.startup_gate=true;
+        let plan=overlay_plan(&compact);
+        assert_eq!(plan.last(),Some(&StartupGate));
+        assert_eq!(plan.iter().position(|slot|*slot==Composer),Some(2));
+        // 就绪之后它必须彻底消失（不是透明盖着）。
+        assert_eq!(overlay_plan(&overlay_state(false,true,true,true,false)).iter().position(|slot|*slot==StartupGate),None);
     }
     /// Every surface the shell paints is a fixed original literal, so a light
     /// system theme can never invert a panel that floats over the scene.
@@ -1436,6 +1527,7 @@ fn main() {
                 let prop_pane=cx.new(|cx|ResidentPropEditorPane::new(window,cx));
                 let lyrics_pane=cx.new(|cx|StageLyricsPane::new(window,cx));
                 let bound_video_pane=cx.new(|cx|StageBoundVideoPromptPane::new(window,cx));
+                let startup_pane=cx.new(StartupGatePane::new);
                 let poll = cx.spawn_in(window, async move |view, cx| {
                     loop {
                         cx.background_executor().timer(Duration::from_millis(100)).await;
@@ -1445,7 +1537,8 @@ fn main() {
                 GMGNProductUI { host: host.clone(), pane, settings_pane, settings_window:None, inbox_pane, inbox_window:None, stage_pane,stage_panel_open:false,
                     program_pane,program_open:false,program_backdrop:Rc::new(RefCell::new(None)),lyrics_layer:Rc::new(RefCell::new(None)),prop_pane,lyrics_pane,lyrics_error_logged:None,bound_video_pane,props_open:false,chat_open:false,composer_focus_pending:false, voice_held:false, pending: None, accepted: false,
                     transcript: vec![], compact, core_notice, runtime_state: serde_json::Value::Null,
-                    surface_mounted: false,navigation_revision:0,error_notice_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None, _poll: poll }
+                    surface_mounted: false,navigation_revision:0,error_notice_revision:0,main_window:main_window.clone(),profile_switch_pending:false,dismissed_reply_revision:None,player_menu_open:false,program_visibility_reported:None,
+                    startup_pane,startup_started:std::time::Instant::now(),startup_phase:StartupPhase::Preparing, _poll: poll }
             });
             *main_ui.borrow_mut()=Some(view.clone());
             cx.new(|cx| gpui_kit::base::Root::new(view, window, cx).bg(rgba(chrome::WINDOW_CLEAR)))

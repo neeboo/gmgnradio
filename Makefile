@@ -348,9 +348,19 @@ _test-harnesses:
 	# 改前每轮多出整树 `DeepClone` ＋ `ToString`→`JObject.Parse` 字符串往返 ＋ 一次
 	# UTF-16 中转；2026-10-09 真机 `sample` 经 `mono_pmip` 解析后，主线程 71% 落在
 	# 这条 Newtonsoft 树上，就是「切全屏会卡」那一帧。判据两半都在：载荷必须与改前
-	# 逐字节相同（无 BOM），且中位耗时不得超过改前的 60%；负对照是 HEAD 的源码与
-	# 改前的实现，都必须红。
+	# 逐字节相同（无 BOM），且中位耗时不得超过改前的 60%；负对照是**真正的改前修订**
+	# （脚本从 HEAD 往回找第一条 6 条结构还全红的祖先）+ 改前的实现，都必须红。
+	# 固定读 `HEAD:` 会在修复随 e474e0a 进版之后把负对照读成绿（build 230 实测），
+	# 所以锚点是「改前修订」，不是「HEAD」。
 	$(PYTHON) tools/test-gpui-projection-cost.py
+	# 全屏**转场**门禁：转场那一帧不许再做整内容重绘（`tools/test-viewport-transition-defer.py`，
+	# 用 Unity 自带的 Roslyn 编 `ViewportTransition.cs` 真跑）。2026-10-09 真机 4096x2304
+	# 进全屏：`Metal RecreateSurface` 之后同一帧的歌词重建是 `rebuildMs=422.807`，其中
+	# `warmFontsMs=411.747`（同一处 resize 在热过之后只有 `rebuildMs=0.698`）。GPUI overlay
+	# 是挂在这个进程里的 NSView，所以这 411 ms 就是转场里「没有 overlay 帧」的那一段。
+	# 判据两半都在：编译出来的窗口必须盖住实测 795 ms 动画且仍有界，一次性 warm 必须落在
+	# 窗口外；负对照是 HEAD 的源码（7 条结构全红）与 HEAD 的无条件重建（warm 落在转场内）。
+	$(PYTHON) tools/test-viewport-transition-defer.py
 	# 用户可见文案门禁（用户 2026-10-02：「所有的提示，所有的错误提示和 warning 都需要
 	# 简化」）：机械扫描全量中文文案，命中内部术语 / key=value / UUID / 文件路径 /
 	# 省略号堆叠 / 打勾打叉 / 超长（>60 汉字或 >2 句）⇒ 红。豁免逐条写明理由（日志出口、

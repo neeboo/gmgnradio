@@ -27,7 +27,12 @@ struct WorldAgentToolResponse: Codable, Equatable, Sendable {
 @MainActor
 final class WorldAgentToolDispatcher {
     var availableMotions: @MainActor () -> [WorldAgentMotionOption] = { [] }
-    var selectMotion: @MainActor (String) -> Bool = { _ in false }
+    /// Async because the host's implementation has to wait for the preparation
+    /// stop it begins itself (`prepareManualMotionSelection` → `presence.motion.stop`)
+    /// before it may ask the selection gate. A sync `Bool` closure forced that
+    /// stop and the selection into one turn, and the gate then refused the
+    /// selection with `side=bridge op=presence.motion.stop ageMs=0` (2026-10-09).
+    var selectMotion: @MainActor (String) async -> Bool = { _ in false }
     private struct MotionArguments: Decodable {
         let motionID: String
         enum CodingKeys: String, CodingKey { case motionID = "motion_id" }
@@ -158,8 +163,9 @@ final class WorldAgentToolDispatcher {
                 message = "已读取当前角色全部可播放动作，使用 motions 中的精确 ID"
             case "play_motion":
                 let arguments = try decode(MotionArguments.self, from: call.argumentsJSON)
-                guard availableMotions().contains(where: { $0.id == arguments.motionID }),
-                      selectMotion(arguments.motionID) else {
+                let available = availableMotions().contains(where: { $0.id == arguments.motionID })
+                let selected = available ? await selectMotion(arguments.motionID) : false
+                guard selected else {
                     return makeResult(callID: call.id, ok: false, code: "motion_unavailable",
                         message: "动作未安装、不兼容当前角色或角色仍在载入；请重新读取 list_available_motions")
                 }

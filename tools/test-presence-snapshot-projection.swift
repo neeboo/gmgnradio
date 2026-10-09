@@ -166,7 +166,8 @@ let pendingFixed = """
     static let rendererAckBudget: TimeInterval = 180
     var selectionRefusalCode: String? {
         _ = expireStalePendingRenderer()
-        return gate.refusal(isWorking: model.isWorking, hasPendingSelection: pendingSelection != nil)
+        reclaimStaleMarkers()
+        return gate.refusal(modelSelection: model.isSelectionWorking, hasPendingSelection: pendingSelection != nil)
     }
     private func publish() {
         if let state=selectionAuthority.confirmed,state.pendingRenderer {

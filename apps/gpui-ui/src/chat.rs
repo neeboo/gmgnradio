@@ -228,11 +228,47 @@ pub fn compact_composer_height(state: &ChatState) -> f32 {
     }
 }
 
+/// 小窗's chat column box: where the chat pane is mounted while the compact
+/// window draws it **in place**.
+///
+/// The original's compact window shows the same chat column, re-anchored:
+/// `.compact-window .chat-column { position:absolute; left:8px; right:48px;
+/// bottom:8px; height:244px; max-height:92%; }` (`Player.uss:102`). The right
+/// edge is the **reserved** Live Cam control column — the same
+/// [`m::COMPACT_COLUMN_RIGHT`] every other compact surface stops at — so the
+/// column never paints under the 30 pt menu.
+///
+/// `window_height` is the real viewport height: the 244 pt height is capped by
+/// the original's `max-height: 92%`, so a window shorter than the column shrinks
+/// it instead of painting it out of its own content box (224×336 keeps the full
+/// 244: 244 ≤ 0.92 × 336 = 309.12).
+pub fn compact_column(window_height: f32) -> Div {
+    div()
+        .absolute()
+        .left(px(m::COMPACT_COLUMN_LEFT))
+        .right(px(m::COMPACT_COLUMN_RIGHT))
+        .bottom(px(m::COMPACT_COLUMN_BOTTOM))
+        .h(px(
+            m::COMPACT_COLUMN_HEIGHT.min((window_height * m::COMPACT_COLUMN_MAX_HEIGHT).max(0.)),
+        ))
+        .flex()
+        .flex_col()
+        .gap(px(s::PANEL_GAP))
+        .min_h_0()
+        .min_w_0()
+        .overflow_hidden()
+}
+
 pub struct ResidentChatPane {
     input: Entity<TextareaState>,
     state: ChatState,
     _subscription: Subscription,
     compact: bool,
+    /// 小窗's chat column (`Player.uss:102`): the same pane drawn in the compact
+    /// window's own box, where the message list flexes instead of holding the
+    /// stage window's fixed 132 pt. Distinct from [`Self::compact`], which is
+    /// the Live Cam **composer** the product App pins to 70/140 pt.
+    compact_column: bool,
     thumbnails: HashMap<String, AttachmentThumbnail>,
     asr_error: Option<String>,
     input_focused: bool,
@@ -276,6 +312,7 @@ impl ResidentChatPane {
             state: ChatState::default(),
             _subscription: subscription,
             compact: false,
+            compact_column: false,
             thumbnails: HashMap::new(),
             asr_error: None,
             input_focused: false,
@@ -292,11 +329,46 @@ impl ResidentChatPane {
             cx.notify();
         }
     }
+    /// Draw this pane as 小窗's chat column ([`compact_column`]): the message list
+    /// flexes to the column's height so the composer keeps its own
+    /// (`.compact-window .messages { height: 0; flex-grow: 1; }`,
+    /// `.compact-window .draft { height: 72px; }`, `Player.uss:102,110,114`).
+    /// The window shape is the host's fact; this only says which of the two chat
+    /// layouts the pane paints.
+    pub fn compact_column(mut self, compact_column: bool) -> Self {
+        self.compact_column = compact_column;
+        self
+    }
+    pub fn set_compact_column(&mut self, compact_column: bool, cx: &mut Context<Self>) {
+        if self.compact_column != compact_column {
+            self.compact_column = compact_column;
+            cx.notify();
+        }
+    }
     pub fn take_commands(&mut self) -> Vec<ChatCommand> {
         self.state.take_commands()
     }
     pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.input.read(cx).focus_handle(cx), cx);
+    }
+    /// The composer's **live text**, read from the same `TextareaState` the user
+    /// edits — not from the mirrored draft. A behavioural test (cut/copy/paste/
+    /// select-all/undo) needs the real field, and the mirror is only updated by
+    /// the `InputEvent::Change` subscription, so reading the entity is the only
+    /// honest answer.
+    pub fn composer_text(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+    /// The composer entity, so a harness can assert focus without synthesising a
+    /// click (this crate's probes are forbidden from synthetic input).
+    pub fn composer_input(&self) -> Entity<TextareaState> {
+        self.input.clone()
+    }
+    /// The draft the **send path** would submit: [`ChatState`]'s mirror of the
+    /// field, updated only by `InputEvent::Change`. Pasting has to move this too,
+    /// or the text is visible but unsendable.
+    pub fn draft(&self) -> &str {
+        &self.state.draft
     }
     /// A native ASR result edits the current composer; it never submits a turn.
     pub fn append_voice_transcript(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -460,26 +532,45 @@ impl ResidentChatPane {
             );
         }
         let reply = self.state.reply.clone();
-        h_flex()
+        // The transcript holds the stage window's fixed 132 pt; 小窗's column
+        // gives it `height: 0; flex-grow: 1` instead, so the 244 pt column
+        // always leaves the composer its own height (`Player.uss:110`).
+        let mut transcript = div()
+            .id("resident-transcript")
+            .overflow_y_scroll()
+            .accessibility_id("stage.resident-transcript");
+        transcript = if self.compact_column {
+            // The compact column flexes the card; the transcript fills the card
+            // it was given (`.compact-window .messages { height:0;
+            // flex-grow:1 }`), so its own content height can never push it over
+            // the composer below.
+            transcript.w(px(0.)).flex_1().h_full().min_h_0()
+        } else {
+            // The stage window's fixed 132 pt transcript, exactly as it was:
+            // `flex_1` follows the fixed height, so the box grows along the row
+            // and shrinks with it.
+            transcript
+                .h(px(m::HISTORY_HEIGHT))
+                .flex_shrink_0()
+                .flex_grow_0()
+                .w(px(0.))
+                .flex_1()
+        };
+        let mut row = h_flex()
             .items_start()
             .gap(px(m::HISTORY_GAP))
             .px(px(m::HISTORY_PADDING_H))
             .py(px(m::HISTORY_PADDING_V))
             .rounded(px(m::HISTORY_RADIUS))
             .bg(rgba(s::PANEL_BG))
-            .w_full()
-            .child(
-                div()
-                    .id("resident-transcript")
-                    .h(px(m::HISTORY_HEIGHT))
-                    .flex_shrink_0()
-                    .flex_grow_0()
-                    .w(px(0.))
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .accessibility_id("stage.resident-transcript")
-                    .child(entries),
-            )
+            .w_full();
+        if self.compact_column {
+            row = row.flex_1().min_h_0();
+        }
+        row
+            // Registered for the layout tests (`try_find` reads the real painted
+            // box); a no-op without gpui-kit's `test-support` feature.
+            .child(transcript.child(entries).test_support())
             .when(!self.state.reply.is_empty(), |row| {
                 row.child(
                     Button::new("copy-resident-reply")
@@ -718,6 +809,7 @@ impl ResidentChatPane {
     fn composer_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let chrome = composer_chrome(self.drop_targeted, self.input_focused);
         let mut card = v_flex()
+            .id("resident-composer-card")
             .gap(px(m::CARD_GAP))
             .p(px(m::CARD_PADDING))
             .rounded(px(m::CARD_RADIUS))
@@ -796,6 +888,9 @@ impl ResidentChatPane {
         }
         card.child(input)
             .child(self.control_row(cx))
+            // Registered for the layout tests, which read the real painted box
+            // of the composer (input + controls) instead of re-deriving it.
+            .test_support()
             .into_any_element()
     }
 }
@@ -811,8 +906,16 @@ impl Render for ResidentChatPane {
         if self.compact {
             // The Live Cam panel pins this to 70/140 pt; the composer card fills it.
             column = column.h_full();
-        } else if history_visible(&self.state) {
-            column = column.child(self.history_card(cx));
+        } else {
+            if history_visible(&self.state) {
+                column = column.child(self.history_card(cx));
+            }
+            // 小窗 hands the pane an exact box ([`compact_column`]); the pane
+            // fills it so the message list flexes and the composer keeps its own
+            // height. The stage window is content-sized and keeps its ceiling.
+            if self.compact_column {
+                column = column.h_full().min_h_0();
+            }
         }
         let drop_entity = cx.entity().downgrade();
         column
@@ -1047,5 +1150,56 @@ mod tests {
             window.draw(cx).clear(cx);
         })
         .unwrap();
+    }
+
+    /// 小窗's chat column is the original's own box — the Unity build's
+    /// `.compact-window .chat-column { position:absolute; left:8px; right:48px;
+    /// bottom:8px; height:244px; max-height:92%; }` (`Player.uss:102`) — read
+    /// back out of the real style, so re-anchoring it (or letting it stretch to
+    /// the whole window) turns this red.
+    #[test]
+    fn the_compact_column_is_the_originals_chat_column_box() {
+        use gpui_kit::{Styled, div, px, relative};
+        assert_eq!(
+            [
+                m::COMPACT_COLUMN_LEFT,
+                m::COMPACT_COLUMN_BOTTOM,
+                m::COMPACT_COLUMN_HEIGHT,
+                m::COMPACT_COLUMN_MAX_HEIGHT,
+            ],
+            [8., 8., 244., 0.92]
+        );
+        // The right edge is the reserved Live Cam control column, not a second
+        // number that could drift away from it.
+        assert_eq!(m::COMPACT_COLUMN_RIGHT, crate::ui_tokens::shell::COMPACT_CONTENT_RIGHT);
+        let mut column = compact_column(336.);
+        assert_eq!(
+            column.style().position,
+            div().absolute().style().position,
+            "the column floats inside the compact window"
+        );
+        assert_eq!(column.style().inset.left, div().left(px(8.)).style().inset.left);
+        assert_eq!(column.style().inset.right, div().right(px(48.)).style().inset.right);
+        assert_eq!(column.style().inset.bottom, div().bottom(px(8.)).style().inset.bottom);
+        assert_eq!(
+            column.style().size.height,
+            div().h(px(244.)).style().size.height,
+            "224×336 keeps the original's full 244 pt (92 % of 336 is 309.12)"
+        );
+        assert_eq!(
+            column.style().flex_direction,
+            div().flex().flex_col().style().flex_direction
+        );
+        assert_eq!(column.style().min_size.height, div().min_h_0().style().min_size.height);
+        // A window shorter than the column shrinks it instead of painting it out
+        // of its own content box: 92 % of 200 is 184.
+        assert_eq!(
+            compact_column(200.).style().size.height,
+            div().h(px(184.)).style().size.height
+        );
+        assert!(
+            compact_column(0.).style().size.height.is_some(),
+            "the cap never becomes a negative height"
+        );
     }
 }

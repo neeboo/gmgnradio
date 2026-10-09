@@ -263,7 +263,25 @@ pub fn request(db: &mut Connection, method: &str, p: &Value) -> Result<Value> {
             if used {
                 return Err("agent_loop_run_conflict");
             }
-            let executing: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_loop_events WHERE world=?1 AND scope=?2 AND state IN ('claimed','cancel_requested','unknown'))",params![world,scope],|r|r.get(0)).map_err(|_|"storage_unavailable")?;
+            // A turn is **executing** only while one of its events is genuinely in
+            // flight. An `unknown` event is the durable record of a turn whose
+            // invocation already returned — or whose owning host session is gone —
+            // and whose side effects are still unconfirmed: every writer of
+            // `unknown` (`recover` at daemon start, `agent_loop_configure` for a
+            // foreign session, and the run tails in `agent_runtime` / `agent_cli` /
+            // `agent_claude` / `agent_dsh`) runs *after* the invocation returned.
+            // Counting it here (the rule until 2026-10-09) let the daemon poison
+            // its own scope: `recover()` rewrote one orphaned turn from the
+            // previous build into `unknown`, and from then on every
+            // `agent_loop_claim` for that world+scope answered `claimed:false` for
+            // the life of the database — a human message stayed `queued` and its
+            // event stayed `pending` forever, so chat looked dead however many
+            // times the user pressed send. The DSH tool gate was corrected the same
+            // way (`agent_dsh_stale_unconfirmed_tools`); the row is still kept —
+            // never rewritten to a terminal state without the host's own
+            // verification — it just stops gating unrelated turns.
+            let executing: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_loop_events WHERE world=?1 AND scope=?2 AND state IN ('claimed','cancel_requested'))",params![world,scope],|r|r.get(0)).map_err(|_|"storage_unavailable")?;
+            let stale: i64=tx.query_row("SELECT count(*) FROM agent_loop_events WHERE world=?1 AND scope=?2 AND state='unknown'",params![world,scope],|r|r.get(0)).map_err(|_|"storage_unavailable")?;
             let limit = c["hourlyLimit"].as_i64().unwrap_or(0);
             let interval = c["minimumWakeIntervalSeconds"].as_i64().unwrap_or(1) * 1000;
             if blocked || executing {
@@ -333,6 +351,23 @@ pub fn request(db: &mut Connection, method: &str, p: &Value) -> Result<Value> {
                             || (e["kind"] == "background" && !flag(&c, "backgroundEnabled", false)))
                     {
                         continue;
+                    }
+                    if stale > 0 {
+                        // Named, readable and never silent — emitted at most once
+                        // per granted turn, because that is exactly the moment the
+                        // unconfirmed record stops gating: the effect of those
+                        // turns is still unconfirmed, we just no longer pretend a
+                        // new turn could learn it.
+                        eprintln!(
+                            "gmgn-taskd: {}",
+                            json!({
+                                "event": "recovered",
+                                "code": "agent_loop_stale_unconfirmed_turns",
+                                "worldID": world,
+                                "residentScope": scope,
+                                "count": stale,
+                            })
+                        );
                     }
                     tx.execute("UPDATE agent_loop_events SET state='claimed',run=?4,session=?5,claimed_at=?6 WHERE world=?1 AND scope=?2 AND event=?3",params![world,scope,event,run,session,now]).map_err(|_|"storage_unavailable")?;
                     if human {
@@ -618,7 +653,7 @@ mod tests {
         assert_eq!(snapshot["events"][0]["state"], "pending");
     }
     #[test]
-    fn human_available_editing_unknown_and_cancel_still_gate() {
+    fn human_available_editing_and_cancel_still_gate() {
         let mut db = setup();
         human(&mut db, "h", "m", "input").unwrap();
         call(&mut db,"agent_loop_configure",json!({"hostSessionID":"h","hourlyLimit":0,"minimumWakeIntervalSeconds":1,"editing":true})).unwrap();
@@ -652,15 +687,20 @@ mod tests {
         .unwrap();
         recover(&db).unwrap();
         human(&mut db, "later", "m3", "input3").unwrap();
-        assert_eq!(
-            call(
-                &mut db,
-                "agent_loop_claim",
-                json!({"nowMillis":5000,"runID":"new","hostSessionID":"h"})
-            )
-            .unwrap()["claimed"],
-            false
-        );
+        // `recover()` names the orphaned turn `unknown` — that is an honest record,
+        // not a lease. Until 2026-10-09 this last assertion read `false`, i.e. the
+        // suite pinned the very rule that locked the resident out of chat: one
+        // orphaned turn from the previous build made every later claim answer
+        // `claimed:false` for the life of the database. The three gates above
+        // (`available` / `editing` / `cancel`) still gate; `unknown` does not.
+        let recovered = call(
+            &mut db,
+            "agent_loop_claim",
+            json!({"nowMillis":5000,"runID":"new","hostSessionID":"h"}),
+        )
+        .unwrap();
+        assert_eq!(recovered["claimed"], true);
+        assert_eq!(recovered["eventID"], "later");
     }
     #[test]
     fn steering_admission_is_durable_unknown_input_cannot_replay() {
@@ -1085,15 +1125,18 @@ mod tests {
             call(&mut db, "agent_loop_read", json!({})).unwrap()["events"][0]["state"],
             "unknown"
         );
-        assert_eq!(
-            call(
-                &mut db,
-                "agent_loop_claim",
-                json!({"nowMillis":3000,"runID":"fresh","hostSessionID":"new"})
-            )
-            .unwrap()["claimed"],
-            false
-        );
+        // 旧回合的 `unknown` 不是租约（见 `agent_loop_claim`）：换了宿主之后可以继续，
+        // 但领到的是**下一个**待办事件，绝不是那个未确认的 `a` —— 这才是本用例要的
+        // "do not replay"。直到 2026-10-09 这里写的是 `claimed: false`，即把
+        // "永不复用旧回合"错写成了"整个 world+scope 永久停摆"。
+        let after_host_change = call(
+            &mut db,
+            "agent_loop_claim",
+            json!({"nowMillis":3000,"runID":"fresh","hostSessionID":"new"}),
+        )
+        .unwrap();
+        assert_eq!(after_host_change["claimed"], true);
+        assert_eq!(after_host_change["eventID"], "b");
         let verified = json!({"eventID":"a","runID":"r","hostSessionID":"new","originalHostSessionID":"h","outcome":"completed","receipt":{"verified":true}});
         assert_eq!(
             call(&mut db, "agent_loop_reconcile", verified.clone()).unwrap()["duplicate"],
@@ -1103,14 +1146,19 @@ mod tests {
             call(&mut db, "agent_loop_reconcile", verified).unwrap()["duplicate"],
             true
         );
+        // 对账之后 `a` 是终态，永远不会再被当成待办领走；也没有别的待办留下。
+        assert_eq!(
+            call(&mut db, "agent_loop_read", json!({})).unwrap()["events"][0]["state"],
+            "completed"
+        );
         assert_eq!(
             call(
                 &mut db,
                 "agent_loop_claim",
-                json!({"nowMillis":3000,"runID":"fresh","hostSessionID":"new"})
+                json!({"nowMillis":6000,"runID":"after-reconcile","hostSessionID":"new"})
             )
-            .unwrap()["eventID"],
-            "b"
+            .unwrap()["claimed"],
+            false
         );
     }
     #[test]
@@ -1166,7 +1214,7 @@ mod tests {
         );
     }
     #[test]
-    fn unknown_cancel_does_not_unlock_scope() {
+    fn unknown_cancel_does_not_settle_the_record() {
         let mut db = setup();
         enqueue(&mut db, "a", "background");
         enqueue(&mut db, "b", "background");
@@ -1181,20 +1229,80 @@ mod tests {
         assert_eq!(cancel["cancelled"], false);
         assert_eq!(cancel["requiresVerification"], true);
         assert_eq!(
-            call(
-                &mut db,
-                "agent_loop_claim",
-                json!({"nowMillis":5000,"runID":"next","hostSessionID":"h"})
-            )
-            .unwrap()["claimed"],
-            false
+            call(&mut db, "agent_loop_read", json!({})).unwrap()["events"][0]["state"],
+            "unknown"
         );
+        // Cancelling an unconfirmed execution must not settle it: the record stays
+        // `unknown` for the host's own reconciliation, and `agent_loop_confirm_cancel`
+        // cannot launder it (asserted below). It must not, however, hold the whole
+        // scope hostage — `unknown` is not a lease, so the next turn is claimable.
+        // Until 2026-10-09 the assertion here read `false`, which is the permanent
+        // lock the real device hit.
+        let next = call(
+            &mut db,
+            "agent_loop_claim",
+            json!({"nowMillis":5000,"runID":"next","hostSessionID":"h"}),
+        )
+        .unwrap();
+        assert_eq!(next["claimed"], true);
+        assert_eq!(next["eventID"], "b");
         assert!(call(
             &mut db,
             "agent_loop_confirm_cancel",
             json!({"eventID":"a","runID":"r","hostSessionID":"h","receipt":{}})
         )
         .is_err());
+    }
+    /// 真机 2026-10-09 18:58 的形状，逐字复现：build 229 的 daemon 启动时
+    /// `recover()` 把上一版遗留的 `claimed` 回合命名成 `unknown`（诚实记录：我们
+    /// 没学到效果），接着用户发一条消息。`unknown` 不是租约 —— 调度器必须还能把
+    /// 这条人类消息领起来。否则人类消息行永远停在 `queued`、事件永远停在
+    /// `pending`，而界面上既没有回复也没有报错（宿主在 `guard let ticket else
+    /// { return }` 处静默），于是「装了 229 之后聊天还是发不出去」。
+    #[test]
+    fn a_recovered_unconfirmed_turn_does_not_starve_the_next_human_message() {
+        let mut db = setup();
+        human(&mut db, "first", "m1", "input1").unwrap();
+        let claimed = call(
+            &mut db,
+            "agent_loop_claim",
+            json!({"nowMillis":1000,"runID":"r1","hostSessionID":"h","eventID":"first"}),
+        )
+        .unwrap();
+        assert_eq!(claimed["claimed"], true);
+        // 宿主没有结算这一轮：build 228 的应用在中途退出，daemon 重启时把它命名。
+        recover(&db).unwrap();
+        assert_eq!(
+            call(&mut db, "agent_loop_read", json!({})).unwrap()["events"][0]["state"],
+            "unknown"
+        );
+        human(&mut db, "second", "m2", "input2").unwrap();
+        let next = call(
+            &mut db,
+            "agent_loop_claim",
+            json!({"nowMillis":5000,"runID":"r2","hostSessionID":"h","eventID":"second"}),
+        )
+        .unwrap();
+        assert_eq!(next["claimed"], true);
+        assert_eq!(next["eventID"], "second");
+        let read = call(&mut db, "agent_loop_read", json!({})).unwrap();
+        let message = read["humanMessages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["messageID"] == "m2")
+            .unwrap();
+        assert_eq!(message["state"], "claimed");
+        // 诚实记录仍在：旧回合没有被猜成 completed/failed，也没有被改写。
+        assert_eq!(
+            read["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["eventID"] == "first")
+                .unwrap()["state"],
+            "unknown"
+        );
     }
     #[test]
     fn separate_connections_cancel_and_claim_never_overlap() {

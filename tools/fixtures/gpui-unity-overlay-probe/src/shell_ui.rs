@@ -542,7 +542,22 @@ impl ShellPane {
         let Some(index) = self.panes.iter().position(|(name, _)| name == label) else {
             return;
         };
+        if label == "聊天" {
+            self.sync_chat_surface(cx);
+        }
         self.set_panel(Some(index), cx);
+    }
+    /// Tell the shared chat pane which of its two layouts **this** window draws:
+    /// 小窗's in-place column ([`gmgn_gpui_ui::chat::compact_column`]) or the
+    /// stage window's floating panel. One flag, one writer, and nothing here
+    /// reads or writes the window mode or its size.
+    fn sync_chat_surface(&self, cx: &mut Context<Self>) {
+        let compact = compact_window(&self.snapshot);
+        crate::PANE.with(|slot| {
+            if let Some(pane) = slot.borrow().as_ref() {
+                pane.update(cx, |pane, cx| pane.set_compact_column(compact, cx));
+            }
+        });
     }
     fn set_panel(&mut self, selected: Option<usize>, cx: &mut Context<Self>) -> bool {
         if enqueue_ui_command(
@@ -623,6 +638,11 @@ impl ShellPane {
         }
         let changed = self.snapshot["music"]["volume"] != snapshot["music"]["volume"];
         self.snapshot = projection;
+        // The window shape is part of this projection, so the chat pane's own
+        // layout is re-asserted here: entering 小窗 with the panel already open
+        // must move the same pane into the in-place column, and leaving it must
+        // put it back in the stage panel.
+        self.sync_chat_surface(cx);
         if changed {
             if let Some(value) = snapshot["music"]["volume"]
                 .as_f64()
@@ -670,7 +690,15 @@ impl ShellPane {
                     }
                 }
             }
-            "chat" => self.toggle_panel("聊天", cx),
+            "chat" => {
+                // 聊天 is the **same panel toggle in both window shapes**: 小窗
+                // draws the chat column in place from this one selected pane, so
+                // the compact menu's 聊天 sends no window-mode command either
+                // (the original's `ToggleChat` only toggles the column,
+                // `PlayerScreen.cs:186,397`).
+                self.sync_chat_surface(cx);
+                self.toggle_panel("聊天", cx)
+            }
             "props" => self.toggle_panel("物品", cx),
             // 空间, from the compact column: `ui.space.toggle` is the op the
             // Unity product already handles, and from 小窗 it restores the stage
@@ -910,7 +938,16 @@ impl Render for ShellPane {
                 panel_content(self.panes[index].1.clone().into_any_element())
                     .into_any_element()
             };
-            root = root.child(
+            // 小窗 draws the selected chat **in place**, in the original's own
+            // compact box (`.compact-window .chat-column`: left 8, right at the
+            // reserved control column, 8 above the bottom, 244 tall —
+            // `Player.uss:102`); the stage window keeps the floating panel. Both
+            // shapes mount the same pane, and neither asks the host for a window
+            // mode: the box is only a position inside the window the shell
+            // already has.
+            let boxed = if is_chat && compact {
+                gmgn_gpui_ui::chat::compact_column(f32::from(viewport.height))
+            } else {
                 panel_container(
                     is_chat || is_props,
                     panel_width,
@@ -918,13 +955,16 @@ impl Render for ShellPane {
                     panel_bottom_gap(&label),
                     compact,
                 )
-                .on_children_prepainted(move |bounds, _, _| {
-                    trace_layout(viewport, bounds.first().copied());
-                    if is_chat {
-                        crate::report_chat_drop_bounds(bounds.first().copied());
-                    }
-                })
-                .child(content),
+            };
+            root = root.child(
+                boxed
+                    .on_children_prepainted(move |bounds, _, _| {
+                        trace_layout(viewport, bounds.first().copied());
+                        if is_chat {
+                            crate::report_chat_drop_bounds(bounds.first().copied());
+                        }
+                    })
+                    .child(content),
             );
         } else {
             crate::report_chat_drop_bounds(None);
@@ -1028,6 +1068,11 @@ impl Render for ShellPane {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    // gpui re-exports a `test` attribute macro and `super::*` shadows the
+    // built-in one, so name it explicitly like the rest of this crate does.
+    use core::prelude::v1::test;
+
     #[test]
     fn chat_is_content_sized_and_keeps_the_same_bottom_anchor_in_fullscreen() {
         use gpui_kit::{Styled, div, px};
@@ -1636,5 +1681,289 @@ mod tests {
             bar_at > else_at,
             "the wide transport bar must sit on the non-compact branch, not in 小窗"
         );
+    }
+
+    /// The chat surface this file's layout tests drive: the **real** pane with one
+    /// real turn in it, so the message list and the composer paint content.
+    fn resident_chat_with_one_turn(
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<gmgn_gpui_ui::chat::ResidentChatPane> {
+        use gmgn_gpui_ui::state::TranscriptLine;
+        cx.new(|cx| {
+            let mut pane = gmgn_gpui_ui::chat::ResidentChatPane::new(window, cx);
+            pane.set_transcript(
+                vec![
+                    TranscriptLine {
+                        speaker: "你".into(),
+                        text: "就在小窗里说。".into(),
+                    },
+                    TranscriptLine {
+                        speaker: "居民".into(),
+                        text: "好，我在小窗里回你。".into(),
+                    },
+                ],
+                cx,
+            );
+            pane
+        })
+    }
+
+    /// What one real layout of the shell says about the chat surface: the window
+    /// the shell laid out in, the commands the click queued, and the boxes GPUI
+    /// really prepared for the message list and the composer (both registered by
+    /// the pane itself, so nothing here re-derives a size).
+    struct ChatLayout {
+        viewport: (f32, f32),
+        commands: Vec<Value>,
+        transcript: Option<(f32, f32, f32, f32)>,
+        composer: Option<(f32, f32, f32, f32)>,
+    }
+
+    fn chat_rect(bounds: Bounds<Pixels>) -> (f32, f32, f32, f32) {
+        (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        )
+    }
+
+    /// Lay the real shell out in a headless window of `size` and send 聊天
+    /// `clicks` times **through the action the window's own 聊天 entry sends**
+    /// (`compact_action`), then read back the real prepared boxes.
+    fn layout_chat(size: Size<Pixels>, compact: bool, clicks: usize) -> ChatLayout {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext};
+        let commands: UiCommandQueue =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new()));
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size, {
+            let commands = commands.clone();
+            move |window, cx| {
+                let chat = resident_chat_with_one_turn(window, cx);
+                // The real mount publishes the shared pane through this slot; the
+                // shell reaches it there, so the test registers it the same way.
+                crate::PANE.with(|slot| *slot.borrow_mut() = Some(chat.clone()));
+                let panes = vec![("聊天".to_string(), chat.into())];
+                let shell = cx.new(|cx| ShellPane::new(window, cx, commands.clone(), panes));
+                shell.update(cx, |shell, cx| {
+                    shell.update_snapshot(
+                        &json!({"ui": {"compact": compact, "fullscreen": false, "connected": true},
+                                "music": {}}),
+                        window,
+                        cx,
+                    );
+                    let published = shell.snapshot.clone();
+                    for _ in 0..clicks {
+                        shell.action(super::compact_action("chat"), cx);
+                    }
+                    // The window mode is the host's fact. 聊天 may only toggle the
+                    // panel; it must not rewrite (or drop) the projection.
+                    assert_eq!(
+                        shell.snapshot, published,
+                        "聊天 must not rewrite the host's own window-mode projection"
+                    );
+                    assert_eq!(shell.snapshot["ui"]["compact"], json!(compact));
+                    assert_eq!(shell.snapshot["ui"]["fullscreen"], json!(false));
+                });
+                gpui_kit::base::Root::new(shell, window, cx)
+            }
+        });
+        let layout = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let viewport = window.viewport_size();
+                ChatLayout {
+                    viewport: (f32::from(viewport.width), f32::from(viewport.height)),
+                    commands: Vec::new(),
+                    transcript: window
+                        .try_find("resident-transcript")
+                        .map(|element| chat_rect(element.bounds())),
+                    composer: window
+                        .try_find("resident-composer-card")
+                        .map(|element| chat_rect(element.bounds())),
+                }
+            })
+            .expect("headless window");
+        crate::PANE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        ChatLayout {
+            commands: commands.borrow().iter().cloned().collect(),
+            ..layout
+        }
+    }
+
+    /// No click on any window's 聊天 entry may ask the host for a window mode.
+    fn assert_no_window_mode_command(commands: &[Value]) {
+        for command in commands {
+            let op = command["op"].as_str().unwrap_or_default();
+            assert!(
+                !matches!(
+                    op,
+                    "ui.window.compact" | "ui.window.fullscreen" | "ui.window.restore"
+                ),
+                "聊天 must not send a window-mode command, got {command}"
+            );
+        }
+    }
+
+    /// 点小窗「聊天」→ **在小窗里聊**.
+    ///
+    /// Read from real values: the window the shell laid out in is still 224×336
+    /// (`viewport_size`), the host's projection (`ui.compact` true /
+    /// `ui.fullscreen` false) is untouched by the click, the command queue
+    /// carries the panel toggle and **no** `ui.window.*` op, and the chat
+    /// surface's own prepared boxes — the message list and the composer — are
+    /// inside the original's compact chat column (`.compact-window .chat-column`,
+    /// `Player.uss:102`: left 8, right at the reserved 48 pt control column,
+    /// 8 above the bottom, 244 tall) with the composer whole.
+    #[test]
+    fn the_compact_chat_opens_in_place_and_never_touches_the_window_mode() {
+        use gpui_kit::{px, size};
+        let layout = layout_chat(size(px(224.), px(336.)), true, 1);
+        assert_eq!(
+            layout.viewport,
+            (224., 336.),
+            "the compact window keeps its own size"
+        );
+        assert!(
+            layout
+                .commands
+                .iter()
+                .any(|command| command["op"] == "ui.overlay.panel"
+                    && command["expanded"] == json!(true)),
+            "聊天 opens the panel: {:?}",
+            layout.commands
+        );
+        assert_no_window_mode_command(&layout.commands);
+        // The column's own box in this window: left 8, right at the reserved
+        // column, 8 above the bottom, 244 tall (92 % of 336 is 309.12, so the
+        // original height stands).
+        let left = chat::COMPACT_COLUMN_LEFT;
+        let right = 224. - chat::COMPACT_COLUMN_RIGHT;
+        let top = 336. - chat::COMPACT_COLUMN_BOTTOM - chat::COMPACT_COLUMN_HEIGHT;
+        let bottom = 336. - chat::COMPACT_COLUMN_BOTTOM;
+        let (tx, ty, tw, th) = layout
+            .transcript
+            .expect("小窗's chat column draws the message list");
+        let (cx_, cy, cw, ch) = layout.composer.expect("小窗's chat column draws the composer");
+        eprintln!(
+            "[compact-chat] 消息列表={:?} 输入框={:?} commands={:?}",
+            (tx, ty, tw, th),
+            (cx_, cy, cw, ch),
+            layout.commands
+        );
+        for (name, (x, y, w, h)) in [("消息列表", (tx, ty, tw, th)), ("输入框", (cx_, cy, cw, ch))] {
+            assert!(w > 0. && h > 0., "{name} must paint a real box");
+            assert!(
+                x >= left - 0.5 && x + w <= right + 0.5,
+                "{name} must stay between the column's 8 pt left edge and the reserved \
+                 control column: x={x} w={w} column=[{left},{right}]"
+            );
+            assert!(
+                y >= top - 0.5 && y + h <= bottom + 0.5,
+                "{name} must stay inside the 244 pt column: y={y} h={h} column=[{top},{bottom}]"
+            );
+        }
+        assert!(
+            ty + th <= cy,
+            "the message list sits above the composer: {ty}+{th} vs {cy}"
+        );
+        assert!(
+            ch >= chat::INPUT_MIN_HEIGHT + 2. * chat::CARD_PADDING - 0.5,
+            "the composer must be whole (its input plus its padding), not clipped: h={ch}"
+        );
+        // …and it is the original's box, not the stage window's panel moved into
+        // a smaller window: the composer starts at the column's own 8 pt left
+        // edge, spans to the reserved control column, and ends 8 pt above the
+        // window's bottom (`Player.uss:102`).
+        assert!(
+            (cx_ - chat::COMPACT_COLUMN_LEFT).abs() <= 0.5,
+            "the chat column starts 8 pt from the window's left edge: x={cx_}"
+        );
+        assert!(
+            (cw - (224. - chat::COMPACT_COLUMN_LEFT - chat::COMPACT_COLUMN_RIGHT)).abs() <= 0.5,
+            "the chat column spans to the reserved 48 pt control column: w={cw}"
+        );
+        assert!(
+            (cy + ch - (336. - chat::COMPACT_COLUMN_BOTTOM)).abs() <= 0.5,
+            "the chat column is pinned 8 pt above the window's bottom: bottom={}",
+            cy + ch
+        );
+        assert!(
+            (tx - (chat::COMPACT_COLUMN_LEFT + chat::HISTORY_PADDING_H)).abs() <= 0.5
+                && (tw
+                    - (224.
+                        - chat::COMPACT_COLUMN_LEFT
+                        - chat::COMPACT_COLUMN_RIGHT
+                        - 2. * chat::HISTORY_PADDING_H))
+                    .abs()
+                    <= 0.5,
+            "the message list fills the compact column's card: x={tx} w={tw}"
+        );
+    }
+
+    /// 大窗里点聊天仍然是切换面板: the same action, the stage window's own panel
+    /// box — right 22, bottom 22 + 48 + 16 above the window's bottom
+    /// (`panel_container`), the message list at the stage card's fixed
+    /// [`chat::HISTORY_HEIGHT`] — no window-mode command, and a second click
+    /// closes the panel again.
+    #[test]
+    fn the_stage_window_chat_still_only_toggles_the_panel() {
+        use gpui_kit::{px, size};
+        let opened = layout_chat(size(px(720.), px(482.)), false, 1);
+        assert_eq!(opened.viewport, (720., 482.));
+        assert!(
+            opened
+                .commands
+                .iter()
+                .any(|command| command["op"] == "ui.overlay.panel"
+                    && command["expanded"] == json!(true)),
+            "the first click opens the panel: {:?}",
+            opened.commands
+        );
+        assert_no_window_mode_command(&opened.commands);
+        let (tx, ty, tw, th) = opened
+            .transcript
+            .expect("the stage panel draws the message list");
+        let (cx_, cy, cw, ch) = opened.composer.expect("the stage panel draws the composer");
+        eprintln!(
+            "[stage-chat] 消息列表={:?} 输入框={:?} commands={:?}",
+            (tx, ty, tw, th),
+            (cx_, cy, cw, ch),
+            opened.commands
+        );
+        assert_eq!(
+            th, chat::HISTORY_HEIGHT,
+            "the stage window keeps the fixed 132 pt transcript (small window flexes it)"
+        );
+        assert!(
+            cx_ + cw <= 720. - metrics::TRANSPORT_INSET + 0.5,
+            "the stage chat stops at the transport bar's own right edge: {cx_}+{cw}"
+        );
+        assert!(
+            cy + ch <= 482. - (metrics::TRANSPORT_INSET + metrics::TRANSPORT_HEIGHT
+                + metrics::COMPOSER_GAP)
+                + 0.5,
+            "the stage chat sits above the transport bar: {cy}+{ch}"
+        );
+        assert!(
+            tx >= 0. && ty >= 0. && tw > 0.,
+            "the stage message list must paint inside the panel: {tx},{ty},{tw},{th}"
+        );
+        let closed = layout_chat(size(px(720.), px(482.)), false, 2);
+        assert!(
+            closed
+                .commands
+                .iter()
+                .any(|command| command["op"] == "ui.overlay.panel"
+                    && command["expanded"] == json!(false)),
+            "the second click closes the panel: {:?}",
+            closed.commands
+        );
+        assert_no_window_mode_command(&closed.commands);
     }
 }

@@ -28,9 +28,19 @@ This gate pins both halves of the fix:
     UTF-8 BOM) and must stay under a share of the pre-fix time.
 
 The negative control is the pre-fix revision itself: the same structural checks are run
-against `git show HEAD:<path>` and every one of them has to be red there, and the pre-fix
+against the pre-fix source and every one of them has to be red there, and the pre-fix
 shape has to blow the cost budget. Both sides are asserted, so the gate cannot pass by
 being vacuous.
+
+**Which revision is "pre-fix"?** Not simply `HEAD`. The fix shipped in `e474e0a`
+(build 229), so at that commit -- and at every later one, `HEAD` included -- the working
+source *is* the fixed shape, and reading `HEAD:<path>` made all six structural controls
+"already hold", i.e. pin nothing. That is the build-230 failure this script used to
+report. `pre_fix_revision()` therefore walks back from `HEAD` to the most recent ancestor
+at which the structural controls are still red; that ancestor is both the structural
+control (`prefix`) and the cost baseline. The method is the one the sibling gate
+`test-viewport-transition-defer.py` already uses ("red on HEAD for all of them"), and the
+assertions themselves are unchanged.
 
 Set GMGN_GPUI_ENVELOPE=<path> to measure a real captured host envelope instead of the
 synthetic one; the default is deterministic and carries no user data.
@@ -62,9 +72,13 @@ def read(path):
         return ""
 
 
-def head_revision(path):
-    """The file as HEAD has it, or "" when HEAD does not have it at all."""
-    result = subprocess.run(["git", "show", "HEAD:" + path], cwd=ROOT,
+def revision(path, reference):
+    """The file as `reference` has it, or "" when that revision does not have it.
+
+    A revision that predates `GPUIProjectionPayload.cs` returns "" for it, which is a
+    red gate rather than a crash -- exactly the meaning `read()` gives a deleted file.
+    """
+    result = subprocess.run(["git", "show", "%s:%s" % (reference, path)], cwd=ROOT,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     return result.stdout.decode("utf-8") if result.returncode == 0 else ""
 
@@ -161,6 +175,30 @@ CHECKS = [
     ("backend hands the tree over", check_backend_hands_the_tree),
     ("probe never re-parses", check_probe_never_reparses),
 ]
+
+#: How far back `pre_fix_revision()` is willing to look before giving up.
+PREFIX_SEARCH_DEPTH = 200
+
+
+def structural_failures(source):
+    """Every structural check that does not hold for `source` (path -> text)."""
+    return [name for name, check in CHECKS if check(source) is not None]
+
+
+def pre_fix_revision():
+    """The most recent ancestor of HEAD at which all structural controls are red.
+
+    Every control has to be red *there* or the gate pins nothing, so "pre-fix" is not a
+    guess: it is the first revision walking back from HEAD whose source still has the old
+    shape (no `GPUIProjectionPayload.Parse`, whole-envelope `DeepClone`, string round trip
+    at the boundary). Returns the revision string, or None when the search runs out.
+    """
+    for step in range(1, PREFIX_SEARCH_DEPTH + 1):
+        reference = "HEAD~%d" % step
+        source = {path: revision(path, reference) for path in (PAYLOAD, BACKEND, PROBE)}
+        if len(structural_failures(source)) == len(CHECKS):
+            return reference
+    return None
 
 
 def synthetic_envelope(target_bytes=158472):
@@ -288,16 +326,25 @@ def run_cost_harness(envelope_text, iterations):
 
 def main():
     shipped = {path: read(path) for path in (PAYLOAD, BACKEND, PROBE)}
-    prefix = {path: head_revision(path) for path in (PAYLOAD, BACKEND, PROBE)}
 
     failures = []
+    reference = pre_fix_revision()
+    if reference is None:
+        failures.append("no ancestor of HEAD in the last %d revisions still has the "
+                        "pre-fix shape, so the negative control has nothing to pin"
+                        % PREFIX_SEARCH_DEPTH)
+        prefix = {path: "" for path in (PAYLOAD, BACKEND, PROBE)}
+    else:
+        prefix = {path: revision(path, reference) for path in (PAYLOAD, BACKEND, PROBE)}
+
     for name, check in CHECKS:
         shipped_reason = check(shipped)
         prefix_reason = check(prefix)
         if shipped_reason is not None:
             failures.append("shipped: " + shipped_reason)
         if prefix_reason is None:
-            failures.append("negative control: %s already holds at HEAD, so it pins nothing" % name)
+            failures.append("negative control: %s already holds at %s, so it pins nothing"
+                            % (name, reference or "the searched ancestors"))
 
     envelope_text = None
     real = os.environ.get("GMGN_GPUI_ENVELOPE")
@@ -328,7 +375,8 @@ def main():
             sys.stderr.write("  - %s\n" % failure)
         return 1
     print("gpui projection cost gate: PASS")
-    print("  structural checks: %d, red on HEAD for all of them" % len(CHECKS))
+    print("  structural checks: %d, red on %s (the located pre-fix revision) for all of them"
+          % (len(CHECKS), reference))
     if real:
         print("  envelope: %s (%d bytes)" % (real, os.path.getsize(real)))
     else:

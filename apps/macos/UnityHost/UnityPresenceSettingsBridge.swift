@@ -107,7 +107,14 @@ final class UnityPresenceSettingsBridge {
         // daemon runs the same bound on the same request and restores its own
         // confirmed selection).
         _ = expireStalePendingRenderer()
-        return gate.refusal(isWorking: model.isWorking, hasPendingSelection: pendingSelection != nil)
+        // Both halves are bounded and reclaimed here, named, before either can
+        // refuse. `model.isSelectionWorking` is the model's **selection** half
+        // only: a read (`presence.load` / `presence.catalog*`, or the model's own
+        // `runRead`) can no longer turn into a refusal, and a live read can no
+        // longer mask a live model selection.
+        reclaimStaleMarkers()
+        return gate.refusal(modelSelection: model.isSelectionWorking,
+                            hasPendingSelection: pendingSelection != nil)
     }
     /// Abandons a renderer receipt that outlived `rendererAckBudget`, named
     /// `presence_renderer_ack_timeout`. Only the marker is dropped — an
@@ -120,12 +127,27 @@ final class UnityPresenceSettingsBridge {
         Self.log.error("code=presence_renderer_ack_timeout op=presence.runtime.result ageMs=\(Int(Date().timeIntervalSince(since) * 1000), privacy: .public) authorityRevision=\(pending.authorityRevision, privacy: .public)")
         return true
     }
-    /// `busy=<op> ageMs=<n> isWorking=<b> pending=<b>` — the identifying detail
-    /// of a `presence_selection_busy` refusal, so the log and the window receipt
-    /// name what held the gate and for how long instead of just "busy".
+    /// `side=<bridge|model|none> op=<op> ageMs=<n> kind=<kind> isWorking=<b>
+    /// pending=<b>` — the identifying detail of a `presence_selection_busy`
+    /// refusal. The `side=` field is the whole point (2026-10-09 build 229): the
+    /// old shape said `busy=model ageMs=0` whenever the marker lived in the
+    /// model, which named neither the operation nor its age.
     var selectionRefusalDetail: String {
-        gate.busyDetail(nowMillis: Self.uptimeMillis(), isWorking: model.isWorking,
+        gate.busyDetail(nowMillis: Self.uptimeMillis(), modelMarker: modelMarker,
                         hasPendingSelection: pendingSelection != nil)
+    }
+    /// The model half's marker, translated into the gate's vocabulary. The model
+    /// module must not depend on this one, so the mapping lives here.
+    private var modelMarker: PresenceSelectionGate.ModelMarker? {
+        guard let marker = model.selectionMarker else { return nil }
+        return .init(op: marker.op, kind: .selection, ageMs: marker.ageMs)
+    }
+    /// Reclaims both halves' markers that outlived their own deadline, each with
+    /// its own named `presence_selection_stale_cleared` line (the model logs its
+    /// own with `side=model`).
+    private func reclaimStaleMarkers() {
+        reclaimStaleSelectionMarker()
+        _ = model.reclaimStaleSelection(reason: "selection-refusal")
     }
     /// The refusal's identifying field: the gate diagnostic when the gate itself
     /// is why, the motion id otherwise.
@@ -153,8 +175,9 @@ final class UnityPresenceSettingsBridge {
     func motionSelectionRefusal(_ id: String) -> String? {
         // A real selection attempt is where a marker that outlived its own
         // deadline is reclaimed, named and cleared (2026-10-09: one `await` that
-        // never returned answered every later click busy for ever).
-        reclaimStaleSelectionMarker()
+        // never returned answered every later click busy for ever). Both halves:
+        // the bridge's own marker *and* the model's `selectionTask`.
+        reclaimStaleMarkers()
         if let code = selectionRefusalCode { return code }
         guard let motion = model.availableMotions.first(where: { $0.id == id }) else {
             return "presence_motion_unavailable"
@@ -377,12 +400,77 @@ final class UnityPresenceSettingsBridge {
     }
 
     /// A marker that outlived its own deadline is cancelled, cleared and named
-    /// with `presence_selection_stale_cleared`, and then the selection proceeds.
+    /// with `presence_selection_stale_cleared side=bridge`, and then the selection
+    /// proceeds.
     @discardableResult
     private func reclaimStaleSelectionMarker() -> Bool {
         guard let stale = gate.reclaimIfStale(nowMillis: Self.uptimeMillis()) else { return false }
         operation?.cancel(); operation = nil
-        Self.log.error("code=\(PresenceSelectionGate.codeStaleCleared, privacy: .public) op=\(stale.op, privacy: .public) ageMs=\(stale.ageMs, privacy: .public) kind=\(stale.kind.rawValue, privacy: .public)")
+        Self.log.error("code=\(PresenceSelectionGate.codeStaleCleared, privacy: .public) side=bridge op=\(stale.op, privacy: .public) ageMs=\(stale.ageMs, privacy: .public) kind=\(stale.kind.rawValue, privacy: .public)")
         return true
+    }
+
+    /// Waits for the selection-kind operation this host began *itself* — the
+    /// `presence.motion.stop` that `prepareManualMotionSelection` triggers through
+    /// `onActivityStopped` — so the selection it was preparing is not refused by
+    /// its own preparation.
+    ///
+    /// 2026-10-09, build 229, the user's own click: `UnityMediaHost.settingsCommand`
+    /// asked the gate (clean at that instant), called
+    /// `prepareManualMotionSelection()`, which synchronously began
+    /// `presence.motion.stop`, and the very next statement asked the gate again —
+    /// refused with `side=bridge op=presence.motion.stop ageMs=0 kind=selection
+    /// isWorking=false pending=false`. Neither bound could ever have helped: the
+    /// 20 s gate budget and the daemon's 180 s renderer budget both only act on a
+    /// marker that has *outlived* its deadline, and this one had just been born.
+    /// The fix is ordering, not forbearance.
+    ///
+    /// Bounded by the gate's own budget, and the loser is never waited on: a
+    /// `Task`'s `value` is uncancellable, so a task group would structurally wait
+    /// for it (same reason as `RustPresenceSelectionClient.Serial.awaitPrior`). If
+    /// the operation outlives the budget it is cancelled, cleared and named by
+    /// `reclaimStaleSelectionMarker`.
+    func awaitSelectionPreparation() async {
+        guard let task = operation else { return }
+        let name = gate.busyMarker?.op ?? "unknown"
+        let kind = gate.busyMarker?.kind.rawValue ?? "unknown"
+        let waitedFrom = Self.uptimeMillis()
+        await Self.awaitCompletion(of: task, timeoutMillis: PresenceSelectionGate.defaultBudgetMillis)
+        let waited = Self.uptimeMillis() &- waitedFrom
+        if operation == task {
+            // It outlived the gate's own budget: cancelled, cleared and named
+            // `presence_selection_stale_cleared side=bridge`. The client's own
+            // serial wait is bounded too, so the cancelled stop cannot wedge a
+            // later authority call.
+            reclaimStaleSelectionMarker()
+            return
+        }
+        // A newer operation took the gate in the meantime: say nothing, the next
+        // `command` refusal will name it.
+        guard operation == nil else { return }
+        Self.log.notice("code=\(PresenceSelectionGate.codePreparationWaited, privacy: .public) op=\(name, privacy: .public) kind=\(kind, privacy: .public) waitedMs=\(waited, privacy: .public)")
+    }
+
+    /// Waits for `task` but never longer than `timeoutMillis`. The loser keeps
+    /// running unattended and is never waited on.
+    private static func awaitCompletion(of task: Task<Void, Never>, timeoutMillis: UInt64) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let once = ResumeOnce(continuation)
+            Task { await task.value; once.finish() }
+            Task { try? await Task.sleep(nanoseconds: timeoutMillis * 1_000_000); once.finish() }
+        }
+    }
+}
+
+/// Resumes a continuation exactly once, whichever of the operation or the
+/// deadline finishes first.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    private let continuation: CheckedContinuation<Void, Never>
+    init(_ continuation: CheckedContinuation<Void, Never>) { self.continuation = continuation }
+    func finish() {
+        lock.lock(); let alreadyDone = done; done = true; lock.unlock()
+        if !alreadyDone { continuation.resume() }
     }
 }

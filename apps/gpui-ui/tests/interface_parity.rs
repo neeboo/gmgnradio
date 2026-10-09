@@ -1873,23 +1873,70 @@ fn snapshot_keys_read_by_the_ui_are_produced_by_a_host() {
 
     // 2) ABI 根：overlay 自己读的快照根键必须落在 overlay 的投影白名单里。
     let overlay = read(&root, "tools/fixtures/gpui-unity-overlay-probe/src/lib.rs");
-    let start = overlay
-        .find("// Retain only UI projections")
-        .expect("overlay lib.rs 里找不到快照投影白名单");
-    let end = overlay[start..].find(']').expect("白名单没有闭合") + start;
+    // 白名单现在是 lib.rs 顶层的 `const RETAINED_KEYS:[&str;30]=["chat",…]`
+    // （`retained_envelope` 与白名单共用这一份，旧写法是
+    // `gmgn_gpui_chat_snapshot` 里紧跟 `// Retain only UI projections` 的循环
+    // 数组字面量）。锚点只认声明本身，`[&str;30]` 类型里的方括号不算白名单开始。
+    const ALLOWLIST_DECL: &str = "RETAINED_KEYS:[&str;";
+    // 冻结前真正在白的键：旧解析锚点（注释 + 循环数组）下会解析出这 30 个。
+    // 数组搬家不许少键，所以集合相等就是判据，不是"长度够长"。
+    const EXPECTED_ALLOWLIST: [&str; 30] = [
+        "chat", "state", "events", "chatAttachments", "voice", "replySpeech",
+        "unityInventory", "unityWorldAuthority", "inventoryMutation", "unityUICommandResult",
+        "settings", "stage", "supportedCommands", "music", "musicLibrary", "musicQueue",
+        "screenVideo", "wish", "inbox", "worldSelection", "selection", "activity",
+        "spatialPresentation", "visualSettingsCommand", "uiIntents", "notice", "locale",
+        "builtinDevices", "ui", "settingsCommandResult",
+    ];
+    let decl = overlay
+        .find(ALLOWLIST_DECL)
+        .expect("overlay lib.rs 里找不到快照投影白名单 RETAINED_KEYS 声明");
+    let declared_len: usize = overlay[decl + ALLOWLIST_DECL.len()..]
+        .split(']')
+        .next()
+        .and_then(|digits| digits.trim().parse().ok())
+        .expect("RETAINED_KEYS 的长度字面量没解析出来");
+    let open = decl + ALLOWLIST_DECL.len() + overlay[decl + ALLOWLIST_DECL.len()..]
+        .find("[").expect("RETAINED_KEYS 声明里没有数组字面量") + 1;
     let allowlist: BTreeSet<String> = {
-        let mut at = start;
+        let mut at = open;
         let mut keys = BTreeSet::new();
         while let Some((literal, next)) = next_string(&overlay, at) {
-            if next > end {
-                break;
-            }
             keys.insert(literal);
             at = next;
+            // 数组字面量的 `]` 是白名单的右界；`next_string` 会一路扫到文件尾，
+            // 所以必须在这里停，不能靠"下一个 `]`"。
+            if overlay.as_bytes().get(skip_ws(&overlay, at)) == Some(&b']') {
+                break;
+            }
         }
         keys
     };
-    assert!(allowlist.len() > 20, "overlay 白名单没解析出来: {allowlist:?}");
+    assert!(
+        allowlist.len() > 20,
+        "overlay 白名单没解析出来: {allowlist:?}"
+    );
+    assert_eq!(
+        allowlist.len(),
+        declared_len,
+        "RETAINED_KEYS 声明 {} 个键，解析出 {} 个: {allowlist:?}",
+        declared_len,
+        allowlist.len()
+    );
+    let missing: Vec<&str> = EXPECTED_ALLOWLIST
+        .iter()
+        .copied()
+        .filter(|key| !allowlist.contains(*key))
+        .collect();
+    let added: Vec<&str> = allowlist
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !EXPECTED_ALLOWLIST.contains(key))
+        .collect();
+    assert!(
+        missing.is_empty() && added.is_empty(),
+        "overlay 白名单与冻结前不一致：少了 {missing:?}，多了 {added:?}"
+    );
     let synthesized: BTreeSet<&str> = ["world"].into_iter().collect();
     let mut overlay_files = Vec::new();
     collect(&root.join("tools/fixtures/gpui-unity-overlay-probe/src"), "rs", &mut overlay_files);

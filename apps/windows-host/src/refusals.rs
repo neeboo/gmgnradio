@@ -58,6 +58,13 @@ pub const HOST_ONLY_CODES: &[&str] = &[
     // second host that drops it from its logs loses the only evidence that a
     // marker ever hung.
     "presence_selection_stale_cleared",
+    // Host-only. `UnityPresenceSettingsBridge.awaitSelectionPreparation` waited
+    // for the *host's own* preparation (`prepareManualMotionSelection`'s
+    // `presence.motion.stop`) instead of letting that freshly-begun marker refuse
+    // the selection it was preparing. The marker never leaves the host, so the
+    // daemon never publishes this code; the Swift declaration is
+    // `UnityPresenceSelectionGate.swift:112` (`codePreparationWaited`).
+    "presence_selection_preparation_waited",
 ];
 
 /// Every code that belongs to the gate's vocabulary.

@@ -2212,6 +2212,7 @@ dependencies = [
  "gmgn-gpui-ui",
  "gpui-fast-macos",
  "gpui-kit",
+ "image",
  "raw-window-handle",
  "serde_json",
 ]

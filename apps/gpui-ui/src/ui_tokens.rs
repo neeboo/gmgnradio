@@ -192,6 +192,25 @@ pub mod chat {
     /// Live Cam (compact) composer heights: idle vs. anything attached.
     pub const COMPACT_IDLE_HEIGHT: f32 = 70.;
     pub const COMPACT_ATTACHED_HEIGHT: f32 = 140.;
+
+    /// The 小窗 chat column: the chat surface drawn **inside** the compact
+    /// window when its own 聊天 entry is pressed.
+    ///
+    /// Source: the Unity build's compact transcription of the AppKit Live Cam
+    /// window — `.compact-window .chat-column { position:absolute; left:8px;
+    /// right:48px; bottom:8px; height:244px; max-height:92%; padding:8px; }`
+    /// (`Player.uss:102`) with `.compact-window .chat-column.compact-history
+    /// { height:320px; }` (`Player.uss:103`). The right edge is the **reserved**
+    /// Live Cam control column, the same 48 the other compact surfaces stop at,
+    /// so it is read from [`super::shell::COMPACT_CONTENT_RIGHT`] instead of
+    /// being written a second time.
+    pub const COMPACT_COLUMN_LEFT: f32 = 8.;
+    pub const COMPACT_COLUMN_RIGHT: f32 = super::shell::COMPACT_CONTENT_RIGHT;
+    pub const COMPACT_COLUMN_BOTTOM: f32 = 8.;
+    pub const COMPACT_COLUMN_HEIGHT: f32 = 244.;
+    pub const COMPACT_COLUMN_HISTORY_HEIGHT: f32 = 320.;
+    /// `max-height: 92%` of the window, as a fraction.
+    pub const COMPACT_COLUMN_MAX_HEIGHT: f32 = 0.92;
 }
 
 // Ownership of the surface modules below: each `pub mod <surface>` belongs to
@@ -584,6 +603,64 @@ pub mod program {
     pub const LOADING_GAP: f32 = 10.;
     pub const LOADING_SIZE: f32 = 13.;
     pub const LOADING_TEXT: u32 = 0xffffff94;
+
+    // ---- the catalog list itself (歌单 · N) ----------------------------------
+    //
+    // Source: the original Unity 「音乐库 / 歌单」 panel the 音乐与节目 control
+    // opened — `apps/unity-player/Assets/GMGN/Resources/MusicLibrary.uss` plus
+    // its builder `MusicLibraryPanel.cs` (`BuildList` / `BuildProgramList`).
+    //
+    // The macOS stage rail (the rest of this module) is a 350×430 floating card
+    // column; the catalog the person actually opens is a **list** that fills its
+    // panel. The 2026-10-09 report 「顶部一大片空白、内容挤在下半屏」 is what
+    // happens when the floating-card geometry is used for the list: 306 pt cards
+    // right-aligned inside a 590 pt panel, 42 + 18 pt of top inset, and the
+    // bottom third of the panel empty.
+    //
+    /// `.music-library-playlist-slot { height: 84px; padding: 0 0 8px 0 }`.
+    pub const LIST_SLOT_HEIGHT: f32 = 84.;
+    pub const LIST_SLOT_PADDING: f32 = 8.;
+    /// `.music-library-playlist { height: 76px; padding: 12px; border-radius:
+    /// 18px; border-width: 1px }`.
+    pub const LIST_ROW_HEIGHT: f32 = 76.;
+    pub const LIST_ROW_PADDING: f32 = 12.;
+    pub const LIST_ROW_RADIUS: f32 = 18.;
+    pub const LIST_ROW_BORDER: f32 = 1.;
+    /// `background-color: rgba(40, 44, 50, 0.86)`.
+    pub const LIST_ROW_BG: u32 = 0x282c32db;
+    /// `.music-library-current { background-color: #083b51 }`, re-toned onto the
+    /// pinned overlay selection surface. The original literal is recorded here
+    /// because the theme gate forbids drawing a control from the system theme —
+    /// this is still a fixed overlay value, just the layer's own selected blue.
+    pub const LIST_CURRENT_BG: u32 = super::scene::SELECTED_SOFT;
+    /// `.music-library-cover { width: 44px; height: 44px; margin-right: 12px;
+    /// border-radius: 12px; background-color: rgba(120, 70, 70, 0.2) }`.
+    pub const LIST_COVER: f32 = 44.;
+    pub const LIST_COVER_GAP: f32 = 12.;
+    pub const LIST_COVER_RADIUS: f32 = 12.;
+    pub const LIST_COVER_BG: u32 = 0x78464633;
+    /// `.music-library-secondary { margin-top: 4px }`.
+    pub const LIST_SECONDARY_GAP: f32 = 4.;
+    /// `.music-library-trailing { margin-left: 8px }`, and
+    /// `.music-library-playlist > .music-library-trailing { font-size: 22px }` —
+    /// the 「›」 affordance.
+    pub const LIST_TRAILING_GAP: f32 = 8.;
+    pub const LIST_TRAILING_SIZE: f32 = 22.;
+    /// `.music-library-track-slot { height: 64px; padding: 0 0 6px 0 }` and
+    /// `.music-library-track { height: 58px; padding: 8px 12px; border-radius:
+    /// 12px; background-color: rgba(40, 44, 50, 0.65) }`, with
+    /// `.music-library-number { width: 24px; margin-right: 8px }` — the 序号
+    /// column the list shows before the title.
+    pub const LIST_TRACK_SLOT_HEIGHT: f32 = 64.;
+    pub const LIST_TRACK_SLOT_PADDING: f32 = 6.;
+    pub const LIST_TRACK_HEIGHT: f32 = 58.;
+    pub const LIST_TRACK_PADDING_V: f32 = 8.;
+    pub const LIST_TRACK_RADIUS: f32 = 12.;
+    pub const LIST_TRACK_BG: u32 = 0x282c32a6;
+    pub const LIST_NUMBER_WIDTH: f32 = 24.;
+    pub const LIST_NUMBER_GAP: f32 = 8.;
+    /// `.music-library-header { margin-bottom: 12px }`.
+    pub const LIST_HEADER_GAP: f32 = 12.;
 }
 
 /// System inbox window.

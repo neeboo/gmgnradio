@@ -5,13 +5,13 @@ use gpui_kit::component::input::{InputState,TextareaState,EditorState};
 use gmgn_gpui_ui::{ResidentChatPane, state::{ChatCommand,TranscriptLine}};
 use serde_json::{Value,json};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::{cell::RefCell, collections::VecDeque, ffi::c_void, path::{Path, PathBuf}, rc::Rc, sync::Arc};
+use std::{cell::{Cell, RefCell}, collections::VecDeque, ffi::c_void, path::{Path, PathBuf}, rc::Rc, sync::Arc};
 use futures::channel::oneshot;
 mod inventory_ui;
 use inventory_ui::InventoryPane;
 mod shell_ui;
 mod settings_ui;
-mod media_ui;
+pub mod media_ui;
 use shell_ui::ShellPane;
 use settings_ui::SettingsPane;
 use media_ui::MediaPane;
@@ -110,6 +110,14 @@ thread_local! {
     static MEDIA:RefCell<Option<Entity<MediaPane>>>=const { RefCell::new(None) };
     static COMMANDS:UiCommandQueue=Rc::new(RefCell::new(VecDeque::new()));
     static SNAPSHOT:RefCell<Value>=const { RefCell::new(Value::Null) };
+    /// The derivations of the accepted `SNAPSHOT` (`normalize_chat`, then
+    /// `visual_projection`). `None` means "not derived yet"; the first reader
+    /// derives them from `Value::Null`, which is what an empty snapshot is.
+    static DERIVED:RefCell<Option<(Value,Value)>>=const { RefCell::new(None) };
+    /// Derivation counters, thread-local so the parallel test threads cannot
+    /// pollute one another. Each is bumped once per poll at most.
+    static NORMALIZE_CALLS:Cell<usize>=const { Cell::new(0) };
+    static VISUAL_CALLS:Cell<usize>=const { Cell::new(0) };
     static VOICE_CURSOR:RefCell<VoiceCursor>=const {RefCell::new(VoiceCursor {context:None,revision:0})};
     static PENDING_REQUEST:RefCell<Option<u64>>=const { RefCell::new(None) };
     static CHAT_DROP_BOUNDS:RefCell<Option<Bounds<Pixels>>>=const { RefCell::new(None) };
@@ -328,6 +336,7 @@ pub extern "C" fn gmgn_gpui_probe_mount(parent:*mut c_void)->i32 {
                 let panel=cx.new(|cx|ShellPane::new(window,cx,commands,panes));
                 SHELL.with(|v|*v.borrow_mut()=Some(panel.clone()));
                 SNAPSHOT.with(|v|*v.borrow_mut()=Value::Null);
+                DERIVED.with(|d|*d.borrow_mut()=None);
                 // Match the product's kit root contract: styled component font,
                 // window presentation plugin and standard input key context.
                 cx.new(|cx|gpui_kit::base::Root::new(panel,window,cx).bg(rgba(0x00000000)))
@@ -382,7 +391,64 @@ fn with_chat(f:impl FnOnce(&mut ResidentChatPane,&mut Window,&mut Context<Reside
     })))
 }
 
+/// The only top-level envelope keys the overlay renders. Everything else the
+/// host publishes — the full `world` snapshot, grid and point-cloud blobs,
+/// native physics — is dropped without ever being copied.
+const RETAINED_KEYS:[&str;30]=["chat","state","events","chatAttachments","voice","replySpeech",
+    "unityInventory","unityWorldAuthority","inventoryMutation","unityUICommandResult",
+    "settings","stage","supportedCommands","music","musicLibrary","musicQueue",
+    "screenVideo","wish","inbox","worldSelection","selection","activity",
+    "spatialPresentation","visualSettingsCommand","uiIntents","notice","locale",
+    "builtinDevices","ui","settingsCommandResult"];
+
+/// The overlay's own view of a host envelope: the retained keys and nothing else.
+/// The parsed envelope is moved and the rest dropped; rebuilding a second map
+/// cloned every retained top-level value on every poll.
+pub(crate) fn retained_envelope(mut value:Value)->Option<Value> {
+    let Value::Object(ref mut retained)=value else {return None};
+    retained.retain(|key,_|RETAINED_KEYS.contains(&key.as_str()));
+    Some(value)
+}
+
+/// Everything one host poll derives from the envelope it just received, plus the
+/// two comparisons that used to re-derive the *previous* envelope to make them.
+pub(crate) struct SnapshotStep {
+    pub state:Value, pub visual:Value,
+    pub changed:bool, pub old_context:Value, pub visual_changed:bool,
+}
+
+/// One `normalize_chat` and one `visual_projection` for the incoming envelope;
+/// the previous envelope's derivations are passed in, never recomputed. Deriving
+/// them here instead cost three `normalize_chat` and two `visual_projection` tree
+/// passes per poll on a ~158 KB envelope at 20 Hz, on the Unity main thread.
+pub(crate) fn snapshot_step(previous_state:&Value,previous_visual:&Value,value:&Value)->Option<SnapshotStep> {
+    let state=normalize_chat(value);
+    if !state.is_object() {return None;}
+    let visual=visual_projection(value);
+    Some(SnapshotStep {changed:*previous_state!=state, old_context:previous_state["contextID"].clone(),
+        visual_changed:*previous_visual!=visual, state, visual})
+}
+
+/// Reads the accepted envelope's derivations, deriving them from the initial
+/// empty snapshot exactly once if no snapshot has been accepted yet.
+fn previous_derivations<R>(f:impl FnOnce(&Value,&Value)->R)->R {
+    DERIVED.with(|d| {
+        let mut d=d.borrow_mut();
+        if d.is_none() {*d=Some((normalize_chat(&Value::Null),visual_projection(&Value::Null)));}
+        let (state,visual)=d.as_ref().expect("derivations initialised above");
+        f(state,visual)
+    })
+}
+
+/// Records an accepted envelope together with the derivations already made from
+/// it, so the next poll compares against them instead of re-deriving this one.
+fn accept_snapshot(value:Value,state:Value,visual:Value) {
+    DERIVED.with(|d|*d.borrow_mut()=Some((state,visual)));
+    SNAPSHOT.with(|v|*v.borrow_mut()=value);
+}
+
 fn normalize_chat(value:&Value)->Value {
+    NORMALIZE_CALLS.with(|count|count.set(count.get()+1));
     let mut state=value["chat"]["state"].clone();
     if !state.is_object() { state=value["state"].clone(); }
     if !state.is_object() { return Value::Null; }
@@ -493,6 +559,7 @@ fn open_settings_window(cx:&mut App) {
     }
 }
 fn visual_projection(value:&Value)->Value {
+    VISUAL_CALLS.with(|count|count.set(count.get()+1));
     let screens:Vec<_>=value["screenVideo"]["screens"].as_array().into_iter().flatten()
         .map(|s|json!({"objectID":s["objectID"],"name":s["name"],"state":s["state"]})).collect();
     let mut result=json!({"shell":shell_projection(value),"screens":screens,
@@ -566,22 +633,12 @@ fn translate_command(command:ChatCommand,snapshot:&Value)->Option<Value> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gmgn_gpui_chat_snapshot(bytes:*const u8,len:usize)->i32 {
     if unsafe { pthread_main_np() }==0 || bytes.is_null() || len==0 || len>4*1024*1024 {return -1;}
-    let Ok(raw)=serde_json::from_slice::<Value>(unsafe {std::slice::from_raw_parts(bytes,len)}) else {return -1};
+    let Ok(value)=serde_json::from_slice::<Value>(unsafe {std::slice::from_raw_parts(bytes,len)}) else {return -1};
     // Retain only UI projections, not full world/grid blobs or native physics.
-    let mut projection=serde_json::Map::new();
-    for key in ["chat","state","events","chatAttachments","voice","replySpeech",
-        "unityInventory","unityWorldAuthority","inventoryMutation","unityUICommandResult",
-        "settings","stage","supportedCommands","music","musicLibrary","musicQueue",
-        "screenVideo","wish","inbox","worldSelection","selection","activity",
-        "spatialPresentation","visualSettingsCommand","uiIntents","notice","locale",
-        "builtinDevices","ui","settingsCommandResult"] {
-        if let Some(value)=raw.get(key) {projection.insert(key.into(),value.clone());}
-    }
-    let value=Value::Object(projection);
-    let mut value=value;
+    let Some(mut value)=retained_envelope(value) else {return -1};
     value["world"]=json!({"worldID":value["unityWorldAuthority"]["state"]["worldID"]});
-    let state=normalize_chat(&value);
-    if !state.is_object() {return -1;}
+    let Some(step)=previous_derivations(|previous_state,previous_visual|snapshot_step(previous_state,previous_visual,&value)) else {return -1;};
+    let SnapshotStep {state,visual,changed,old_context,visual_changed}=step;
     let events=value["chat"]["events"].as_array().or_else(||value["events"].as_array()).cloned().unwrap_or_default();
     let has_events=!events.is_empty();
     let inventory_changed=SNAPSHOT.with(|v| {
@@ -590,11 +647,8 @@ pub unsafe extern "C" fn gmgn_gpui_chat_snapshot(bytes:*const u8,len:usize)->i32
     let new_ui_receipt=SNAPSHOT.with(|v|v.borrow()["unityUICommandResult"]!=value["unityUICommandResult"]);
     let placement_started=new_ui_receipt && value["unityUICommandResult"]["status"]=="started"
         && matches!(value["unityUICommandResult"]["op"].as_str(),Some("ui.inventory.place"|"ui.device.place"));
-    let old_context=SNAPSHOT.with(|v|normalize_chat(&v.borrow())["contextID"].clone());
-    let changed=SNAPSHOT.with(|v|normalize_chat(&v.borrow())!=state);
     let context_changed=!old_context.is_null() && old_context!=state["contextID"];
     let voice_text=VOICE_CURSOR.with(|v|v.borrow_mut().observe(&state["contextID"],&value["voice"]));
-    let visual_changed=SNAPSHOT.with(|v|visual_projection(&v.borrow())!=visual_projection(&value));
     let applied=with_chat(|pane,window,cx| {
         if context_changed {pane.reset_context(window,cx);}
         if let Some(text)=&voice_text {pane.append_voice_transcript(text,window,cx);pane.focus_composer(window,cx);}
@@ -651,7 +705,7 @@ pub unsafe extern "C" fn gmgn_gpui_chat_snapshot(bytes:*const u8,len:usize)->i32
             }
         }
     });
-    SNAPSHOT.with(|v|*v.borrow_mut()=value);
+    accept_snapshot(value,state,visual);
     if applied { if changed || has_events || inventory_changed || visual_changed || voice_text.is_some() {unsafe {probe_native_wake_frames();}} 0 } else {-2}
 }
 
@@ -881,5 +935,77 @@ mod chat_transport_tests {
             assert!(!source.contains(&format!("self.0.{name}(")),"direct Mac credential call forbidden");
         }
         assert_eq!(source.matches("Task::ready(Err(anyhow::anyhow!(\"platform_credentials_disabled\")))").count(),3);
+    }
+    #[test]
+    fn one_poll_derives_the_state_and_the_visual_projection_exactly_once() {
+        let previous=json!({"chat":{"state":{"contextID":"world-a","transcript":[{"role":"user","text":"旧"}]}}});
+        let value=json!({"chat":{"state":{"contextID":"world-a","transcript":[{"role":"user","text":"新"}]}},
+            "chatAttachments":{"attachments":[]},"voice":{"state":"idle"},"replySpeech":{"isPlaying":false},
+            "music":{"position":3,"queue":[]},"screenVideo":{"screens":[]},"settings":{},
+            "world":{"worldID":"world-a"},"unityWorldAuthority":{"state":{"worldID":"world-a"}}});
+        let previous_state=normalize_chat(&previous);
+        let previous_visual=visual_projection(&previous);
+        let normal_before=NORMALIZE_CALLS.with(Cell::get);
+        let visual_before=VISUAL_CALLS.with(Cell::get);
+        let step=snapshot_step(&previous_state,&previous_visual,&value).expect("an object chat state");
+        assert_eq!(NORMALIZE_CALLS.with(Cell::get)-normal_before,1,
+            "one poll must normalize the chat state once, not once per comparison");
+        assert_eq!(VISUAL_CALLS.with(Cell::get)-visual_before,1,
+            "one poll must build the visual projection once, not once per side");
+        assert!(step.changed,"a changed transcript is a changed snapshot");
+        assert_eq!(step.old_context,"world-a","the comparison still reads the previous context");
+        assert_eq!(step.state,normalize_chat(&value),"the step hands back the real state");
+        assert_eq!(step.visual,visual_projection(&value),"the step hands back the real projection");
+    }
+    #[test]
+    fn the_poll_never_rederives_or_reclones_the_previous_envelope() {
+        let lib=include_str!("lib.rs");
+        // Cut the test module off: this test's own source must never satisfy it.
+        let code=lib.split("\n#[cfg(test)]").next().expect("library source before tests");
+        let poll=code.split("pub unsafe extern \"C\" fn gmgn_gpui_chat_snapshot").nth(1)
+            .expect("per poll host snapshot");
+        let poll=poll.split("\nfn navigation_command").next().unwrap();
+        assert!(!poll.contains("normalize_chat("),
+            "the poll must take the state from snapshot_step, never re-derive it");
+        assert!(!poll.contains("visual_projection("),
+            "the poll must take the visual projection from snapshot_step, never re-derive it");
+        assert!(poll.contains("snapshot_step("),"the poll derives through the one-step helper");
+        assert_eq!(poll.matches("previous_derivations(").count(),1,
+            "the previous envelope's derivations are read once, from the cache");
+        let step=code.split("pub(crate) fn snapshot_step").nth(1).expect("snapshot step");
+        let step=step.split("\n}").next().unwrap();
+        assert_eq!(step.matches("normalize_chat(").count(),1,"one state derivation per step");
+        assert_eq!(step.matches("visual_projection(").count(),1,"one visual derivation per step");
+        assert!(poll.contains("retained_envelope("),
+            "the poll keeps the parsed envelope and drops the rest");
+        assert!(!poll.contains("value.clone()"),
+            "retained keys must move out of the parsed envelope, never be cloned");
+        let retain=code.split("pub(crate) fn retained_envelope").nth(1).expect("retained envelope");
+        let retain=retain.split("\n}").next().unwrap();
+        assert!(retain.contains("retained.retain(|key,_|RETAINED_KEYS.contains(&key.as_str()))"),
+            "the retained envelope moves the parsed map and drops the rest");
+        assert!(!retain.contains("value.clone()"),
+            "the retained envelope must move the parsed map, never clone its values");
+    }
+    #[test]
+    fn retained_envelope_keeps_the_ui_keys_and_drops_the_rest() {
+        let raw=json!({"chat":{"state":{"contextID":"w"}},"music":{"title":"x"},
+            "settings":{"settings":{}},"builtinDevices":{"templates":[]},
+            "world":{"triangles":[[[0,0,0]]],"generation":9},
+            "runtimeDiagnostics":{"frame":1},"heldAvatarBindingNotice":"x"});
+        // The pre-fix shape: a fresh map that cloned every retained value.
+        let mut reference=serde_json::Map::new();
+        for key in RETAINED_KEYS {
+            if let Some(value)=raw.get(key) {reference.insert(key.into(),value.clone());}
+        }
+        assert_eq!(retained_envelope(raw.clone()),Some(Value::Object(reference)),
+            "the retained envelope is exactly the old key list, value for value");
+        let got=retained_envelope(raw).expect("an object envelope");
+        assert!(got.get("runtimeDiagnostics").is_none(),"host diagnostics are not a UI projection");
+        assert!(got.get("heldAvatarBindingNotice").is_none(),"world services are not a UI projection");
+        assert!(got.get("world").is_none(),
+            "the host's full world/grid blob is dropped, never copied; the poll rebuilds a \
+             one-key world from unityWorldAuthority.state.worldID instead");
+        assert_eq!(retained_envelope(json!([1,2])),None,"a non-object envelope is refused");
     }
 }

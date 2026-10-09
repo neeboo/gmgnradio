@@ -13,14 +13,31 @@ namespace GMGN.UnityPlayer
         float reportAt;
         int frames, slowFrames;
         static int windowWidth = 1440, windowHeight = 900;
+        static ViewportTransition viewport;
+        static double viewportStartedAt;
+        // The only code path that moves the framebuffer also owns the window
+        // that says so. `Screen.SetResolution` recreates the Metal surface
+        // synchronously and AppKit keeps the window animating afterwards, so
+        // views that would otherwise start a whole-content GPU rebuild on the
+        // first moved frame read this instead.
+        public static bool FramebufferMoving { get { return viewport.Open; } }
+        public static void BeginViewportTransition()
+        {
+            viewport.Begin();
+            viewportStartedAt = Time.realtimeSinceStartupAsDouble;
+        }
         public static void ToggleFullscreen()
         {
             if (Screen.fullScreen) {
+                BeginViewportTransition();
                 Screen.SetResolution(windowWidth, windowHeight, FullScreenMode.Windowed);
             } else {
                 windowWidth = Screen.width; windowHeight = Screen.height;
                 int width = (int)gmgn_unity_screen_pixels(0), height = (int)gmgn_unity_screen_pixels(1);
-                if (width > 0 && height > 0) Screen.SetResolution(width, height, FullScreenMode.FullScreenWindow);
+                if (width > 0 && height > 0) {
+                    BeginViewportTransition();
+                    Screen.SetResolution(width, height, FullScreenMode.FullScreenWindow);
+                }
             }
         }
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -32,6 +49,9 @@ namespace GMGN.UnityPlayer
         }
         void Update()
         {
+            // Drives the bounded transition window from a component that runs
+            // every frame, whether or not any lyrics are showing.
+            viewport.Observe(Screen.width, Screen.height, Time.realtimeSinceStartupAsDouble - viewportStartedAt);
             frames++;
             if (Time.unscaledDeltaTime > .05f) slowFrames++;
             if (Time.unscaledTime >= reportAt + 5) {

@@ -27,6 +27,10 @@ pub mod projective_card;
 pub mod settings;
 pub mod shell;
 pub mod stage_panels;
+/// The gate that runs **before** the person is let in: the readiness checklist,
+/// the parallel state machine behind it, and the loading surface that names every
+/// step it could not finish. See the module docs for the hard rules.
+pub mod startup;
 pub mod state;
 pub mod ui_tokens;
 

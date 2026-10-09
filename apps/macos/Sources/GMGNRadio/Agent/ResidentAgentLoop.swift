@@ -35,6 +35,16 @@ private enum ResidentImageChainLog {
     }
 }
 
+/// 居民调度「领取被拒」的具名日志。
+///
+/// **不与图片链共用**那个 32 条/进程的预算：被拒取证会一直持续到收敛，共用同一个
+/// 预算就会把图片链的诊断挤没。限流由调用点自己做（每 30 秒最多一次取证/上报）。
+private enum ResidentSchedulerLog {
+    static let log = Logger(subsystem: "ai.gmgn.radio", category: "ResidentScheduler")
+    static func note(_ message: String) { log.notice("\(message, privacy: .public)") }
+    static func failure(_ message: String) { log.error("\(message, privacy: .public)") }
+}
+
 /// 居民聊天区一条状态行的类别。两个聊天表面（LiveCam、空间）共用同一套语义，
 /// 避免「语音连接中」「本轮失败」等互相覆盖或长期残留。
 enum ResidentStatusNoticeKind: Equatable, Sendable {
@@ -765,6 +775,18 @@ final class ResidentAgentLoop {
     private var rustHumanBatch: [Message]?
     private var rustHumanEventID: String?
     private var rustHumanRetryAt: Date?
+    /// 「领取被拒」的可见性状态：连续被拒的起点与次数、最近一次只读取证与它的时刻、
+    /// 最近一次具名失败的时刻。领取成功、换调度器、开新一批就清零 —— 它只描述
+    /// "此刻这批还在等"，不是一个持久状态。
+    ///
+    /// 存在的理由：从前被拒时 `guard let ticket` 的 else 分支直接静默返回，
+    /// 用户发出去的消息停在队列里，既没有回复也没有任何错误，界面上只剩
+    /// 「等待居民回应…」（真机 2026-10-09，build 229）。
+    private var rustHumanDeniedSince: Date?
+    private var rustHumanDeniedCount = 0
+    private var rustHumanClaimRefusalEvidence: ResidentHumanClaimEvidence?
+    private var rustHumanClaimRefusalEvidenceAt: Date?
+    private var rustHumanDeniedReportedAt: Date?
     private var rustCancelledSteering: [UUID: Task<Void, Never>] = [:]
     private var stopped = false
     private var invalidated = false
@@ -1136,6 +1158,7 @@ final class ResidentAgentLoop {
         rustHumanBatch = nil
         rustHumanEventID = nil
         rustHumanRetryAt = nil
+        resetRustHumanClaimRefusal()
         rustOpportunityInput = nil
         rustNextPollAt = nil
         rustOpportunityID = UUID().uuidString
@@ -1241,6 +1264,7 @@ final class ResidentAgentLoop {
             Task { try? await scheduler.cancelPending(eventID: eventID) }
         }
         rustHumanBatch = nil; rustHumanEventID = nil; rustHumanRetryAt = nil
+        resetRustHumanClaimRefusal()
         if let ticket = rustTicket, let scheduler = rustScheduler {
             if let steeringTask { rustCancelledSteering[ticket.runID] = steeringTask }
             if let result = completedResult {
@@ -1472,7 +1496,10 @@ final class ResidentAgentLoop {
         guard rustHumanScheduleTask == nil, rustScheduleTask == nil,
               rustSchedulerAvailability?() == true,
               memoryScope.map({ $0.worldID == scheduler.worldID && $0.residentScope == scheduler.residentScope }) ?? true else { return }
-        if rustHumanBatch == nil { rustHumanBatch = messages; rustHumanEventID = "human." + UUID().uuidString }
+        if rustHumanBatch == nil {
+            rustHumanBatch = messages; rustHumanEventID = "human." + UUID().uuidString
+            resetRustHumanClaimRefusal()
+        }
         guard let batch = rustHumanBatch, let eventID = rustHumanEventID else { return }
         let ids = batch.map(rustMessageID)
         let refs = Dictionary(uniqueKeysWithValues: batch.map { (rustMessageID($0), rustInputRef($0)) })
@@ -1496,13 +1523,24 @@ final class ResidentAgentLoop {
                     else { try? await scheduler.cancelPending(eventID: eventID) }
                     return
                 }
-                guard let ticket else { return }
+                guard let ticket else {
+                    // daemon 明确回了 `claimed:false`：这一轮没有被授权，不是异常。
+                    // 从前这里直接返回 —— 消息留在队列里、没有任何解释，真机上用户
+                    // 只看到「等待居民回应…」，既没有回复也没有错误（2026-10-09 build 229）。
+                    // 现在第一次被拒就**具名**说清在等什么、被什么挡住（只读取证走既有
+                    // 路由 `agent_loop_read`，正常路径一次 RPC 都不加），到门槛再给具名
+                    // 失败。重试照旧（自愈），队列里的消息一条都不丢。
+                    await self.noteRustHumanClaimRefusal(scheduler: scheduler, eventID: eventID,
+                                                         date: date, batchCount: batch.count)
+                    return
+                }
                 let batchIDs = Set(batch.map(\.id))
                 guard batch.allSatisfy({ item in self.messages.contains(where: { $0.id == item.id }) }) else {
                     try await scheduler.finish(ticket, outcome: "cancelled", invocationStarted: false); return
                 }
                 self.messages.removeAll { batchIDs.contains($0.id) }
                 self.rustHumanBatch = nil; self.rustHumanEventID = nil; self.rustHumanRetryAt = nil
+                self.resetRustHumanClaimRefusal()
                 self.rustTicket = ticket
                 self.beginRun(userMessages: batch.map(\.text), imageURLs: batch.flatMap(\.imageURLs),
                     isBackground: false, submissions: batch, claimedRunID: ticket.runID)
@@ -1514,6 +1552,73 @@ final class ResidentAgentLoop {
                 }
             }
         }
+    }
+
+    /// 领取被拒（`claimed:false`）：**具名**日志 + 用户可见的「在等什么」+ 门槛后的具名失败。
+    ///
+    /// 取证只在第一次、到门槛、以及每 `residentHumanClaimReportIntervalSeconds` 秒做一次：
+    /// 正常路径（领取成功）一次 RPC 都不加，被拒时最多每 30 秒一次 `agent_loop_read`。
+    /// 重试节奏**不动**（外层 tick 照旧每秒来领）—— 挡住它的回合一结算就立刻送达，
+    /// 不被退避拖慢；这里只负责"不再静默"和"超时具名"。
+    private func noteRustHumanClaimRefusal(scheduler: RustResidentSchedulerClient,
+                                           eventID: String, date: Date, batchCount: Int) async {
+        guard rustScheduler === scheduler, !invalidated else { return }
+        rustHumanDeniedCount += 1
+        let since = rustHumanDeniedSince ?? date
+        rustHumanDeniedSince = since
+        let waited = date.timeIntervalSince(since)
+        let timedOut = waited >= residentHumanClaimNamedFailureSeconds
+        let probeElapsed = rustHumanClaimRefusalEvidenceAt.map { date.timeIntervalSince($0) } ?? .infinity
+        let shouldProbe = rustHumanClaimRefusalEvidenceAt == nil
+            || probeElapsed >= residentHumanClaimReportIntervalSeconds
+            || (timedOut && rustHumanDeniedReportedAt == nil)
+        if shouldProbe {
+            rustHumanClaimRefusalEvidenceAt = date
+            rustHumanClaimRefusalEvidence = await scheduler.humanClaimRefusalEvidence(eventID: eventID)
+        }
+        guard rustScheduler === scheduler, !invalidated, !stopped else { return }
+        let evidence = rustHumanClaimRefusalEvidence ?? ResidentHumanClaimEvidence()
+        let refusal = residentHumanClaimRefusal(evidence)
+        var changed = false
+        if shouldProbe {
+            // 可见：不是静默等待，也不是「失败」—— 消息还在队列里。
+            let notice = refusal.waitingNotice(attempts: rustHumanDeniedCount)
+            if progress != notice { progress = notice; changed = true }
+            ResidentSchedulerLog.note(
+                "居民领取链[被拒] 事件=\(eventID) 世界=\(scheduler.worldID) 空间=\(scheduler.residentScope)"
+                    + " 码=\(refusal.code) claimed=false 第=\(rustHumanDeniedCount)次"
+                    + " 在飞=\(evidence.executing) 未确认=\(evidence.staleUnconfirmed)"
+                    + " 本批状态=\(evidence.ourEventState ?? "缺失") 在等=\(refusal.waiting)"
+                    + " 已等=\(Int(waited))秒 消息=\(batchCount) 队列=\(messages.count)"
+            )
+        }
+        if timedOut,
+           rustHumanDeniedReportedAt.map({ date.timeIntervalSince($0) >= residentHumanClaimReportIntervalSeconds }) ?? true {
+            rustHumanDeniedReportedAt = date
+            let failure = refusal.namedFailure(waitedSeconds: Int(waited), attempts: rustHumanDeniedCount)
+            if lastFailure != failure { lastFailure = failure; changed = true }
+            // `lastFailure` 只进 E2E 快照，**不渲染**（宿主只从 `snapshot.progress`
+            // 调 `setResidentProgress`）。所以具名失败必须同时落在状态行上，否则
+            // "超时给出具名失败"对用户仍然等于没有。
+            if progress != failure { progress = failure; changed = true }
+            ResidentSchedulerLog.failure(
+                "居民领取链[超时] 事件=\(eventID) 世界=\(scheduler.worldID) 空间=\(scheduler.residentScope)"
+                    + " 码=\(refusal.code) 已等=\(Int(waited))秒 次=\(rustHumanDeniedCount)"
+                    + " 在飞=\(evidence.executing) 未确认=\(evidence.staleUnconfirmed)"
+                    + " 消息=\(batchCount) 仍在队列=\(messages.count)"
+            )
+        }
+        if changed { onChange() }
+    }
+
+    /// 领取被拒的可见性状态只描述「此刻这批还在等」：领取成功、换调度器、开新一批、
+    /// 或取消本轮就清零，绝不跨批次/跨绑定残留。
+    private func resetRustHumanClaimRefusal() {
+        rustHumanDeniedSince = nil
+        rustHumanDeniedCount = 0
+        rustHumanClaimRefusalEvidence = nil
+        rustHumanClaimRefusalEvidenceAt = nil
+        rustHumanDeniedReportedAt = nil
     }
 
     private func rustOutcome(_ result: Result<String, Error>, silentAllowed: Bool) -> String {

@@ -58,45 +58,56 @@ check(PresenceSelectionGate.Kind.classify(op: "presence.remove") == .write, "pre
 check(PresenceSelectionGate.Kind.classify(op: "presence.download") == .write, "presence.download is a write")
 check(PresenceSelectionGate.Kind.classify(op: "presence.catalog.install") == .write, "presence.catalog.install is a write")
 
-// ② A read never refuses a selection (the 2026-10-09 root cause).
+// ② A read never refuses a selection (the 2026-10-09 root cause), and a live
+//    read must not *mask* a live model selection either (build 229: `isWorking`
+//    conflated the read slot with the model's selection half).
 var readGate = PresenceSelectionGate()
 _ = readGate.begin(op: "presence.load", nowMillis: 1_000)
-check(readGate.refusal(isWorking: false, hasPendingSelection: false) == nil,
+check(readGate.refusal(modelSelection: false, hasPendingSelection: false) == nil,
       "an in-flight presence.load must not refuse a selection")
-// presence.catalog's refresh sets the model's own working flag while it runs;
-// the read explains it, so it must still not refuse.
 var catalogGate = PresenceSelectionGate()
 _ = catalogGate.begin(op: "presence.catalog", nowMillis: 1_000)
-check(catalogGate.refusal(isWorking: true, hasPendingSelection: false) == nil,
-      "a read explains isWorking and must not refuse")
-check(catalogGate.refusal(isWorking: false, hasPendingSelection: true) == PresenceSelectionGate.codeRendererPending,
+check(catalogGate.refusal(modelSelection: false, hasPendingSelection: false) == nil,
+      "a read in the bridge read slot must not refuse a selection")
+check(catalogGate.refusal(modelSelection: false, hasPendingSelection: true) == PresenceSelectionGate.codeRendererPending,
       "pendingSelection is presence_renderer_pending, not busy")
+check(catalogGate.refusal(modelSelection: true, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
+      "a live read must not mask a live model selection")
 
 // ③ No loosening: a live selection/write, or isWorking with no read in flight,
 //    still refuses serialisation between selections.
 var busy = PresenceSelectionGate()
 _ = busy.begin(op: "presence.motion", nowMillis: 1_000)
-check(busy.refusal(isWorking: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
+check(busy.refusal(modelSelection: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
       "a live selection refuses another selection")
-check(busy.refusal(isWorking: false, hasPendingSelection: true) == PresenceSelectionGate.codeBusy,
+check(busy.refusal(modelSelection: false, hasPendingSelection: true) == PresenceSelectionGate.codeBusy,
       "busy wins over pending, as before")
 var writeBusy = PresenceSelectionGate()
 _ = writeBusy.begin(op: "presence.download", nowMillis: 0)
-check(writeBusy.refusal(isWorking: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
+check(writeBusy.refusal(modelSelection: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
       "a live write refuses a selection")
+// The model half is a *selection* fact (`model.isSelectionWorking`), and with no
+// read in the bridge read slot it refuses exactly as before.
 var bareWorking = PresenceSelectionGate()
-check(bareWorking.refusal(isWorking: true, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
-      "isWorking with no read in flight refuses a selection")
+check(bareWorking.refusal(modelSelection: true, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
+      "a live model selection refuses a selection")
+// A selection-kind operation that is *not* a read still refuses even when a read
+// happens to be in flight on the other slot.
+var stopWhileReading = PresenceSelectionGate()
+_ = stopWhileReading.begin(op: "presence.catalog", nowMillis: 0)
+_ = stopWhileReading.begin(op: "presence.motion.stop", nowMillis: 10)
+check(stopWhileReading.refusal(modelSelection: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
+      "presence.motion.stop still refuses while a read is in flight")
 
 // ④ A completion only clears the generation that began it.
 var gen = PresenceSelectionGate()
 let g1 = gen.begin(op: "presence.motion", nowMillis: 0)
 let g2 = gen.begin(op: "presence.motion", nowMillis: 10)
 check(gen.finish(generation: g1) == nil, "a late completion clears nothing")
-check(gen.refusal(isWorking: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
+check(gen.refusal(modelSelection: false, hasPendingSelection: false) == PresenceSelectionGate.codeBusy,
       "the replacing marker is still live")
 check(gen.finish(generation: g2) == .operation, "the current generation clears the operation slot")
-check(gen.refusal(isWorking: false, hasPendingSelection: false) == nil, "and then the gate is free")
+check(gen.refusal(modelSelection: false, hasPendingSelection: false) == nil, "and then the gate is free")
 
 // ⑤ Stale reclaim: a marker has an upper bound, the clear is named, the
 //    selection continues, and the reclaimed op's completion is late.
@@ -110,7 +121,7 @@ if let cleared = stale.reclaimIfStale(nowMillis: 21_000) {
     check(false, "a marker past its deadline must be reclaimed")
 }
 check(stale.staleClearCount == 1, "one stale clear is counted")
-check(stale.refusal(isWorking: false, hasPendingSelection: false) == nil, "the selection continues after reclaim")
+check(stale.refusal(modelSelection: false, hasPendingSelection: false) == nil, "the selection continues after reclaim")
 check(stale.finish(generation: sg) == nil, "the reclaimed operation's completion is late")
 
 // ⑥ Reads are never reclaimed and never counted as staleness.
@@ -119,14 +130,32 @@ _ = readStale.begin(op: "presence.load", nowMillis: 0)
 check(readStale.reclaimIfStale(nowMillis: 1_000_000) == nil, "reads are never reclaimed")
 check(readStale.staleClearCount == 0, "a read is not a stale marker")
 
-// ⑦ The busy diagnostic is the required shape, and the snapshot fields are the
-//    marker's own identity.
+// ⑦ The busy diagnostic names **which half** is in flight, with the op, its age
+//    and its kind. The 2026-10-09 build 229 click answered `busy=presence.motion.stop
+//    ageMs=0 isWorking=false pending=false`, which named neither the side nor what
+//    "model" meant; `busy=model ageMs=0` was the dead end for a model-half marker.
 var detail = PresenceSelectionGate()
 _ = detail.begin(op: "presence.motion", nowMillis: 500)
-check(detail.busyDetail(nowMillis: 900, isWorking: false, hasPendingSelection: true)
-        == "busy=presence.motion ageMs=400 isWorking=false pending=true",
-      "busy detail is busy=<op> ageMs=<n> isWorking=<b> pending=<b>")
+check(detail.busyDetail(nowMillis: 900, modelMarker: nil, hasPendingSelection: true)
+        == "side=bridge op=presence.motion ageMs=400 kind=selection isWorking=false pending=true",
+      "bridge detail: side=<bridge> op= ageMs= kind= isWorking= pending=")
+check(detail.busyDetail(nowMillis: 900,
+                        modelMarker: .init(op: "presence.remove", kind: .selection, ageMs: 4_312),
+                        hasPendingSelection: false)
+        == "side=bridge op=presence.motion ageMs=400 kind=selection isWorking=true pending=false",
+      "the bridge half wins and still reports the model half is live")
+var modelOnly = PresenceSelectionGate()
+check(modelOnly.busyDetail(nowMillis: 900,
+                           modelMarker: .init(op: "presence.remove", kind: .selection, ageMs: 4_312),
+                           hasPendingSelection: false)
+        == "side=model op=presence.remove ageMs=4312 kind=selection isWorking=true pending=false",
+      "a model-half marker is named with its own op and age, not `busy=model ageMs=0`")
+check(modelOnly.busyDetail(nowMillis: 900, modelMarker: nil, hasPendingSelection: false)
+        == "side=none op=none ageMs=0 kind=none isWorking=false pending=false",
+      "no marker says side=none instead of an anonymous busy")
 check(detail.busyOperation == "presence.motion" && detail.busySinceMillis == 500, "snapshot busy fields")
+check(PresenceSelectionGate.codePreparationWaited == "presence_selection_preparation_waited",
+      "the preparation wait has its own named code")
 
 // ⑧ The read slot is a distinct slot: finishing a read does not clear the
 //    selection marker, and vice versa.
@@ -211,6 +240,20 @@ let mutations: [Mutation] = [
         return text.replacingOccurrences(of: "if operation?.generation == generation {",
                                          with: "if operation != nil {")
     },
+    // build 229's own hole: the model half was folded into the read slot's
+    // condition, so a live read *masked* a live model selection.
+    Mutation(name: "a live read masks a live model selection (`if modelSelection {` → `if modelSelection && reads.isEmpty {`)") { text in
+        guard text.contains("if modelSelection { return Self.codeBusy }") else { return nil }
+        return text.replacingOccurrences(of: "if modelSelection { return Self.codeBusy }",
+                                         with: "if modelSelection && reads.isEmpty { return Self.codeBusy }")
+    },
+    // The diagnostic regressing to an anonymous name is how the 2026-10-09
+    // click read `busy=presence.motion.stop ageMs=0` with no side at all.
+    Mutation(name: "busy detail is anonymous again (`side=bridge ...` → `busy=<op>`)") { text in
+        let anchor = "return \"side=bridge op=\\(marker.op) ageMs=\\(nowMillis &- marker.startedAtMillis)\""
+        guard text.contains(anchor) else { return nil }
+        return text.replacingOccurrences(of: anchor, with: "return \"busy=\\(marker.op)\"")
+    },
 ]
 for mutation in mutations {
     guard let mutated = mutation.apply(pristineGate), mutated != pristineGate else {
@@ -229,11 +272,22 @@ for mutation in mutations {
 // ③ Wiring: the gate is only a fix if the production sources use it.
 // ---------------------------------------------------------------------------
 let bridge = try source("apps/macos/UnityHost/UnityPresenceSettingsBridge.swift")
-check(bridge.contains("gate.refusal(isWorking:"), "③ 桥的拒绝谓词委托给 gate（不再是裸 `operation/isWorking`）")
+check(bridge.contains("gate.refusal(modelSelection: model.isSelectionWorking"),
+      "③ 桥的拒绝谓词只问模型的**选择半**（不再是 read 也置位的 `isWorking`）")
+check(!bridge.contains("gate.refusal(isWorking:") && !bridge.contains("busyDetail(nowMillis: Self.uptimeMillis(), isWorking:"),
+      "③ 旧谓词 `refusal(isWorking:)` / `busyDetail(isWorking:)` 已不存在")
 check(!bridge.contains("if operation != nil || model.isWorking { return \"presence_selection_busy\" }"),
       "③ 旧谓词 `operation != nil || model.isWorking` 已不存在")
-check(bridge.contains("reclaimStaleSelectionMarker"), "③ 下一次选择会回收陈旧标记")
+check(bridge.contains("reclaimStaleSelectionMarker"), "③ 下一次选择会回收桥侧陈旧标记")
+check(bridge.contains("model.reclaimStaleSelection("),
+      "③ 下一次选择**也**回收模型侧陈旧 selectionTask（旧的上界只在 runSelection 入口，选择路径够不到）")
+check(bridge.contains("side=bridge") && bridge.contains("side=model"),
+      "③ 两半的回收都具名 side=bridge / side=model")
 check(bridge.contains("PresenceSelectionGate.codeStaleCleared"), "③ 陈旧回收打具名码 presence_selection_stale_cleared")
+check(bridge.contains("func awaitSelectionPreparation()"),
+      "③ 桥提供「等自己的准备停止」的入口（同回合自竞争的修法）")
+check(bridge.contains("PresenceSelectionGate.codePreparationWaited"),
+      "③ 等待准备停止打具名码 presence_selection_preparation_waited")
 check(bridge.contains("\"busyOperation\"") && bridge.contains("\"busySinceMillis\""),
       "③ 快照含非破坏性 busyOperation / busySinceMillis")
 check(bridge.contains("run(\"presence.load\")") && bridge.contains("run(\"presence.catalog\", kind: .read)"),
@@ -248,6 +302,12 @@ check(mediaHost.contains("presenceSettings.rendererSelectionRevision"),
       "③ 发布给渲染器的身份是权威 revision（不随每次刷新前进）")
 check(mediaHost.contains("presenceSettings.selectionRefusalDetail(for: id)"),
       "③ 拒绝的 detail 带 gate 诊断")
+check(mediaHost.contains("await presenceSettings.awaitSelectionPreparation()"),
+      "③ settingsCommand 在选择前等自己的 `presence.motion.stop`（两处调用点都要）")
+let prepareWaits = mediaHost.components(separatedBy: "await self.presenceSettings.awaitSelectionPreparation()").count - 1
+let prepareWaitsDirect = mediaHost.components(separatedBy: "await presenceSettings.awaitSelectionPreparation()").count - 1
+check(prepareWaits + prepareWaitsDirect == 2,
+      "③ 两个 `prepareManualMotionSelection()` 调用点都等到了（设置路径 + agent 动作路径）")
 
 let model = try source("apps/macos/Sources/GMGNRadio/Settings/PresenceSettingsModel.swift")
 if let runStart = model.range(of: "private func runSelection("),
@@ -260,11 +320,53 @@ if let runStart = model.range(of: "private func runSelection("),
     if let deferIndex, let guardIndex {
         check(deferIndex.lowerBound < guardIndex.lowerBound, "③ 清理的 defer 装在 guard let self 之前")
     }
-    check(body.contains("selectionStaleAfter") && body.contains("presence_selection_stale_cleared"),
-          "③ 陈旧 selectionTask 被取消 + 具名日志")
+    check(body.contains("reclaimStaleSelection("),
+          "③ runSelection 入口仍回收陈旧 selectionTask")
 } else {
     check(false, "③ 找不到 runSelection 函数体")
 }
+
+/// 模型半的规则（模型在另一个模块，这个 harness 编不了它，只能按文本钉住）。
+/// 返回值非空 = 违规。正对照是生产源码，负对照是改回旧行为的那一份。
+func modelHalfViolations(_ text: String) -> [String] {
+    var failures: [String] = []
+    if !text.contains("var isSelectionWorking: Bool { selectionTask != nil }") {
+        failures.append("模型没有把「选择半」单独说出来：拒绝谓词只能又去问 read 也置位的 isWorking")
+    }
+    if !text.contains("runRead(op: \"presence.load\")") {
+        failures.append("load()（一次目录 bind，纯读）没有走 read 槽，会重新占住选择半")
+    }
+    if !text.contains("var selectionMarker: SelectionMarker?") {
+        failures.append("模型半没有可命名的 marker（拒绝 detail 只能写 busy=model ageMs=0）")
+    }
+    guard let reclaim = text.range(of: "func reclaimStaleSelection(") else {
+        return failures + ["模型半没有可从外部（宿主选择路径）够到的回收入口"]
+    }
+    let body = String(text[reclaim.lowerBound...].prefix(1_600))
+    if !body.contains("selectionStaleAfter") { failures.append("模型半的回收没有 selectionStaleAfter 上界") }
+    if !body.contains("presence_selection_stale_cleared") { failures.append("模型半的回收没有具名码") }
+    if !body.contains("side=model") { failures.append("模型半的回收没有说清是哪一半") }
+    if !body.contains("selectionTask?.cancel()") { failures.append("模型半的回收没有真的取消陈旧任务") }
+    return failures
+}
+
+let modelViolations = modelHalfViolations(model)
+check(modelViolations.isEmpty, "③ 模型半：读走 read 槽 / 选择半具名 / 可从宿主选择路径回收（\(modelViolations.joined(separator: "；"))）")
+
+// 负对照：改回旧行为的那一份必须被判违规。
+let modelPreFix = """
+    func load() {
+        runSelection { try await self.loadConfirmed() }
+    }
+    private func runSelection(_ body: @escaping @MainActor () async throws -> Void) {
+        if let startedAt = selectionTaskStartedAt, Date().timeIntervalSince(startedAt) >= Self.selectionStaleAfter {
+            Self.selectionLog.error("code=presence_selection_stale_cleared op=selection.task")
+            selectionTask?.cancel(); selectionTask = nil; selectionTaskStartedAt = nil; isWorking = false
+        }
+    }
+"""
+check(!modelHalfViolations(modelPreFix).isEmpty,
+      "③ 负对照：改回 `load()` 走 runSelection / 无外部回收入口的那一份必须违规")
 
 let client = try source("apps/macos/Sources/GMGNRadio/Presence/RustPresenceSelectionClient.swift")
 check(client.contains("priorWaitMillis") && client.contains("awaitPrior"),
@@ -417,7 +519,7 @@ if let newest = backups.last {
 }
 
 if failures.isEmpty {
-    print("PASS presence selection gate harness: ① green, ② \(mutations.count) injected regressions red, ③ wiring + bounded serial wait, ④ discriminator covered")
+    print("PASS presence selection gate harness: ① green, ② \(mutations.count) injected regressions red, ③ wiring (two halves named + bounded + reclaimable, preparation awaited) + bounded serial wait, ④ discriminator covered")
     exit(0)
 }
 for failure in failures { print("FAIL \(failure)") }

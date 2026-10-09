@@ -43,3 +43,28 @@ harness = false
 name = "props_remaining_toggle"
 harness = false
 
+# The 「歌单 · N」 program rail as pixels: the real `StageProgramRailPane` at its
+# own 350×430 with a 62-item catalog, so the panel the person complained about
+# (「顶部一大片空白、内容挤在下半屏」) can be looked at without a device.
+[[test]]
+name = "program_rail_shot"
+harness = false
+
+# 小窗's chat as pixels: the real `ResidentChatPane` in the original's compact
+# chat column (`.compact-window .chat-column`, `Player.uss:102`) inside a headless
+# 224×336 window, so "点聊天就切回大窗" has a picture that shows the chat **in**
+# the compact window — message list and input — plus a real-layout check that the
+# input is never pushed out of it. GPUI's macOS platform must run on the main
+# thread, so this is a `harness = false` binary test too.
+[[test]]
+name = "compact_chat_shot"
+harness = false
+
+# 启动加载态**作为像素**：真 `StartupGatePane` 在无头窗口里渲染出的「准备中」（步骤名
+# + `n/m 项已就绪` + 进度条，**没有**重试）与「卡住」（具名失败 + 重试 + 进门后按需的
+# 具名列表）两帧，外加"全部就绪后加载态必须让位"的判据。GPUI 的 macOS 平台必须在主
+# 线程创建，所以这也是 `harness = false`。
+[[test]]
+name = "startup_gate_shot"
+harness = false
+

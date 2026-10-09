@@ -22,6 +22,7 @@ use gmgn_gpui_ui::{
     ui_tokens::{self, scene},
 };
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::{
     input::{Input, InputState},
     scroll::ScrollableElement,
@@ -86,6 +87,130 @@ pub(crate) const SURFACE_BORDER: f32 = 1.;
 /// off (「消息面板没显示完整，左边缺一块」).
 pub(crate) const PANEL_CONTENT_FLOOR: f32 =
     ui_tokens::inbox::PANE_MIN_WIDTH + 2. * SURFACE_PADDING + 2. * SURFACE_BORDER;
+
+// ---- 电视 / 屏幕面板的原始数值 ----------------------------------------------
+//
+// Source: `apps/unity-player/Assets/GMGN/Resources/ScreenVideo.uss` (the
+// original Unity panel that the 电视 transport control opened) and
+// `UnityScreenVideoController.cs` (`Initialize` / `RefreshPanel`). Every number
+// here is a verbatim transcription; the comments carry the original selector.
+//
+// The panel is **not** the space-video settings page: it is the small surface
+// that lists the screens, takes one link and reports what the selected screen is
+// doing — including which item of a playlist that link expanded to.
+
+/// `.screen-video-choice { margin-bottom: 8px }` — the gap under the screen
+/// picker.
+pub(crate) const CHOICE_GAP: f32 = 8.;
+/// `.screen-video-url .unity-base-field__label { margin-bottom: 4px }`.
+pub(crate) const URL_LABEL_GAP: f32 = 4.;
+/// `.screen-video-choice .unity-base-field__input, .screen-video-url
+/// .unity-base-field__input { height: 36px; padding: 6px 10px }`.
+pub(crate) const FIELD_HEIGHT: f32 = 36.;
+/// `.screen-video-actions { height: 36px; margin-top: 8px }`.
+pub(crate) const ACTIONS_HEIGHT: f32 = 36.;
+pub(crate) const ACTIONS_TOP: f32 = 8.;
+/// `.screen-video-play { margin-right: 8px }`.
+pub(crate) const PLAY_GAP: f32 = 8.;
+/// `.screen-video-status { min-height: 20px; margin-top: 8px }`.
+pub(crate) const STATUS_MIN_HEIGHT: f32 = 20.;
+pub(crate) const STATUS_TOP: f32 = 8.;
+/// `.screen-video-rows { min-height: 20px; margin-top: 8px }` and its Label.
+pub(crate) const ROWS_MIN_HEIGHT: f32 = 20.;
+pub(crate) const ROWS_TOP: f32 = 8.;
+/// `.screen-video-status { color: #ff9c94 }` — the original's failure tint. It is
+/// a fixed overlay value (`stage::DANGER_TEXT`), never the system theme's.
+pub(crate) const STATUS_COLOR: u32 = ui_tokens::stage::DANGER_TEXT;
+
+/// The playlist row [`screen_status_projection`] built for one screen, or
+/// `Null`.
+///
+/// The host's own copy lives at `screenVideo.video.screens[]`
+/// (`UnityScreenVideoBridge.settingsSnapshot()`); it is the **only** place the
+/// backend's playlist facts live, because the outer `screenVideo.screens[]`
+/// carries just `objectID` / `name` / `state`. The pane's own projection keeps
+/// the same per-screen facts under `screenVideo.status[]`.
+pub(crate) fn screen_status<'a>(snapshot: &'a Value, object_id: &str) -> &'a Value {
+    snapshot["screenVideo"]["status"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["objectID"].as_str() == Some(object_id))
+        })
+        .unwrap_or(&Value::Null)
+}
+
+/// 「播放列表 2/10」 from the host's own `playlistIndex` / `playlistCount`
+/// (`NativeScreenPlaybackCoordinator.Session.playlistText`, published at
+/// `UnityScreenVideoBridge.swift:398-400`). The UI never re-counts a playlist it
+/// did not import; a screen that is not on a playlist shows nothing.
+pub(crate) fn playlist_line(row: &Value) -> Option<String> {
+    let count = row["playlistCount"].as_u64()?;
+    if count == 0 {
+        return None;
+    }
+    let index = row["playlistIndex"].as_u64().unwrap_or(0);
+    Some(format!("播放列表 {}/{}", (index + 1).min(count), count))
+}
+
+/// 「m:ss」 — the original's `Duration` formatting
+/// (`MusicLibraryPanel.cs` `Duration`: `$"{(int)seconds / 60}:{(int)seconds % 60:00}"`).
+pub(crate) fn clock(seconds: f64) -> String {
+    let total = if seconds.is_finite() {
+        seconds.max(0.).floor() as u64
+    } else {
+        0
+    };
+    format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// 「01:23 / 04:05」 for a finite item, 「直播」 for a live one, and nothing at all
+/// until the decoder reports a clock. The numbers are the host's
+/// `currentSeconds` / `durationSeconds`; a missing duration is not invented as 0.
+pub(crate) fn progress_line(row: &Value) -> Option<String> {
+    if row["isLive"].as_bool() == Some(true) {
+        return Some("直播".to_owned());
+    }
+    let current = row["currentSeconds"].as_f64()?;
+    if !current.is_finite() || current < 0. {
+        return None;
+    }
+    let duration = row["durationSeconds"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value > 0.);
+    Some(match duration {
+        Some(duration) => format!("{} / {}", clock(current), clock(duration)),
+        None => clock(current),
+    })
+}
+
+/// The 电视 panel's second half: the playlist position and the clock the host
+/// publishes per screen in `screenVideo.video.screens[]`. Only the fields the
+/// panel draws are projected, and the clock is quantized to whole seconds, so a
+/// 60 Hz `currentSeconds` does not notify the pane 60 times a second.
+pub(crate) fn screen_status_projection(snapshot: &Value) -> Vec<Value> {
+    rows(&snapshot["screenVideo"]["video"], "screens")
+        .iter()
+        .map(|s| {
+            json!({
+                "objectID": s["objectID"],
+                "state": s["state"],
+                "playlistIndex": s["playlistIndex"],
+                "playlistCount": s["playlistCount"],
+                "playlistRevision": s["playlistRevision"],
+                "currentSeconds": s["currentSeconds"].as_f64().map(|v| v.floor()),
+                "durationSeconds": s["durationSeconds"].as_f64().map(|v| v.floor()),
+                "isLive": s["isLive"] == true,
+            })
+        })
+        .collect()
+}
+
+/// The only ops the 电视 panel may send. Every one of them is in
+/// `UnityScreenVideoBridge.supportedCommands`; the backend has **no**
+/// skip-to-playlist-item op (a playlist advances on the player's own EOF
+/// receipt), so the panel must not offer one.
+pub(crate) const SCREEN_OPS: [&str; 3] = ["screen.list", "screen.play", "screen.stop"];
 
 fn media_surface() -> Div {
     ui::scene_card()
@@ -460,7 +585,7 @@ impl MediaPane {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         match self.section {
             0 | 2 => self.load_catalog(cx),
-            3 => self.submit(json!({"op":"screen.list"}), cx),
+            3 => self.submit(json!({"op": SCREEN_OPS[0]}), cx),
             4 => self.submit(json!({"op":"inbox.list"}), cx),
             5 => self.submit(json!({"op":"wish.status"}), cx),
             _ => {}
@@ -567,11 +692,35 @@ impl MediaPane {
         // form state and must not relayout catalog lists on each host frame.
         let screens: Vec<_> = rows(&snapshot["screenVideo"], "screens")
             .iter()
-            .map(|s| json!({"objectID":s["objectID"],"name":s["name"],"state":s["state"]}))
+            .map(|s| json!({"objectID":s["objectID"],"name":s["name"],"state":s["state"],"playing":s["playing"] == true}))
             .collect();
+        // The 电视 panel's second half: the playlist position and the clock the
+        // host publishes per screen in `screenVideo.video.screens[]`. Only the
+        // fields the panel draws are projected, and the clock is quantized to
+        // whole seconds, so a 60 Hz `currentSeconds` does not notify the pane
+        // 60 times a second.
+        let screen_status = screen_status_projection(snapshot);
+        // The original panel is usable the moment it opens: its `DropdownField`
+        // selects the first screen (`UnityScreenVideoController.RefreshPanel`:
+        // `screenChoice.index = index >= 0 ? index : screenIDs.Count > 0 ? 0 : -1`).
+        // Without this the panel listed 「客厅电视」 and simultaneously told the
+        // person 「空间中尚无屏幕，请先放置屏幕物件。」, and 播放/停止 stayed dead
+        // until a screen was clicked by hand.
+        let selected_still_exists = self.selected_screen.as_deref().is_some_and(|id| {
+            screens
+                .iter()
+                .any(|screen| screen["objectID"].as_str() == Some(id))
+        });
+        if !selected_still_exists {
+            self.selected_screen = screens
+                .first()
+                .and_then(|screen| screen["objectID"].as_str())
+                .map(str::to_owned);
+        }
         let projection = json!({"world":{"worldID":snapshot["world"]["worldID"]},
             "music":{"queueIndex":snapshot["music"]["queueIndex"]},
             "screenVideo":{"screens":screens,"commandNotice":snapshot["screenVideo"]["commandNotice"],
+                "status":screen_status,
                 "pendingBoundVideo":snapshot["screenVideo"]["video"]["pendingBoundVideo"]}});
         if self.snapshot["world"]["worldID"] != snapshot["world"]["worldID"] {
             self.inbox = json!({});
@@ -657,19 +806,35 @@ impl MediaPane {
         ))
         .into_any_element()
     }
+    /// 电视 — the original `screen-video-panel`
+    /// (`UnityScreenVideoController.Initialize` + `Resources/ScreenVideo.uss`):
+    /// a screen picker, one 36 pt link field, a 36 pt 播放 / 停止 row, the command
+    /// status line, and the selected screen's own readout.
+    ///
+    /// The readout is where the backend's playlist was missing: the outer
+    /// `screenVideo.screens[]` carries only a pre-joined `state` string, while the
+    /// structured `playlistIndex` / `playlistCount` / `playlistRevision` and the
+    /// `currentSeconds` / `durationSeconds` / `isLive` clock live in
+    /// `screenVideo.video.screens[]` — published by the host since the playlist
+    /// work, and read by **nothing** in this UI until now. The panel only reads
+    /// them: there is no skip-to-item op in the backend, so the panel does not
+    /// invent one (a playlist advances on the player's own EOF receipt).
     fn screen(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut body = div().flex().flex_col().gap_3().child("空间屏幕");
+        let mut choice = div().flex().flex_col().gap_2().mb(px(CHOICE_GAP));
         for screen in rows(&self.snapshot["screenVideo"], "screens") {
             let id = text(&screen, "objectID");
             let selected = self.selected_screen.as_deref() == Some(&id);
-            body = body.child(media_row(
-                format!(
-                    "{}{} · {}",
-                    if selected { "已选择 · " } else { "" },
-                    text(&screen, "name"),
-                    text(&screen, "state")
-                ),
-                selected,
+            let playing = screen["playing"] == true;
+            let label = format!(
+                "{}{} · {}{}",
+                if selected { "已选择 · " } else { "" },
+                text(&screen, "name"),
+                text(&screen, "state"),
+                if playing { " ▶" } else { "" }
+            );
+            choice = choice.child(media_row(
+                label,
+                selected || playing,
                 ui::icon_button(
                     SharedString::from(format!("screen:{id}")),
                     IconName::PanelRight,
@@ -684,24 +849,107 @@ impl MediaPane {
             ));
         }
         if self.selected_screen.is_none() {
-            body = body.child("空间中尚无屏幕，请先放置屏幕物件。");
+            choice = choice.child("空间中尚无屏幕，请先放置屏幕物件。");
         }
         let disabled = self.selected_screen.is_none();
-        body=body.child(div().flex().flex_col().gap_2().child("视频链接").child(Input::new(&self.url).disabled(disabled)))
-            .child("支持视频、直播与 YouTube 播放列表。播放进度以屏幕回执为准。")
-            .child(div().flex().gap_2()
-                .child(ui::icon_button("screen-play", IconName::Play, "播放链接", false, !disabled)
-                    .on_click(cx.listener(|this,_,_,cx|{
-                        let url=this.url.read(cx).value().trim().to_owned();
-                        if url.trim().is_empty() {this.notice="请填写视频链接".into();cx.notify();return;}
-                        this.submit(json!({"op":"screen.play","objectID":this.selected_screen,"url":url}),cx);
-                    })))
-                .child(self.button("screen-stop".into(),"停止播放".into(),json!({"op":"screen.stop","objectID":self.selected_screen}),disabled,cx)));
-        let notice = text(&self.snapshot["screenVideo"], "commandNotice");
-        if !notice.is_empty() {
-            body = body.child(notice);
+        let link = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .mb(px(URL_LABEL_GAP))
+                    .child(ui::muted("视频链接")),
+            )
+            .child(
+                div()
+                    .h(px(FIELD_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .child(Input::new(&self.url).disabled(disabled)),
+            );
+        let actions = div()
+            .flex()
+            .items_center()
+            .h(px(ACTIONS_HEIGHT))
+            .mt(px(ACTIONS_TOP))
+            // The original's two labelled buttons, each `flex-grow: 1` in a 36 pt
+            // row with an 8 pt gap (`.screen-video-actions Button { flex-grow: 1 }`,
+            // `.screen-video-play { margin-right: 8px }`). An icon-only control
+            // would drop the words 播放 / 停止 the original prints.
+            .child(
+                ui::capsule_button("screen-play", "播放")
+                    .flex_1()
+                    .h(px(ACTIONS_HEIGHT))
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let url = this.url.read(cx).value().trim().to_owned();
+                        if url.trim().is_empty() {
+                            this.notice = "请填写视频链接".into();
+                            cx.notify();
+                            return;
+                        }
+                        this.submit(
+                            json!({"op": SCREEN_OPS[1],"objectID":this.selected_screen,"url":url}),
+                            cx,
+                        );
+                    })),
+            )
+            .child(div().w(px(PLAY_GAP)).flex_shrink_0())
+            .child(
+                ui::capsule_button("screen-stop", "停止")
+                    .flex_1()
+                    .h(px(ACTIONS_HEIGHT))
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.submit(
+                            json!({"op": SCREEN_OPS[2],"objectID":this.selected_screen}),
+                            cx,
+                        );
+                    })),
+            );
+        let command_notice = text(&self.snapshot["screenVideo"], "commandNotice");
+        let status = div()
+            .flex_shrink_0()
+            .min_h(px(STATUS_MIN_HEIGHT))
+            .mt(px(STATUS_TOP))
+            .text_size(px(ui_tokens::BODY))
+            .text_color(rgba(STATUS_COLOR))
+            .child(command_notice);
+        // The selected screen's playlist item and clock, exactly as the host
+        // publishes them. A screen the host has not reported yet shows nothing
+        // rather than a fabricated 「播放列表 1/1」.
+        let status_row = self
+            .selected_screen
+            .as_deref()
+            .map(|id| screen_status(&self.snapshot, id).clone())
+            .unwrap_or(Value::Null);
+        let mut readout = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt(px(ROWS_TOP))
+            .min_h(px(ROWS_MIN_HEIGHT))
+            .text_size(px(ui_tokens::BODY))
+            .text_color(rgba(scene::TEXT));
+        if let Some(playlist) = playlist_line(&status_row) {
+            readout = readout.child(playlist);
         }
-        body.into_any_element()
+        if let Some(progress) = progress_line(&status_row) {
+            readout = readout.child(progress);
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(choice)
+            .child(link)
+            .child(actions)
+            .child(status)
+            .child(readout)
+            .child(ui::muted(
+                "支持视频、直播与 YouTube 播放列表。播放进度以屏幕回执为准。",
+            ))
+            .into_any_element()
     }
     fn wish(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut body = div().flex().flex_col().gap_3();
@@ -1290,5 +1538,151 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// The backend already publishes the playlist the 电视 panel was built to
+    /// drive: `screenVideo.video.screens[]` carries `playlistIndex`,
+    /// `playlistCount`, `playlistRevision`, `currentSeconds`, `durationSeconds`
+    /// and `isLive` (`UnityScreenVideoBridge.swift:387-401`). Until this change
+    /// **no** Rust UI read any of those keys, so the panel could not say which
+    /// item of a playlist was playing. This is the field-level wire.
+    #[test]
+    fn the_tv_panel_projects_every_playlist_field_the_host_publishes() {
+        let host = json!({
+            "screenVideo": {
+                "screens": [{"objectID": "tv", "name": "电视", "state": "播放中 · 播放列表 2/10",
+                             "playing": true}],
+                "commandNotice": "",
+                "video": {
+                    "screens": [{
+                        "objectID": "tv", "state": "播放中",
+                        "currentSeconds": 83.7, "durationSeconds": 245.2,
+                        "playbackRate": 1, "timeControlStatus": "playing",
+                        "waitingReason": null, "decodedFrames": 1234,
+                        "playbackEndCount": 1, "isLive": false,
+                        "playlistIndex": 1, "playlistCount": 10, "playlistRevision": 3
+                    }],
+                    "pendingBoundVideo": null
+                }
+            }
+        });
+        let projected = screen_status_projection(&host);
+        assert_eq!(projected.len(), 1, "one row per published screen");
+        let row = &projected[0];
+        for key in [
+            "playlistIndex",
+            "playlistCount",
+            "playlistRevision",
+            "currentSeconds",
+            "durationSeconds",
+            "isLive",
+        ] {
+            assert!(
+                row.get(key).is_some(),
+                "the projection must carry `{key}`; it carried {row}"
+            );
+        }
+        assert_eq!(row["playlistIndex"], 1);
+        assert_eq!(row["playlistCount"], 10);
+        assert_eq!(row["playlistRevision"], 3);
+        // The clock is quantized: the panel draws m:ss, and a 60 Hz float would
+        // notify the pane 60 times a second for no visible change.
+        assert_eq!(row["currentSeconds"], 83.0);
+        assert_eq!(row["durationSeconds"], 245.0);
+        assert_eq!(row["isLive"], false);
+        // …and it is the row the panel actually looks up.
+        let live = json!({"screenVideo": {"status": projected}});
+        let found = screen_status(&live, "tv");
+        assert_eq!(found["playlistRevision"], 3);
+        assert!(
+            screen_status(&live, "gone").is_null(),
+            "an unknown screen reads as Null, never as another screen's playlist"
+        );
+    }
+
+    /// 「播放列表 2/10」 is the host's own index/count — the panel never re-counts
+    /// a playlist it did not import, and a screen that is not on a playlist shows
+    /// no line at all.
+    #[test]
+    fn the_playlist_and_clock_lines_are_the_hosts_own_numbers() {
+        let on_playlist = json!({"playlistIndex": 1, "playlistCount": 10,
+            "currentSeconds": 83.0, "durationSeconds": 245.0, "isLive": false});
+        assert_eq!(playlist_line(&on_playlist).as_deref(), Some("播放列表 2/10"));
+        assert_eq!(progress_line(&on_playlist).as_deref(), Some("1:23 / 4:05"));
+        assert_eq!(clock(0.), "0:00");
+        assert_eq!(clock(59.9), "0:59");
+        assert_eq!(clock(60.), "1:00");
+        assert_eq!(clock(3599.), "59:59");
+        assert_eq!(clock(f64::NAN), "0:00");
+
+        // Live: no clock, one word.
+        let live = json!({"isLive": true, "currentSeconds": 12.0, "durationSeconds": null});
+        assert_eq!(progress_line(&live).as_deref(), Some("直播"));
+
+        // Not a playlist / nothing reported yet: no invented 「1/1」.
+        assert_eq!(playlist_line(&json!({"playlistCount": 0})), None);
+        assert_eq!(playlist_line(&json!({"playlistCount": null})), None);
+        assert_eq!(
+            playlist_line(&json!({"playlistIndex": 0, "playlistCount": 1})).as_deref(),
+            Some("播放列表 1/1"),
+            "a one-item playlist the host really imported is still a playlist"
+        );
+        assert_eq!(progress_line(&json!({"currentSeconds": null})), None);
+        assert_eq!(
+            progress_line(&json!({"currentSeconds": 30.0, "durationSeconds": 0.0})).as_deref(),
+            Some("0:30"),
+            "a duration the decoder has not reported is not turned into 0:00"
+        );
+    }
+
+    /// The panel sends only ops the host already dispatches, and it sends them
+    /// with the fields `UnityScreenVideoBridge.command` validates. There is no
+    /// skip-to-item op in the backend, so 上一集/下一集 must not exist here.
+    #[test]
+    fn the_tv_panel_only_sends_the_hosts_existing_screen_ops() {
+        assert_eq!(
+            SCREEN_OPS,
+            ["screen.list", "screen.play", "screen.stop"],
+            "the panel's op set is the host's supported set, not a new one"
+        );
+        let play = json!({"op": SCREEN_OPS[1], "objectID": "tv", "url": "https://example.test/v"});
+        assert!(play["objectID"].is_string() && play["url"].is_string());
+        let stop = json!({"op": SCREEN_OPS[2], "objectID": "tv"});
+        assert!(stop["objectID"].is_string());
+        for op in SCREEN_OPS {
+            assert!(
+                !op.starts_with("screen.next")
+                    && !op.starts_with("screen.previous")
+                    && !op.starts_with("screen.playlist"),
+                "no playlist-stepping op exists in `UnityScreenVideoBridge.supportedCommands`"
+            );
+        }
+    }
+
+    /// The 电视 panel's own metrics are the original `ScreenVideo.uss`
+    /// selectors, so a re-layout that drifts from the original numbers fails
+    /// here instead of only being visible on a device.
+    #[test]
+    fn the_tv_panel_metrics_are_the_original_stylesheet_values() {
+        // `.screen-video-choice { margin-bottom: 8px }`.
+        assert_eq!(CHOICE_GAP, 8.);
+        // `.screen-video-url .unity-base-field__label { margin-bottom: 4px }`.
+        assert_eq!(URL_LABEL_GAP, 4.);
+        // `… .unity-base-field__input { height: 36px; padding: 6px 10px }`.
+        assert_eq!(FIELD_HEIGHT, 36.);
+        // `.screen-video-actions { height: 36px; margin-top: 8px }` and
+        // `.screen-video-play { margin-right: 8px }`.
+        assert_eq!(ACTIONS_HEIGHT, 36.);
+        assert_eq!(ACTIONS_TOP, 8.);
+        assert_eq!(PLAY_GAP, 8.);
+        // `.screen-video-status { min-height: 20px; margin-top: 8px;
+        //  color: #ff9c94 }` — the tint is the pinned overlay danger token, not
+        //  a raw literal and not the system theme's.
+        assert_eq!(STATUS_MIN_HEIGHT, 20.);
+        assert_eq!(STATUS_TOP, 8.);
+        assert_eq!(STATUS_COLOR, ui_tokens::stage::DANGER_TEXT);
+        // `.screen-video-rows { min-height: 20px; margin-top: 8px }`.
+        assert_eq!(ROWS_MIN_HEIGHT, 20.);
+        assert_eq!(ROWS_TOP, 8.);
     }
 }

@@ -3,6 +3,7 @@ use super::scene_variant;
 use crate::projective_card::{
     CardEffects, CardShadow, CardTransform, ProjectedCard, RailMask, RgbaTexture, ScrollTransition,
 };
+use crate::primitives as ui;
 use crate::ui_tokens as doc;
 use crate::ui_tokens::scene as s;
 
@@ -1496,7 +1497,127 @@ impl StageProgramRailPane {
             }))
             .into_any_element()
     }
+    /// One catalog row, transcribed from the original Unity 「音乐库 / 歌单」
+    /// panel (`MusicLibraryPanel.BuildList` / `BuildProgramList` +
+    /// `Resources/MusicLibrary.uss`): an 84 pt `.music-library-playlist-slot`
+    /// holding a full-width 76 pt `.music-library-playlist` — 12 pt padding,
+    /// 18 pt radius, one 1 pt `--line` border, `rgba(40,44,50,0.86)` — with a
+    /// 44 pt `.music-library-cover` plate, the name over the
+    /// `.music-library-secondary` source/count line, and the 22 pt 「›」. The
+    /// entry the host calls current wears `.music-library-current`, re-toned
+    /// onto the pinned overlay selection surface (`scene::SELECTED_SOFT` fill,
+    /// `scene::SELECTED` text) instead of the original `#083b51`.
+    fn catalog_row(
+        &self,
+        item: &Value,
+        is_playlist: bool,
+        op: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = item["id"].as_str().unwrap_or_default().to_owned();
+        let current = item["isCurrent"].as_bool() == Some(true);
+        let pending = item["isPending"].as_bool() == Some(true);
+        // The original program row prints its state as a badge in front of the
+        // name (`BuildProgramList`: 「当前 · 」/「待切换 · 」).
+        let name = format!(
+            "{}{}",
+            if !is_playlist && current {
+                "当前 · "
+            } else if !is_playlist && pending {
+                "待切换 · "
+            } else {
+                ""
+            },
+            item["title"].as_str().unwrap_or("")
+        );
+        let secondary = item["subtitle"].as_str().unwrap_or("").to_owned();
+        let mut row = div()
+            .id(SharedString::from(format!("program-row:{id}")))
+            .w_full()
+            .h(px(m::LIST_ROW_HEIGHT))
+            .flex_shrink_0()
+            .px(px(m::LIST_ROW_PADDING))
+            .flex()
+            .items_center()
+            .rounded(px(m::LIST_ROW_RADIUS))
+            .border(px(m::LIST_ROW_BORDER))
+            .border_color(rgba(s::BORDER))
+            .bg(rgba(if current {
+                m::LIST_CURRENT_BG
+            } else {
+                m::LIST_ROW_BG
+            }))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.commands.push(json!({"op": op, "id": id.clone()}));
+                cx.notify();
+            }));
+        if is_playlist {
+            row = row.child(
+                div()
+                    .w(px(m::LIST_COVER))
+                    .h(px(m::LIST_COVER))
+                    .flex_shrink_0()
+                    .mr(px(m::LIST_COVER_GAP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(m::LIST_COVER_RADIUS))
+                    .bg(rgba(m::LIST_COVER_BG))
+                    .child(
+                        gpui_kit::component::Icon::new(AssetIcon::Music)
+                            .size(px(m::LIST_COVER / 2.2))
+                            .text_color(ui::icon_color(current, true)),
+                    ),
+            );
+        }
+        row = row
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(doc::BODY))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgba(if current { s::SELECTED } else { s::TEXT }))
+                            .truncate()
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .mt(px(m::LIST_SECONDARY_GAP))
+                            .text_size(px(doc::CAPTION))
+                            .text_color(rgba(s::TEXT_MUTED))
+                            .truncate()
+                            .child(secondary),
+                    ),
+            )
+            .child(
+                div()
+                    .ml(px(m::LIST_TRAILING_GAP))
+                    .flex_shrink_0()
+                    .text_size(px(if is_playlist {
+                        m::LIST_TRAILING_SIZE
+                    } else {
+                        doc::CAPTION
+                    }))
+                    .text_color(rgba(if current { s::SELECTED } else { s::TEXT_MUTED }))
+                    .child(if is_playlist { "\u{203a}" } else { "" }),
+            );
+        div()
+            .w_full()
+            .h(px(m::LIST_SLOT_HEIGHT))
+            .flex_shrink_0()
+            .pb(px(m::LIST_SLOT_PADDING))
+            .overflow_hidden()
+            .child(row)
+            .into_any_element()
+    }
 }
+
 impl Render for StageProgramRailPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         {
@@ -1580,16 +1701,18 @@ impl Render for StageProgramRailPane {
                 .child(div().mt(px(m::EMPTY_TOP_PADDING)).child(state))
                 .child(self.material_publisher(cx));
         }
-        let mut content = div()
-            .flex()
-            .flex_col()
-            .items_end()
-            .gap(px(if tracks {
-                TRACK_SPACING
-            } else {
-                PROGRAM_SPACING
-            }))
-            .py(px(m::CONTENT_MARGIN));
+        // The catalog list fills the panel it is opened in; the macOS floating
+        // rail keeps its trailing alignment and content margins.
+        let mut content = div().flex().flex_col().gap(px(if tracks {
+            TRACK_SPACING
+        } else {
+            PROGRAM_SPACING
+        }));
+        if tracks {
+            content = content.items_end().py(px(m::CONTENT_MARGIN));
+        } else {
+            content = content.w_full();
+        }
         // The original header hugs the trailing edge (the rail is a trailing
         // `VStack`): it is sized by its content, never stretched across the rail,
         // so the back control sits next to the title instead of at the far left.
@@ -1604,8 +1727,10 @@ impl Render for StageProgramRailPane {
             .px(px(m::HEADER_H_PADDING))
             .text_size(px(m::HEADER_SIZE))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgba(m::HEADER_TEXT))
-            .self_end();
+            .text_color(rgba(m::HEADER_TEXT));
+        if tracks {
+            header = header.self_end();
+        }
         if tracks {
             // Preserve negative Swift zIndex values by shifting every priority
             // equally, rather than collapsing all distant cards to zero.
@@ -1723,19 +1848,27 @@ impl Render for StageProgramRailPane {
                 );
             }
         } else {
+            // 「歌单 · N」: the original Unity catalog list
+            // (`MusicLibraryPanel.BuildList` / `BuildProgramList` +
+            // `Resources/MusicLibrary.uss`). The title sits on the leading edge
+            // and the refresh control on the trailing one, and every entry is a
+            // **full-width** 84 pt slot — not the macOS rail's 306 pt floating
+            // card, which is what the report saw as 「顶部一大片空白、内容挤在
+            // 下半屏」 inside the 590 pt media panel.
             header = header
+                .w_full()
+                .child(format!(
+                    "歌单 · {}",
+                    self.snapshot["programs"].as_array().map_or(0, Vec::len)
+                        + self.snapshot["playlists"].as_array().map_or(0, Vec::len)
+                ))
+                .child(div().flex_1())
                 .child(self.icon_button(
                     "program-replan",
                     AssetIcon::RefreshCw,
                     "重新编排",
                     json!({"op":"stage.program.replan"}),
                     cx,
-                ))
-                .child(div().w(px(doc::SPACING_4)))
-                .child(format!(
-                    "歌单 · {}",
-                    self.snapshot["programs"].as_array().map_or(0, Vec::len)
-                        + self.snapshot["playlists"].as_array().map_or(0, Vec::len)
                 ));
             for (key, op) in [
                 ("programs", "stage.program.open"),
@@ -1743,26 +1876,30 @@ impl Render for StageProgramRailPane {
             ] {
                 let items = self.snapshot[key].as_array().cloned().unwrap_or_default();
                 for item in &items {
-                    let row = self.projected_card(item, true, key == "playlists", op, window, cx);
-                    content = content.child(row);
+                    content = content.child(self.catalog_row(item, key == "playlists", op, cx));
                 }
             }
         }
-        div()
+        let mut rail = div()
             .id("stage-program-rail")
             .capture_any_mouse_down(cx.listener(|this, _, _, _| this.pressed_card = None))
             .w_full()
             .h_full()
-            .max_w(px(m::RAIL_WIDTH))
-            .max_h(px(m::RAIL_HEIGHT))
-            .pt(px(m::RAIL_TOP))
-            .pr(px(m::RAIL_TRAILING))
             .flex()
             .flex_col()
-            .items_end()
-            .gap(px(m::RAIL_GAP))
+            .gap(px(if tracks { m::RAIL_GAP } else { m::LIST_HEADER_GAP }))
             .font_family(doc::FONT_FAMILY)
-            .text_color(rgba(s::TEXT))
+            .text_color(rgba(s::TEXT));
+        if tracks {
+            // The macOS stage rail: a 350×430 trailing card column.
+            rail = rail
+                .max_w(px(m::RAIL_WIDTH))
+                .max_h(px(m::RAIL_HEIGHT))
+                .pt(px(m::RAIL_TOP))
+                .pr(px(m::RAIL_TRAILING))
+                .items_end();
+        }
+        rail
             .child(header)
             .child(
                 div()
@@ -2148,102 +2285,72 @@ mod tests {
         assert!(!worker.busy());
     }
     #[test]
-    fn real_fifty_catalog_draw_bounds_source_work_to_visible_rows_and_reuses_textures() {
+    fn real_fifty_catalog_list_delivers_rows_without_rasterizing_a_single_card() {
         use gpui_kit::{AppContext, TestAppContext, point, px};
-        use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+        use std::cell::RefCell;
+        use std::rc::Rc;
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
         let stored = Rc::new(RefCell::new(None));
         let entity = stored.clone();
-        let cold = std::time::Instant::now();
-        let handle=cx.add_window(move|window,cx|{
-            let pane=cx.new(|cx|{
-                let mut pane=super::StageProgramRailPane::new(window,cx);
-                // Unit regression only: no provider/library writes or requests.
-                pane.snapshot=json!({"route":"programs","programs":(0..50).map(|i|json!({"id":format!("perf-{i}"),"title":"回归布局字段","subtitle":"缓存工作量"})).collect::<Vec<_>>(),"playlists":[]});
-                pane.set_native_material_renderer(Some(Rc::new(|_|true)),cx);
+        let handle = cx.add_window(move |window, cx| {
+            let pane = cx.new(|cx| {
+                let mut pane = super::StageProgramRailPane::new(window, cx);
+                pane.snapshot = fifty_program_catalog();
+                pane.set_native_material_renderer(Some(Rc::new(|_| true)), cx);
                 pane
             });
-            *entity.borrow_mut()=Some(pane.clone());
-            gpui_kit::base::Root::new(pane,window,cx)
+            *entity.borrow_mut() = Some(pane.clone());
+            gpui_kit::base::Root::new(pane, window, cx)
         });
-        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
             .unwrap();
-        let cold_elapsed = cold.elapsed();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let busy = cx.update(|cx| {
-                stored
-                    .borrow()
-                    .as_ref()
-                    .unwrap()
-                    .read(cx)
-                    .prepare_worker
-                    .busy()
-            });
-            if !busy {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "bounded background prepare must complete"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
-            .unwrap();
-        let initial = cx.update(|cx| {
-            let pane = stored.borrow().as_ref().unwrap().read(cx);
-            assert_eq!(
-                pane.focus_handles.len(),
-                50,
-                "offscreen rows retain original keyboard/AX entries and layout"
-            );
-            let sources = pane.card_cache.borrow();
-            assert!(!sources.is_empty());
-            assert!(
-                sources.len() <= 10,
-                "never rasterize the entire fifty-row library on first draw"
-            );
-            assert_eq!(sources.len(), pane.material_sources.borrow().len());
-            sources
-                .iter()
-                .map(|(id, (_, source))| (id.clone(), Arc::as_ptr(source)))
-                .collect::<HashMap<_, _>>()
-        });
-        let warm = std::time::Instant::now();
-        cx.update_window(handle.into(), |_, window, cx| { window.refresh(); window.draw(cx).clear(cx) })
-            .unwrap();
-        let warm_elapsed = warm.elapsed();
+        };
+        let start = std::time::Instant::now();
+        draw(&mut cx);
         cx.update(|cx| {
             let pane = stored.borrow().as_ref().unwrap().read(cx);
-            let sources = pane.card_cache.borrow();
-            assert_eq!(sources.len(), initial.len());
-            for (id, pointer) in &initial {
-                assert_eq!(
-                    Arc::as_ptr(&sources[id].1),
-                    *pointer,
-                    "warm frame performs no text/SVG raster rebuild"
-                );
-            }
+            assert!(pane.focus_handles.is_empty(), "a list row owns no card focus handle");
+            assert!(pane.card_cache.borrow().is_empty(), "the list rasterizes nothing");
+            assert!(pane.material_sources.borrow().is_empty(), "…and publishes no material source");
+            assert!(!pane.prepare_worker.busy(), "the list queues no raster work");
         });
-        let scrolled = std::time::Instant::now();
         cx.update_window(handle.into(), |_, window, cx| {
             stored.borrow().as_ref().unwrap().update(cx, |pane, cx| {
                 pane.scroll.set_offset(point(px(0.), px(-1200.)));
                 cx.notify();
             });
-            { window.refresh(); window.draw(cx).clear(cx) };
+            window.refresh();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
-        let scroll_elapsed = scrolled.elapsed();
-        cx.update(|cx|{
-            let pane=stored.borrow().as_ref().unwrap().read(cx);
-            let count=pane.card_cache.borrow().len();
-            assert!(count<=initial.len()+10,"far scroll prepares only newly visible rows, not remaining fifty");
-            assert!(pane.native_material_frame().cards.len()<=10);
-            eprintln!("50-row Window coldWithSetup={cold_elapsed:?} warm={warm_elapsed:?} farScroll={scroll_elapsed:?}; initialSources={} totalAfterFarScroll={count}",initial.len());
+        draw(&mut cx);
+        cx.update(|cx| {
+            let pane = stored.borrow().as_ref().unwrap().read(cx);
+            assert!(pane.card_cache.borrow().is_empty());
+            assert!(pane.material_sources.borrow().is_empty());
+            assert!(pane.native_material_frame().cards.is_empty());
+            assert!(pane.focus_handles.is_empty());
         });
+        eprintln!("50-row catalog list: {:?}, rasterized=0", start.elapsed());
+    }
+
+    /// A 50-row 歌单 catalog, built outside the macro so the test body stays
+    /// small enough for the compiler's proc-macro recursion budget.
+    fn fifty_program_catalog() -> serde_json::Value {
+        let mut programs = Vec::new();
+        for i in 0..50 {
+            programs.push(json!({
+                "id": format!("perf-{i}"),
+                "title": "回归布局字段",
+                "subtitle": "缓存工作量",
+            }));
+        }
+        json!({"route": "programs", "programs": programs, "playlists": []})
     }
     #[test]
     fn real_material_frame_uses_foreground_geometry_and_same_frame_failure_fallback() {
@@ -2259,7 +2366,12 @@ mod tests {
         let handle = cx.add_window(move |window, cx| {
             let pane = cx.new(|cx| {
                 let mut pane = super::StageProgramRailPane::new(window, cx);
-                pane.snapshot = json!({"route":"programs","programs":[{"id":"material-geometry","title":"真实字段","subtitle":"内容"}],"playlists":[]});
+                // The catalog route draws the original full-width list, so the
+                // only card it still rasterizes is the empty-state waveform card
+                // — which is the card this material-frame contract is measured on
+                // (142×64 r22, not the old 306×74 catalog card).
+                pane.snapshot = json!({"route":"programs","programs":[],"playlists":[],
+                    "emptyMessage":"暂无节目"});
                 pane.set_native_material_renderer(Some(std::rc::Rc::new(move |frame| {
                     *frames.borrow_mut() = frame.clone();
                     returned.get()
@@ -2293,7 +2405,11 @@ mod tests {
         );
         assert!(latest.borrow().viewport[3] > 0.);
         let card = latest.borrow().cards[0].clone();
-        assert_eq!((card.width, card.height, card.radius), (306., 74., 22.));
+        assert_eq!(
+            (card.width.round(), card.height, card.radius),
+            (142., 64., 22.),
+            "the empty-state card the list route still rasterizes, not a catalog card"
+        );
         cx.update(|cx| {
             let pane = stored.borrow().as_ref().unwrap().read(cx);
             assert!(

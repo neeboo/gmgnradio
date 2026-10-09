@@ -36,6 +36,11 @@ namespace GMGN.UnityPlayer
         public int GlowTargetAllocationCount { get; private set; }
         public bool IsGpuReady => compute != null && material != null;
         public bool EnsureGpuReady() => Initialize();
+        // True while the current track's glyphs have not been warmed yet, which
+        // is exactly when `Rebuild()` is a whole-content rebuild rather than a
+        // cheap relayout. Measured on the reported machine: the warm is
+        // 411.747 ms of a 422.807 ms rebuild; a warmed rebuild is 0.698 ms.
+        bool WarmPending => warmedSession != session || warmedRevision != revision;
         public string Mode { get; private set; } = "luminous";
         const int MaximumGlyphs = 512;
         readonly List<LyricGlyphSeed> descriptors = new();
@@ -140,8 +145,15 @@ namespace GMGN.UnityPlayer
             var index = ActiveLineIndex(clock);
             var layoutChanged = SettleViewport(Screen.width, Screen.height, panelScale, Time.realtimeSinceStartupAsDouble);
             if (index != activeIndex || layoutChanged) {
-                activeIndex = index;
-                Rebuild();
+                // Never start a whole-content rebuild inside a native framebuffer
+                // move. The GPUI overlay is an NSView mounted in this same
+                // process, so a stall here is the transition's "no overlay
+                // frame" gap. The last complete layout keeps drawing and the
+                // rebuild is retried on the first settled frame.
+                if (!ViewportTransition.DeferFullRebuild(WarmPending, NativeUIScale.FramebufferMoving)) {
+                    activeIndex = index;
+                    Rebuild();
+                }
             }
             if (PointCapacity == 0) return;
             compute.SetInt("_PointCount", PointCapacity);
@@ -193,7 +205,12 @@ namespace GMGN.UnityPlayer
         bool RenderGlow(){
             if(!hasGlow)return false;
             var targetWidth=Mathf.Max(1,width/4);var targetHeight=Mathf.Max(1,height/4);
-            if(glowA==null||glowA.width!=targetWidth||glowA.height!=targetHeight){
+            // Growing the glow pair is a synchronous GPU allocation. While the
+            // native framebuffer is still moving, stay on the pre-transition
+            // pair: it is the cheaper tier, the composite samples it by UV, so
+            // the glow is only somewhat softer until the viewport settles.
+            var resize=glowA==null||glowA.width!=targetWidth||glowA.height!=targetHeight;
+            if(resize&&!(glowA!=null&&NativeUIScale.FramebufferMoving)){
                 var allocationStarted=System.Diagnostics.Stopwatch.GetTimestamp();
                 ReleaseGlowTargets();
                 var format=SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.ARGBHalf)?RenderTextureFormat.ARGBHalf:RenderTextureFormat.ARGB32;
@@ -204,6 +221,8 @@ namespace GMGN.UnityPlayer
                 var allocationMs=(System.Diagnostics.Stopwatch.GetTimestamp()-allocationStarted)*1000d/System.Diagnostics.Stopwatch.Frequency;
                 Debug.Log($"GPU lyric glow targets: {targetWidth}x{targetHeight} {format}; allocations={GlowTargetAllocationCount}; allocationMs={allocationMs:F3}; no CPU readback",this);
             }
+            if(glowA==null||glowB==null)return false;
+            targetWidth=glowA.width;targetHeight=glowA.height;
             ConfigureGaussianBlur(blurMaterial,(styleCode==1?22:18)*scale*.25f);
             glowCommands.Clear();glowCommands.SetRenderTarget(glowA);glowCommands.SetViewport(new Rect(0,0,targetWidth,targetHeight));
             glowCommands.ClearRenderTarget(false,true,Color.clear);

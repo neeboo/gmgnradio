@@ -6,7 +6,7 @@ edition = "2024"
 [workspace]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f46266991a230ae94f749af496af2a", features = ["gpui-fast"] }
@@ -23,4 +23,12 @@ serde_json = "=1.0.151"
 # `cdylib` keeps its own feature set (resolver 3), so nothing the host mounts
 # changes.
 [dev-dependencies]
+image = { version = "=0.25.10", default-features = false }
 gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "c1bda59e67f46266991a230ae94f749af496af2a", features = ["gpui-fast", "test-support"] }
+
+# 逐屏视觉对照: the real `MediaPane` (电视 and 音乐与节目 sections) painted at the
+# overlay panel's own 590×458 through GPUI's headless Metal renderer. GPUI's
+# macOS platform must be created on the main thread, so `harness = false`.
+[[test]]
+name = "media_panels_shot"
+harness = false

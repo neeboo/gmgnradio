@@ -53,6 +53,12 @@ final class PresenceSettingsModel {
     private let renderPolicy: String
     private let supportedEngines: Set<String>
     private var selectionTask: Task<Void, Never>?
+    /// Read-kind model work (`load()`'s catalog `bind`). It never claims the
+    /// selection half: a read must not be able to refuse a 选定动作 (2026-10-09).
+    private var readTask: Task<Void, Never>?
+    /// The live `selectionTask`'s own op name, so a refusal can say which
+    /// operation the model half is running instead of the anonymous `model`.
+    private var selectionTaskOp: String?
     /// When the live `selectionTask` started. `presence.remove` runs through
     /// `runSelection`, bypassing the bridge's own operation gate, so a task that
     /// never returned used to pin `isWorking` and answer every later 选定动作
@@ -61,6 +67,25 @@ final class PresenceSettingsModel {
     /// A `selectionTask` at or past this age is treated as non-existent.
     private static let selectionStaleAfter: TimeInterval = 20
     static let selectionLog = Logger(subsystem: "ai.gmgn.radio", category: "PresenceSelection")
+
+    /// Whether the model's **selection** half owns the authority's selection
+    /// state right now. This — not the observable `isWorking`, which reads also
+    /// set — is what the host's refusal predicate must ask. Reads are `readTask`.
+    var isSelectionWorking: Bool { selectionTask != nil }
+
+    /// The live selection marker, named and aged, for the host's
+    /// `side=model` refusal detail. A plain value type: this module must not
+    /// depend on the Unity host's gate.
+    struct SelectionMarker: Equatable, Sendable {
+        let op: String
+        let ageMs: UInt64
+    }
+
+    var selectionMarker: SelectionMarker? {
+        guard selectionTask != nil, let startedAt = selectionTaskStartedAt else { return nil }
+        return SelectionMarker(op: selectionTaskOp ?? "selection.task",
+                               ageMs: UInt64(max(0, Date().timeIntervalSince(startedAt)) * 1000))
+    }
 
     private enum MotionPreferenceKey {
         static let vrm = "gmgn.presence.motion.preferred.vrm"
@@ -141,7 +166,11 @@ final class PresenceSettingsModel {
     }
 
     func load() {
-        runSelection { try await self.loadConfirmed() }
+        // A catalog `bind` is a **read**: it must go through the read marker, not
+        // through `runSelection`. Routing it through the selection half is what
+        // let a read own the selection gate (2026-10-09: "读槽分离要覆盖
+        // isWorking 的每一处来源").
+        runRead(op: "presence.load") { try await self.loadConfirmed() }
     }
 
     func loadConfirmed() async throws {
@@ -159,20 +188,52 @@ final class PresenceSettingsModel {
         try refreshEffectiveMotionForActiveAvatar()
         onSelectionChanged?()
     }
-    private func runSelection(_ body: @escaping @MainActor () async throws -> Void) {
-        if let startedAt = selectionTaskStartedAt, Date().timeIntervalSince(startedAt) >= Self.selectionStaleAfter {
-            let ageMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-            Self.selectionLog.error("code=presence_selection_stale_cleared op=selection.task ageMs=\(ageMs, privacy: .public) reason=runSelection")
-            selectionTask?.cancel(); selectionTask = nil; selectionTaskStartedAt = nil; isWorking = false
+    /// The model half, bounded: a `selectionTask` at or past `selectionStaleAfter`
+    /// is cancelled, cleared and named `presence_selection_stale_cleared` with
+    /// `side=model`, and the caller is told which op it was and how old.
+    ///
+    /// It is reachable from **the host's selection path** (`presence.motion` is
+    /// refused by the bridge before it ever reaches `runSelection`), which is why
+    /// the old bound — only checked on entry to `runSelection` — was unreachable
+    /// exactly when it was needed.
+    @discardableResult
+    func reclaimStaleSelection(now: Date = Date(), reason: String = "runSelection") -> SelectionMarker? {
+        guard let startedAt = selectionTaskStartedAt,
+              now.timeIntervalSince(startedAt) >= Self.selectionStaleAfter else { return nil }
+        let marker = SelectionMarker(op: selectionTaskOp ?? "selection.task",
+                                     ageMs: UInt64(now.timeIntervalSince(startedAt) * 1000))
+        selectionTask?.cancel(); selectionTask = nil
+        selectionTaskStartedAt = nil; selectionTaskOp = nil
+        isWorking = false
+        Self.selectionLog.error("code=presence_selection_stale_cleared side=model op=\(marker.op, privacy: .public) ageMs=\(marker.ageMs, privacy: .public) reason=\(reason, privacy: .public)")
+        return marker
+    }
+
+    /// Read-kind model work. Sets the observable `isWorking` (so the window still
+    /// shows a spinner) but never claims the selection half, so it cannot refuse
+    /// a 选定动作.
+    private func runRead(op: String, _ body: @escaping @MainActor () async throws -> Void) {
+        guard readTask == nil, selectionTask == nil else { return }
+        isWorking = true
+        readTask = Task { [weak self] in
+            defer { self?.isWorking = false; self?.readTask = nil }
+            guard let self else { return }
+            do { try await body() } catch { show(error: error) }
         }
+    }
+
+    private func runSelection(op: String, _ body: @escaping @MainActor () async throws -> Void) {
+        _ = reclaimStaleSelection(reason: "runSelection")
         guard selectionTask == nil else { return }
         isWorking = true
+        selectionTaskOp = op
         selectionTaskStartedAt = Date()
         selectionTask = Task { [weak self] in
             // The clear is installed before `guard let self` and covers every
             // exit path, including cancellation: a stale marker must not outlive
             // the model, and a later selection must see `selectionTask == nil`.
-            defer { self?.isWorking = false; self?.selectionTask = nil; self?.selectionTaskStartedAt = nil }
+            defer { self?.isWorking = false; self?.selectionTask = nil
+                    self?.selectionTaskStartedAt = nil; self?.selectionTaskOp = nil }
             guard let self else { return }
             do { try await body() } catch { show(error: error) }
         }
@@ -302,7 +363,7 @@ final class PresenceSettingsModel {
     }
 
     func activateMotion(_ motion: StageMotionAsset) {
-        runSelection { try await self.activateMotionConfirmed(motion) }
+        runSelection(op: "presence.motion") { try await self.activateMotionConfirmed(motion) }
     }
     func activateMotionConfirmed(_ motion: StageMotionAsset) async throws {
         onWillActivateMotion(motion.id)
@@ -312,7 +373,7 @@ final class PresenceSettingsModel {
     }
 
     func removeMotion(_ motion: StageMotionAsset) {
-        runSelection { [self] in
+        runSelection(op: "presence.motion.remove") { [self] in
             let store = try requireMotionStore()
             try await store.removeAsync(id: motion.id)
             try await loadConfirmed()
@@ -425,7 +486,7 @@ final class PresenceSettingsModel {
     }
 
     private func installMotion(from sourceURL: URL) {
-        runSelection { [self] in
+        runSelection(op: "presence.motion.import") { [self] in
             let store = try requireMotionStore()
             let installed = try store.installMotion(from: sourceURL)
             motions = try store.listMotions()
@@ -486,7 +547,7 @@ final class PresenceSettingsModel {
     }
 
     func activate(_ package: PresencePackage) {
-        runSelection { try await self.activateConfirmed(package) }
+        runSelection(op: "presence.activate") { try await self.activateConfirmed(package) }
     }
     func activateConfirmed(_ package: PresencePackage) async throws {
         try await requireService().store.activateAsync(id: package.manifest.id)
@@ -495,7 +556,7 @@ final class PresenceSettingsModel {
     }
 
     func remove(_ package: PresencePackage) {
-        runSelection { [self] in
+        runSelection(op: "presence.remove") { [self] in
             try await requireService().store.removeAsync(id: package.manifest.id)
             try await loadConfirmed()
             show(message: "已移除 \(package.manifest.name)。")
@@ -503,7 +564,7 @@ final class PresenceSettingsModel {
     }
 
     private func install(from sourceURL: URL) {
-        runSelection { [self] in
+        runSelection(op: "presence.import") { [self] in
             let service = try requireService()
             let installed = try service.store.installPackage(from: sourceURL)
             try await loadConfirmed()

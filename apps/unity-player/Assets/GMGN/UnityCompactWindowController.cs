@@ -59,6 +59,12 @@ namespace GMGN.UnityPlayer
         }
         IEnumerator ChangeFullscreen()
         {
+            // The framebuffer can move twice on the compact path (native window
+            // resize first, fullscreen resolution second). One bounded window
+            // covers both so a whole-content GPU rebuild is never started
+            // mid-move; `NativeUIScale.ToggleFullscreen` restarts it at the
+            // resolution change, which is the authoritative move.
+            NativeUIScale.BeginViewportTransition();
             if (IsCompact) {
                 yield return ChangeMode(false);
                 // Unity updates its framebuffer dimensions after NSWindow's resize event.

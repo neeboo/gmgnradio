@@ -949,6 +949,99 @@ def run_chain_b(chain: Chain, binary: Path, work: Path, keep: bool) -> dict:
         chain.check(False, "7.0", "第二轮 start 成功，故障注入才有意义",
                     where="services/gmgn-taskd/src/agent_dsh.rs:474",
                     reason=f"start 返回 {second_error!r}", evidence=second)
+
+    # =====================================================================
+    # 8. 未确认的旧回合不许永久堵住后面的人类回合
+    # =====================================================================
+    #
+    # 真机 2026-10-09 18:58 的形状（build 229 已装机、单实例）：
+    #   * 16:50:15 某一轮人类回合被 claim（run E261AC9D… / session 96C0CBE6…），
+    #     宿主从未结算它；
+    #   * 18:27:23 build 229 的 daemon 启动，`recover()` 把这一行命名成
+    #     `unknown`（诚实记录：没学到效果）；
+    #   * 18:58:04 用户在聊天框发消息：`agent_loop_enqueue` 真的写下了人类消息行
+    #     （`agent_loop_human_messages.state='queued'`）与事件行（`pending`），
+    #     紧接着 `agent_loop_claim` 回 `{"claimed":false}` —— 因为 executing 门槛
+    #     把 `unknown` 也当成"还在执行"。此后那个数据库再没有被写过一次，消息永远
+    #     发不出去，界面上既没有回复也没有报错。
+    #
+    # 这一节用真 daemon 走完同一个形状：claim 一轮人类回合 → **故意不结算** →
+    # 重启 daemon（真 `recover()`）→ 再发一条人类消息 → 必须能被领起来。
+    # 8.1/8.2 先证明那行毒记录是产品代码产生的（不是本节假造），8.3~8.5 才是判据。
+    print("  --- 8. 未确认的旧回合不许堵住后续人类回合 ---", flush=True)
+    rec_world, rec_scope, rec_host = "w-recovered", "s-recovered", "h-recovered"
+    rec_base = {"worldID": rec_world, "residentScope": rec_scope, "hostSessionID": rec_host}
+    taskd.request("agent_loop_configure", {**rec_base, "hourlyLimit": 6,
+                                          "minimumWakeIntervalSeconds": 1,
+                                          "backgroundEnabled": True, "available": True})
+
+    def rec_read() -> dict:
+        return taskd.request("agent_loop_read", dict(rec_base)).get("result", {})
+
+    def rec_event_state(event: str):
+        return next((e.get("state") for e in rec_read().get("events", [])
+                     if e.get("eventID") == event), None)
+
+    def rec_claim_human(event: str, message: str, run_id: str) -> dict:
+        """用户在聊天框按下发送时宿主打出的那串 RPC，逐字同序。"""
+        taskd.request("agent_loop_enqueue", {
+            **rec_base, "eventID": event, "intentID": "human-batch", "kind": "human",
+            "intentState": "active", "messageIDs": [message],
+            "inputRefs": {message: {"submissionID": message,
+                                    "inputSHA256": hashlib.sha256(message.encode()).hexdigest(),
+                                    "imageReferences": []}},
+            "command": {"type": "resident_human_turn", "messageIDs": [message]}})
+        return taskd.request("agent_loop_claim", {
+            **rec_base, "runID": run_id, "nowMillis": int(time.time() * 1000),
+            "eventID": event})
+
+    first_claim = rec_claim_human("human-recovered-1", "m-recovered-1", "r-recovered-1")
+    chain.check(first_claim.get("result", {}).get("claimed") is True, "8.1",
+                "第一轮人类回合被 claim（随后被宿主遗弃，用来造出真机上那一行毒记录）",
+                where="services/gmgn-taskd/src/agent_scheduler.rs:372",
+                reason=json.dumps(first_claim, ensure_ascii=False)[:300], evidence=first_claim)
+
+    # 故意不结算这一轮，然后重启 daemon：真 `recover()` 必须把它命名成 `unknown`。
+    taskd.restart()
+    orphan_state = rec_event_state("human-recovered-1")
+    chain.check(orphan_state == "unknown", "8.2",
+                "daemon 重启后，被遗弃的 claimed 回合由真 `recover()` 命名成 `unknown`"
+                " —— 毒记录来自产品代码，不是本节假造",
+                where="services/gmgn-taskd/src/agent_scheduler.rs:50",
+                reason=f"recover() 之后 state={orphan_state!r}",
+                evidence={"state": orphan_state, "expected": "unknown"})
+
+    second_claim = rec_claim_human("human-recovered-2", "m-recovered-2", "r-recovered-2")
+    chain.check(second_claim.get("result", {}).get("claimed") is True, "8.3",
+                "未确认的旧回合不再毒化整个 world+scope：下一条人类消息仍能被 claim",
+                where="services/gmgn-taskd/src/agent_scheduler.rs:283",
+                reason=(f"agent_loop_claim 回 {json.dumps(second_claim, ensure_ascii=False)[:200]}"
+                        " —— executing 门槛把上一轮的 `unknown` 当成了仍在执行，"
+                        "于是人类消息永远停在 queued、事件永远停在 pending；"
+                        "真机上这一条红就是「装了 229 之后聊天还是发不出去」"),
+                evidence=second_claim)
+
+    readback = rec_read()
+    message_state = next((m.get("state") for m in readback.get("humanMessages", [])
+                          if m.get("messageID") == "m-recovered-2"), None)
+    chain.check(message_state == "claimed", "8.4",
+                "那个人类消息行真的离开了 queued（宿主领取时同步改写）",
+                where="services/gmgn-taskd/src/agent_scheduler.rs:374",
+                reason=f"agent_loop_human_messages.state={message_state!r}",
+                evidence={"state": message_state, "expected": "claimed"})
+    kept_state = rec_event_state("human-recovered-1")
+    chain.check(kept_state == "unknown", "8.5",
+                "诚实记录没有被猜掉：旧的未确认回合仍是 `unknown`，"
+                "只能由宿主自己的 agent_loop_reconcile 结算",
+                where="services/gmgn-taskd/src/agent_scheduler.rs:451",
+                reason=f"state={kept_state!r}（不许被改写成 completed/failed）",
+                evidence={"state": kept_state, "expected": "unknown"})
+    rec_stderr = taskd.stderr_text()
+    chain.check("agent_loop_stale_unconfirmed_turns" in rec_stderr, "8.6",
+                "这一处自我恢复有名字：stderr 出现 agent_loop_stale_unconfirmed_turns"
+                "（与 agent_dsh_stale_unconfirmed_tools 同一套做法）",
+                where="services/gmgn-taskd/src/agent_scheduler.rs:365",
+                reason="stderr 里没有那条具名记录，尾部：" + rec_stderr[-300:])
     return context
 
 
@@ -1559,8 +1652,14 @@ def run_chain_c(chain: Chain, binary: Path, work: Path, keep: bool) -> dict:
 
 
 # 只存在于宿主的拒码：它们说的是宿主自己的在途任务与最后兜底，daemon 不发。
+# `presence_selection_preparation_waited` 是 2026-10-09 build 229 之后新增的：宿主
+# 等自己刚起的 `presence.motion.stop`（同一个用户动作的准备）走完才去问门。这件事
+# 只发生在宿主里，daemon 没有对应状态，所以它进「宿主自有」这一侧，而不是被 6.1
+# 当成伪造的 daemon 码。允许集是「宿主自有的码」这个集合本身，6.1/6.2/6.3 的判据
+# 没有放宽：转述 daemon 的码仍必须逐个在 daemon 词表里存在。
 HOST_ONLY_REFUSAL_CODES = {"presence_selection_busy", "presence_selection_rejected",
-                           "presence_selection_stale_cleared"}
+                           "presence_selection_stale_cleared",
+                           "presence_selection_preparation_waited"}
 
 
 GATE_FILE = "apps/macos/UnityHost/UnityPresenceSelectionGate.swift"

@@ -555,6 +555,12 @@ final class UnityMediaHost {
                   self.presenceSettings.canSelectMotion(id) else { return false }
             do { try composition.prepareManualMotionSelection() }
             catch { return false }
+            // The stop `prepareManualMotionSelection` just began is *this* host's
+            // own preparation for the selection below. Waiting for it (bounded by
+            // the gate's own budget) is what keeps that stop from refusing the
+            // selection it was preparing: 2026-10-09 build 229 answered the user's
+            // click `side=bridge op=presence.motion.stop ageMs=0`.
+            await self.presenceSettings.awaitSelectionPreparation()
             return self.presenceSettings.command(["op": "presence.motion", "id": id])
         }
         let autonomy = UnityResidentAgentLoopBridge(context: composition.context, defaults: defaults, settings: productSettings.authority,
@@ -1802,6 +1808,12 @@ final class UnityMediaHost {
                 else { detail = "\(id):\(type(of: error))" }
                 return settingsRefusal(op: op, code: "presence_world_not_ready", detail: detail)
             }
+            // `prepareManualMotionSelection` stops the running activity, and that
+            // stop synchronously begins this bridge's own `presence.motion.stop`
+            // marker. Wait for it before asking for the selection again, so the
+            // click is not refused by this host's own preparation (2026-10-09:
+            // `side=bridge op=presence.motion.stop ageMs=0 kind=selection`).
+            await presenceSettings.awaitSelectionPreparation()
             guard presenceSettings.command(value) else {
                 let code = presenceSettings.motionSelectionRefusal(id) ?? "presence_selection_rejected"
                 return settingsRefusal(op: op, code: code, detail: presenceSettings.selectionRefusalDetail(for: id))
