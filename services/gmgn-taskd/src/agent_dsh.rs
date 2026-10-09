@@ -598,7 +598,28 @@ impl DshService {
                 let s = self.current(&i, &p["eventID"]).await?;
                 let call = text(p, "callID")?;
                 let images = image_blocks(p)?;
-                if images.len() > 1 || p["output"].to_string().len() > 16384 {
+                // The result half of a receipt is the **host's** own payload (for
+                // `inspect_world` it is the whole visible snapshot plus the movement
+                // path), so it is measured against `MAXIMUM_RECEIPT_BYTES`, not the
+                // 16 KiB bound the model's own arguments are held to. A refusal names
+                // the field and the measured size instead of being anonymous.
+                let output_bytes = p["output"].to_string().len();
+                if images.len() > 1 || output_bytes > crate::agent_tools::MAXIMUM_RECEIPT_BYTES {
+                    eprintln!(
+                        "gmgn-taskd: {}",
+                        json!({
+                            "event": "rejected",
+                            "code": "agent_dsh_invalid_receipt",
+                            "method": "agent_dsh_tool_receipt",
+                            "tool": &call,
+                            "path": if images.len() > 1 { "$.images" } else { "$.output" },
+                            "detail": if images.len() > 1 {
+                                format!("receipt carries {} images, above the 1 image limit", images.len())
+                            } else {
+                                format!("host result is {} bytes, above the {} byte limit", output_bytes, crate::agent_tools::MAXIMUM_RECEIPT_BYTES)
+                            },
+                        })
+                    );
                     return Err("agent_dsh_invalid_receipt");
                 }
                 let answer = json!({"acpSessionID":text(p,"acpSessionID")?,"operationID":text(p,"operationID")?,"status":p["status"],"output":p["output"],"images":images.iter().map(|v|json!({"mediaType":v.media_type,"byteLength":v.bytes.len(),"sha256":format!("{:x}",Sha256::digest(&v.bytes))})).collect::<Vec<_>>()});
@@ -637,7 +658,23 @@ impl DshService {
                     Some("completed") => HostToolStatus::Completed,
                     Some("unknown") => HostToolStatus::Unknown,
                     Some("rejected") => HostToolStatus::Rejected,
-                    _ => return Err("agent_dsh_invalid_receipt"),
+                    other => {
+                        eprintln!(
+                            "gmgn-taskd: {}",
+                            json!({
+                                "event": "rejected",
+                                "code": "agent_dsh_invalid_receipt",
+                                "method": "agent_dsh_tool_receipt",
+                                "tool": &call,
+                                "path": "$.status",
+                                "detail": match other {
+                                    Some(value) => format!("host status {:?} is not one of completed/unknown/rejected", value.chars().take(32).collect::<String>()),
+                                    None => "host status is missing or not a string".to_owned(),
+                                },
+                            })
+                        );
+                        return Err("agent_dsh_invalid_receipt");
+                    }
                 };
                 let execution = pending.remove(&call).unwrap();
                 execution
@@ -1162,5 +1199,140 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(state, "unknown");
+    }
+
+    /// The live space's `inspect_world` result is **host-owned** data: every enabled
+    /// place, every activity with its seat projection, every camera, the motion
+    /// catalogue and — while the resident is en route — `movement.waypointIDs`, one id
+    /// per waypoint. `marble-living-cabin` (the shipping space, world `84503420-…`)
+    /// declares 643 waypoints and the live space held 13 generated props, so the widest
+    /// legitimate result crosses the 16 KiB ceiling that exists for the **model's**
+    /// arguments. Measured on the real device 2026-10-09 14:50:23, that ceiling refused
+    /// the whole receipt as `agent_dsh_invalid_receipt`, left the call `unknown`, and
+    /// blocked every later start with `agent_dsh_unresolved_tools`.
+    ///
+    /// 1000 waypoint ids (~23 KB) is that shape, not padding.
+    #[tokio::test]
+    async fn host_result_wider_than_one_model_argument_still_settles() {
+        let (service, p, _root) = setup(false).await;
+        service.request("agent_dsh_start", &p).await.unwrap();
+        wait(&service, &p, "running").await;
+        let runner = service.clone();
+        let token = p["grantToken"].as_str().unwrap().to_owned();
+        let call = tokio::spawn(async move {
+            runner.host_call(&token,&json!({"v":1,"callId":"call","name":"gmgn_move","arguments":{"target":"chair"}})).await
+        });
+        let read = wait(&service, &p, "authorize").await;
+        let mut approval = read["pendingTools"][0].clone();
+        approval["decision"] = json!("approved");
+        approval["operationID"] = json!("operation");
+        service
+            .request("agent_dsh_authorize", &approval)
+            .await
+            .unwrap();
+        let read = wait(&service, &p, "execute").await;
+        let mut receipt = read["pendingTools"][0].clone();
+        let waypoints: Vec<String> = (0..1000)
+            .map(|i| format!("wp.auto.x{}.z{}.h0", i % 26, i / 26))
+            .collect();
+        receipt["status"] = json!("completed");
+        receipt["output"] = json!({"ok":true,"snapshot":{"movement":{"waypointIDs":waypoints}}});
+        let encoded = receipt["output"].to_string().len();
+        assert!(
+            encoded > 16384,
+            "the fixture must exceed one model argument: {encoded} bytes"
+        );
+        assert!(encoded <= crate::agent_tools::MAXIMUM_RECEIPT_BYTES);
+        service
+            .request("agent_dsh_tool_receipt", &receipt)
+            .await
+            .unwrap();
+        let result = call.await.unwrap().unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["data"]["snapshot"]["movement"]["waypointIDs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1000
+        );
+        // The inner ledger persisted the same wide host result instead of refusing it.
+        let (state, stored) = service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT state, length(receipt) FROM agent_tool_calls WHERE call='call'",
+                        [],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .map_err(|_| "storage_unavailable")
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "finished");
+        assert!(
+            stored > 16384,
+            "the ledger keeps the wide receipt: {stored} bytes"
+        );
+    }
+
+    /// Bounded, not unbounded: a host receipt past its own ceiling is still refused and
+    /// never silently completed, and a status outside the host vocabulary is refused
+    /// for the same reason.
+    #[tokio::test]
+    async fn host_result_above_the_receipt_bound_and_unknown_status_are_refused() {
+        let (service, p, _root) = setup(false).await;
+        service.request("agent_dsh_start", &p).await.unwrap();
+        wait(&service, &p, "running").await;
+        let runner = service.clone();
+        let token = p["grantToken"].as_str().unwrap().to_owned();
+        let _call = tokio::spawn(async move {
+            runner.host_call(&token,&json!({"v":1,"callId":"call","name":"gmgn_move","arguments":{"target":"chair"}})).await
+        });
+        let read = wait(&service, &p, "authorize").await;
+        let mut approval = read["pendingTools"][0].clone();
+        approval["decision"] = json!("approved");
+        approval["operationID"] = json!("operation");
+        service
+            .request("agent_dsh_authorize", &approval)
+            .await
+            .unwrap();
+        let read = wait(&service, &p, "execute").await;
+        let mut receipt = read["pendingTools"][0].clone();
+        receipt["status"] = json!("completed");
+        receipt["output"] = json!({"padding":"x".repeat(crate::agent_tools::MAXIMUM_RECEIPT_BYTES + 4096)});
+        for _ in 0..2 {
+            assert_eq!(
+                service
+                    .request("agent_dsh_tool_receipt", &receipt)
+                    .await
+                    .unwrap_err(),
+                "agent_dsh_invalid_receipt"
+            );
+        }
+        let mut bad_status = receipt.clone();
+        bad_status["output"] = json!({"moved":true});
+        bad_status["status"] = json!("succeeded");
+        assert_eq!(
+            service
+                .request("agent_dsh_tool_receipt", &bad_status)
+                .await
+                .unwrap_err(),
+            "agent_dsh_invalid_receipt"
+        );
+        let mut too_many_images = receipt.clone();
+        too_many_images["output"] = json!({"moved":true});
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture");
+        too_many_images["images"] =
+            json!([{"mediaType":"image/png","base64":png},{"mediaType":"image/png","base64":png}]);
+        assert_eq!(
+            service
+                .request("agent_dsh_tool_receipt", &too_many_images)
+                .await
+                .unwrap_err(),
+            "agent_dsh_invalid_receipt"
+        );
     }
 }

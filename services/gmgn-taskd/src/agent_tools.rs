@@ -50,9 +50,11 @@ fn safe(v: &Value) -> bool {
         _ => true,
     }
 }
-/// Ceiling for one model-supplied tool argument object, one tool receipt and one
-/// reconciliation receipt. These are the only payloads a model or a transport can
-/// inflate, so they keep the tight bound they always had.
+/// Ceiling for one **model-supplied** tool argument object (and the reconciliation
+/// receipt the model's turn carries back). These are the payloads the model itself
+/// can inflate, so they keep the tight bound they always had.
+///
+/// It no longer covers host-owned results: see `MAXIMUM_RECEIPT_BYTES`.
 const MAXIMUM_ARGUMENT_BYTES: usize = 16384;
 /// Ceiling for the whole host-owned tool catalogue.
 ///
@@ -70,6 +72,30 @@ const MAXIMUM_ARGUMENT_BYTES: usize = 16384;
 /// below the 12 MiB wire frame limit, so an accidentally enormous catalogue is still
 /// refused — loudly, with its measured size, instead of anonymously.
 const MAXIMUM_CATALOG_BYTES: usize = 262144;
+/// Ceiling for one **host-produced** tool receipt (`agent_tool_finish`, and the
+/// `output` half of `agent_dsh_tool_receipt`).
+///
+/// This used to share `MAXIMUM_ARGUMENT_BYTES` with the model's argument object.
+/// That was the catalogue mistake again, one layer down: a receipt is the trusted
+/// host's own result, not model input. For the resident world tools it is
+/// `inspect_world`'s whole visible snapshot — every enabled place, every available
+/// activity with its seat projection, every camera, the motion catalogue and, while
+/// the resident is en route, `movement.waypointIDs` with one id per waypoint. The
+/// shipping space (`marble-living-cabin`, world `84503420-3010-…`) declares 643
+/// waypoints and the live space held 13 generated props, so a legitimate result is
+/// already ~9 KB standing still and crosses 16 KiB as soon as a route is attached.
+///
+/// Measured on the real device 2026-10-09 14:50:23: the first `inspect_world` of a
+/// human turn was refused as `agent_dsh_invalid_receipt` 200 ms after the call, the
+/// call was left `unknown`, and every later `agent_dsh_start` was then blocked by
+/// `agent_dsh_unresolved_tools` — with nothing on any log naming a size, a field or
+/// a tool.
+///
+/// 64 KiB is ~2.7x the widest live result this host can produce, still 190x below
+/// the 12 MiB wire frame limit, and caps a 128-call run at 8 MiB of durable receipt
+/// text, so a transport that inflates a receipt is still refused — loudly, with its
+/// measured size.
+pub(crate) const MAXIMUM_RECEIPT_BYTES: usize = 65536;
 fn bounded(v: &Value) -> Result<String> {
     let encoded = crate::canonical_json::to_string(v).map_err(|_| "agent_tool_invalid_payload")?;
     if encoded.len() > MAXIMUM_ARGUMENT_BYTES || !safe(v) {
@@ -98,6 +124,35 @@ fn bounded_catalog(v: &Value) -> Result<String> {
                     format!("tool catalogue is {} bytes, above the {} byte limit", encoded.len(), MAXIMUM_CATALOG_BYTES)
                 } else {
                     "tool catalogue contains a credential-shaped key".to_owned()
+                },
+            })
+        );
+        return Err("agent_tool_invalid_payload");
+    }
+    Ok(encoded)
+}
+/// The host receipt gets its own bound for the same reason the catalogue did, and an
+/// oversize receipt is named on stderr: `agent_dsh_invalid_receipt` with no size, no
+/// field and no tool is what made this defect cost a second real-device round trip.
+///
+/// `safe` is unchanged, so this is a size decision, not a relaxation of what may be
+/// persisted: a credential-shaped key is still refused.
+fn bounded_receipt(v: &Value) -> Result<String> {
+    let encoded = crate::canonical_json::to_string(v).map_err(|_| "agent_tool_invalid_payload")?;
+    let oversize = encoded.len() > MAXIMUM_RECEIPT_BYTES;
+    if oversize || !safe(v) {
+        eprintln!(
+            "gmgn-taskd: {}",
+            json!({
+                "event": "rejected",
+                "code": "agent_tool_invalid_payload",
+                "method": "agent_tool_finish",
+                "tool": v["status"].as_str().map_or("host receipt".to_owned(), |status| format!("host receipt ({status})")),
+                "path": "$.receipt",
+                "detail": if oversize {
+                    format!("host receipt is {} bytes, above the {} byte limit", encoded.len(), MAXIMUM_RECEIPT_BYTES)
+                } else {
+                    "host receipt contains a credential-shaped key".to_owned()
                 },
             })
         );
@@ -568,7 +623,7 @@ pub fn request(db: &mut Connection, method: &str, p: &Value) -> Result<Value> {
             }
         }
         "agent_tool_finish" => {
-            let receipt = bounded(&p["receipt"])?;
+            let receipt = bounded_receipt(&p["receipt"])?;
             let run = text(p, "runID")?;
             let session = text(p, "hostSessionID")?;
             let call = text(p, "callID")?;
