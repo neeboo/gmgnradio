@@ -103,3 +103,81 @@ if !violations(fixed).isEmpty {
 }
 
 print("presence snapshot projection gate: PASS (one motion-list read per snapshot; selectable still derived from the host refusal predicate)")
+
+// ---------------------------------------------------------------------------
+// Second gate: the *pending renderer receipt* marker must be bounded.
+//
+// `pendingRenderer` is cleared only by the renderer's own `renderer_ack`. On the
+// real device the renderer can die, be replaced by a build without the ack, or
+// simply never answer — and then every later 选定动作 answered
+// `presence_renderer_pending` for the life of the process (2026-10-09). The
+// host half is a bounded marker: it is observed in `publish`, it carries the
+// wall clock of its first observation, and the refusal predicate abandons it
+// before it can refuse a click. The daemon carries the same bound, so an app
+// restart cannot resurrect the lock. The negative control is the pre-fix shape.
+func pendingBoundViolations(_ text: String) -> [String] {
+    var failures: [String] = []
+    if !text.contains("static let rendererAckBudget") {
+        failures.append("the bridge has no `rendererAckBudget`: a renderer receipt that never came is unbounded")
+    }
+    if !text.contains("private var pendingSince: Date?") {
+        failures.append("`pendingSelection` carries no observation time, so its age cannot be bounded")
+    }
+    guard let refusal = text.range(of: "var selectionRefusalCode: String? {") else {
+        return failures + ["the bridge has no selectionRefusalCode"]
+    }
+    let body = String(text[refusal.lowerBound...].prefix(600))
+    if !body.contains("expireStalePendingRenderer()") {
+        failures.append("selectionRefusalCode answers the gate without expiring a stale pending renderer")
+    }
+    if !text.contains("if pendingSince == nil { pendingSince = Date() }") {
+        failures.append("publish() does not record when the pending renderer was first observed")
+    }
+    return failures
+}
+
+let pendingCheck = pendingBoundViolations(source)
+if !pendingCheck.isEmpty {
+    FileHandle.standardError.write(Data(("presence renderer-pending bound gate: FAIL\n  - " + pendingCheck.joined(separator: "\n  - ") + "\n").utf8))
+    exit(1)
+}
+
+// Negative control: the pre-fix shape must be rejected.
+let pendingPreFix = """
+    private var pendingSelection: (revision: UInt64, authorityRevision: Int64)?
+    var selectionRefusalCode: String? {
+        gate.refusal(isWorking: model.isWorking, hasPendingSelection: pendingSelection != nil)
+    }
+    private func publish() {
+        if let state=selectionAuthority.confirmed,state.pendingRenderer {
+            pendingSelection=(runtime.snapshot.revision,state.revision)
+        } else { pendingSelection=nil }
+    }
+"""
+if pendingBoundViolations(pendingPreFix).isEmpty {
+    FileHandle.standardError.write(Data("presence renderer-pending bound gate: negative control passed but must fail\n".utf8))
+    exit(1)
+}
+
+// Positive control: the fixed shape must be accepted.
+let pendingFixed = """
+    private var pendingSelection: (revision: UInt64, authorityRevision: Int64)?
+    private var pendingSince: Date?
+    static let rendererAckBudget: TimeInterval = 180
+    var selectionRefusalCode: String? {
+        _ = expireStalePendingRenderer()
+        return gate.refusal(isWorking: model.isWorking, hasPendingSelection: pendingSelection != nil)
+    }
+    private func publish() {
+        if let state=selectionAuthority.confirmed,state.pendingRenderer {
+            pendingSelection=(runtime.snapshot.revision,state.revision)
+            if pendingSince == nil { pendingSince = Date() }
+        } else { pendingSelection=nil; pendingSince=nil }
+    }
+"""
+if !pendingBoundViolations(pendingFixed).isEmpty {
+    FileHandle.standardError.write(Data("presence renderer-pending bound gate: positive control rejected\n".utf8))
+    exit(1)
+}
+
+print("presence renderer-pending bound gate: PASS (a receipt that never came is abandoned on the next request, not refused for ever)")

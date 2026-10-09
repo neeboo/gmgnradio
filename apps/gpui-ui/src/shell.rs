@@ -132,9 +132,15 @@ pub struct TransportControl {
     pub face_text: Option<SharedString>,
     /// Unread count drawn on the control's trailing shoulder (通知).
     pub badge: Option<SharedString>,
-    /// Surface painted while `active`. The host resolves the live system tint
-    /// where the original used `NSColor.systemBlue` and passes it here; `None`
-    /// keeps the resting surface (the asserted glyph is accent either way).
+    /// Surface painted while `active`, as an explicit override.
+    ///
+    /// `None` — the normal case — lets the bar paint its **own** selected wash
+    /// ([`crate::ui_tokens::scene::SELECTED_SOFT`]) for an asserted control
+    /// whose glyph is [`crate::ui_tokens::scene::SELECTED`]. The host must not
+    /// substitute a system tint here: the original's `NSColor.systemBlue` is the
+    /// "default blue" the overlay palette replaced, and a system colour follows
+    /// the OS appearance, which is exactly what an overlay over the rendered
+    /// space must not do.
     pub active_fill: Option<u32>,
     /// A panel that opens **above the bar**, anchored to this control's slot.
     ///
@@ -349,13 +355,20 @@ fn transport_bar_slots(
             control.icon,
             control.label.clone(),
             control.active,
+            control.enabled,
         )
         .w(px(width))
         .h(px(stage::CONTROL_SIZE))
         .flex_shrink_0()
-        .rounded(px(m::CONTROL_RADIUS))
-        .disabled(!control.enabled);
-        if let Some(fill) = control.active_fill {
+        .rounded(px(m::CONTROL_RADIUS));
+        // An asserted control paints the layer's selected wash behind its own
+        // bright-blue glyph. The default is the **token**, not a host-supplied
+        // colour: the host used to pass `NSColor.systemBlue`, which is the
+        // "default blue" this layer must not show. `active_fill` stays as an
+        // explicit override for a host that needs one, but the bar itself is
+        // correct with none.
+        let active_fill = control.active_fill.or(control.active.then_some(s::SELECTED_SOFT));
+        if let Some(fill) = active_fill {
             button = button.bg(rgba(fill));
         }
         if let Some(text) = &control.face_text {
@@ -486,7 +499,7 @@ pub fn destination_button(
         .bg(rgba(s::BAR_BG))
         .border_1()
         .border_color(rgba(s::BORDER))
-        .text_color(rgba(s::ACCENT))
+        .text_color(ui::icon_color(true, enabled))
         .child(div().flex().items_center().justify_center().child(icon))
         .tooltip(label.clone())
         .accessibility_label(label)

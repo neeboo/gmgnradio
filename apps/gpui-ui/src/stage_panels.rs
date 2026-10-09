@@ -40,8 +40,7 @@ use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{
     button::*,
     menu::*,
-    slider::{Slider, SliderEvent, SliderState},
-    tab::{Tab, TabBar},
+    slider::{SliderEvent, SliderState},
     *,
 };
 use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _, StatefulInteractiveElement as _};
@@ -597,12 +596,16 @@ impl StagePanelsPane {
         let label: SharedString = label.into();
         let label = settings_copy(locale, label.as_ref()).to_owned();
         let text = if disabled { s::TEXT_DIM } else { s::TEXT };
+        let icon_tone = ui::icon_color(
+            false,
+            !(disabled || self.snapshot["isSaving"].as_bool() == Some(true)),
+        );
         Button::new(id)
             .custom(scene_variant(cx, 0x00000000, 0xffffff14, text))
             .small()
             .icon(icon)
             .rounded(px(metrics::ROW_RADIUS))
-            .text_color(rgba(text))
+            .text_color(icon_tone)
             .tooltip(label.clone())
             .accessibility_label(label)
             .disabled(disabled || self.snapshot["isSaving"].as_bool() == Some(true))
@@ -651,6 +654,7 @@ impl StagePanelsPane {
         } else {
             s::TEXT
         };
+        let icon_tone = ui::icon_color(active, !disabled);
         Button::new(id)
             .custom(scene_variant(
                 cx,
@@ -662,7 +666,7 @@ impl StagePanelsPane {
             .min_h(px(metrics::TILE_MIN_HEIGHT))
             .px(px(metrics::ROW_PADDING))
             .rounded(px(metrics::ROW_RADIUS))
-            .text_color(rgba(text))
+            .text_color(icon_tone)
             .accessibility_label(aria)
             .disabled(disabled)
             .child(body)
@@ -893,7 +897,7 @@ impl StagePanelsPane {
                                     "Y" => "人物上下位置",
                                     _ => "人物前后位置",
                                 })
-                                .child(Slider::new(&self.sliders[i])),
+                                .child(ui::scene_slider(&self.sliders[i])),
                         )
                         .child(
                             div()
@@ -998,35 +1002,38 @@ impl StagePanelsPane {
             .iter()
             .filter(|motion| motion_in_category(motion, &self.motion_category))
             .collect();
-        group = group.child(
-            TabBar::new("motion-categories")
-                .segmented()
-                .small()
-                .w_full()
-                .selected_index(motion_category_index(&self.motion_category, &categories))
-                .children(
-                    std::iter::once("全部".to_owned())
-                        .chain(
-                            categories
-                                .iter()
-                                .map(|category| category["name"].as_str().unwrap_or("").to_owned()),
-                        )
-                        .map(|label| Tab::new().label(label).flex_1().min_w_0()),
+        group = group.child(ui::selected_tabs(
+            "motion-categories",
+            std::iter::once("全部".to_owned())
+                .chain(
+                    categories
+                        .iter()
+                        .map(|category| category["name"].as_str().unwrap_or("").to_owned()),
                 )
-                .on_click(cx.listener(move |this, index: &usize, _, cx| {
-                    this.motion_category = if *index == 0 {
-                        String::new()
-                    } else {
-                        this.snapshot["motions"]["categories"]
-                            .as_array()
-                            .and_then(|categories| categories.get(index - 1))
-                            .and_then(|category| category["id"].as_str())
-                            .unwrap_or("")
-                            .to_owned()
-                    };
-                    cx.notify();
-                })),
-        );
+                .map(ui::TabFace::text)
+                .collect(),
+            motion_category_index(&self.motion_category, &categories),
+            // The picker's callback carries no entity, so the pane is reached
+            // through its weak handle — the same shape the settings tab bars use.
+            {
+                let weak = cx.entity().downgrade();
+                move |index: usize, _: &mut Window, cx: &mut App| {
+                    _ = weak.update(cx, |this, cx| {
+                        this.motion_category = if index == 0 {
+                            String::new()
+                        } else {
+                            this.snapshot["motions"]["categories"]
+                                .as_array()
+                                .and_then(|categories| categories.get(index - 1))
+                                .and_then(|category| category["id"].as_str())
+                                .unwrap_or("")
+                                .to_owned()
+                        };
+                        cx.notify();
+                    });
+                }
+            },
+        ));
         let saving = motions["isWorking"].as_bool() == Some(true);
         // 刷新 → `presence.load`, 每个动作 → `presence.motion` (the same two
         // production entries `ProductHost.swift:284-290` uses). The Unity
@@ -1065,7 +1072,8 @@ impl StagePanelsPane {
                         } else {
                             AssetIcon::PersonStanding
                         })
-                        .size(px(metrics::TILE_ICON_SIZE)),
+                        .size(px(metrics::TILE_ICON_SIZE))
+                        .text_color(ui::icon_color(active, true)),
                     )
                     .child(body)
                     .child(div().flex_1())
@@ -1073,7 +1081,7 @@ impl StagePanelsPane {
                         row.child(
                             Icon::new(AssetIcon::Check)
                                 .size(px(metrics::TILE_ICON_SIZE))
-                                .text_color(rgba(s::ACCENT)),
+                                .text_color(ui::icon_color(true, true)),
                         )
                     })
                     .into_any_element(),
@@ -1199,7 +1207,8 @@ impl StagePanelsPane {
                                 } else {
                                     AssetIcon::CirclePlay
                                 })
-                                .size(px(metrics::TILE_ICON_SIZE)),
+                                .size(px(metrics::TILE_ICON_SIZE))
+                                .text_color(ui::icon_color(active, true)),
                             )
                             .child(div().child(item["name"].as_str().unwrap_or("").to_owned()))
                             .child(div().flex_1())
@@ -1392,7 +1401,7 @@ impl StagePanelsPane {
                     .min_w(px(0.))
                     .role(Role::Slider)
                     .aria_label(settings_copy(locale, "颗粒大小"))
-                    .child(Slider::new(&self.sliders[3])),
+                    .child(ui::scene_slider(&self.sliders[3])),
             )
             .child(
                 div()
@@ -1532,7 +1541,7 @@ impl StagePanelsPane {
                             .min_w(px(0.))
                             .role(Role::Slider)
                             .aria_label(settings_copy(locale, "视频亮度"))
-                            .child(Slider::new(&self.sliders[4])),
+                            .child(ui::scene_slider(&self.sliders[4])),
                     )
                     .child(
                         div()
@@ -1674,7 +1683,7 @@ fn section_heading(title: &str, symbol: AssetIcon) -> AnyElement {
         .child(
             Icon::new(symbol)
                 .size(px(metrics::TILE_ICON_SIZE))
-                .text_color(rgba(s::TEXT)),
+                .text_color(ui::icon_color(false, true)),
         )
         .child(
             ui::section_title(title)
@@ -1718,33 +1727,27 @@ fn status_element(status: WorldStatus<'_>) -> AnyElement {
 impl Render for StagePanelsPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = stage_mode(&self.snapshot);
-        let tabs = TabBar::new("stage-tabs")
-            .segmented()
-            .small()
-            .w_full()
-            .selected_index(self.tab)
-            .children(
-                STAGE_TABS
-                    .into_iter()
-                    .zip(STAGE_TAB_ICONS)
-                    .map(|(label, icon)| {
-                        Tab::new()
-                            .icon(icon)
-                            .aria_label(label)
-                            .flex_1()
-                            .min_w_0()
-                            .tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
-                            })
-                    }),
-            )
-            .on_click(cx.listener(|this, index: &usize, _, cx| {
-                this.tab = *index;
-                if *index == 2 && this.op_supported("stage.motion.refresh") {
-                    this.commands.push(json!({"op":"stage.motion.refresh"}));
+        let tabs = ui::selected_tabs(
+            "stage-tabs",
+            STAGE_TABS
+                .into_iter()
+                .zip(STAGE_TAB_ICONS)
+                .map(|(label, icon)| ui::TabFace::icon(icon, label))
+                .collect(),
+            self.tab,
+            {
+                let weak = cx.entity().downgrade();
+                move |index: usize, _: &mut Window, cx: &mut App| {
+                    _ = weak.update(cx, |this, cx| {
+                        this.tab = index;
+                        if index == 2 && this.op_supported("stage.motion.refresh") {
+                            this.commands.push(json!({"op":"stage.motion.refresh"}));
+                        }
+                        cx.notify();
+                    });
                 }
-                cx.notify();
-            }));
+            },
+        );
         let body = match self.tab {
             0 => self.player(cx),
             2 => self.motions(cx),

@@ -404,6 +404,25 @@ struct Session {
     success: AtomicUsize,
     calls: Mutex<HashSet<String>>,
 }
+/// A refused host receipt is not a receipt: the effect stays unconfirmed either
+/// way. What must not happen is the host future waiting on it parking until the
+/// 120 s transport bound with nobody left to answer — that is the "报一个错、
+/// 改一个错" shape the 2026-10-09 sweep removed. Settle the pending execution as
+/// `Unknown` immediately (the executor then writes the same durable `unknown`
+/// row), and still return the named refusal so the caller learns why.
+async fn refuse_receipt(s: &Session, call: &str, code: &'static str) -> Result<Value> {
+    let execution = s.queue.execution.lock().await.remove(call);
+    if let Some(execution) = execution {
+        let _ = execution.tx.send(HostToolReceipt {
+            identity: s.identity.clone(),
+            call_id: call.to_owned(),
+            status: HostToolStatus::Unknown,
+            output: json!({"error":"host_receipt_refused"}),
+            images: Vec::new(),
+        });
+    }
+    Err(code)
+}
 pub struct DshService {
     db: Database,
     session: Mutex<Option<Arc<Session>>>,
@@ -485,20 +504,69 @@ impl DshService {
                 }
                 self.claimed(&i, &event).await?;
                 let ledger_identity = params(&i);
-                let blocked=self.db.call(move |store|store.connection.query_row(
-                    "SELECT count(*) FROM agent_tool_calls WHERE world=?1 AND scope=?2 AND state IN ('unknown','inflight')",
-                    rusqlite::params![ledger_identity["worldID"].as_str(),ledger_identity["residentScope"].as_str()],
-                    |row|row.get::<_,i64>(0)).map_err(|_|"storage_unavailable")).await?;
+                // "Unresolved" is only a reason to refuse a new turn while it can
+                // still be produced. An `inflight` row is a dispatch this daemon
+                // started and whose host future is bounded by the 120 s transport
+                // window (`Transport::dispatch`), so it is always live. An
+                // `unknown` row is a durable "we never learned the effect" fact:
+                // it is live only while the run that owns it is still claimed.
+                //
+                // Counting every `unknown` row for the whole world+scope (the
+                // rule until 2026-10-09) made one refused host receipt lock the
+                // resident out of chat for the life of the database: nothing on
+                // the DSH path ever calls `agent_runtime_reconcile`, and the
+                // in-memory session check below refused too. The record is kept —
+                // it is never rewritten to `applied`/`not_applied` without the
+                // host's own verification — it simply stops gating unrelated
+                // turns. The same operation is still protected by
+                // `agent_tool_operation_blocked` at `agent_tool_begin`.
+                let (blocked, stale) = self
+                    .db
+                    .call(move |store| {
+                        let live: i64 = store.connection.query_row(
+                            "SELECT count(*) FROM agent_tool_calls c JOIN agent_loop_events e ON e.world=c.world AND e.scope=c.scope AND e.run=c.run \
+                             WHERE c.world=?1 AND c.scope=?2 AND (c.state='inflight' OR (c.state='unknown' AND e.state IN ('claimed','cancel_requested')))",
+                            rusqlite::params![ledger_identity["worldID"].as_str(),ledger_identity["residentScope"].as_str()],
+                            |row| row.get(0)).map_err(|_|"storage_unavailable")?;
+                        let stale: i64 = store.connection.query_row(
+                            "SELECT count(*) FROM agent_tool_calls c WHERE c.world=?1 AND c.scope=?2 AND c.state='unknown' \
+                             AND NOT EXISTS (SELECT 1 FROM agent_loop_events e WHERE e.world=c.world AND e.scope=c.scope AND e.run=c.run AND e.state IN ('claimed','cancel_requested'))",
+                            rusqlite::params![ledger_identity["worldID"].as_str(),ledger_identity["residentScope"].as_str()],
+                            |row| row.get(0)).map_err(|_|"storage_unavailable")?;
+                        Ok((live, stale))
+                    })
+                    .await?;
+                if stale > 0 {
+                    // Named, readable, and never silent: the effect of these calls
+                    // is still unconfirmed, we just no longer pretend a new turn
+                    // could learn it.
+                    eprintln!(
+                        "gmgn-taskd: {}",
+                        json!({
+                            "event": "recovered",
+                            "code": "agent_dsh_stale_unconfirmed_tools",
+                            "worldID": i.world_id,
+                            "residentScope": i.scope_id,
+                            "count": stale,
+                        })
+                    );
+                }
                 if blocked > 0 {
                     return Err("agent_dsh_unresolved_tools");
                 }
                 let config = Configuration::parse(p)?;
                 let mut current = self.session.lock().await;
                 if let Some(old) = current.as_ref() {
+                    let previous = old.state.lock().await.clone();
+                    // `unknown` is written only at the end of `run`, after the ACP
+                    // child was reaped and every cancelled host future got its 2 s
+                    // settle window: the session is dead, nothing can advance it.
+                    // Refusing to replace it (the rule until 2026-10-09) turned one
+                    // uncertain turn into a permanent `agent_dsh_session_busy` for
+                    // the whole resident scope.
                     if old.token == token
-                        || old.identity == i
-                        || !["completed", "failed", "cancelled"]
-                            .contains(&old.state.lock().await.as_str())
+                        || !["completed", "failed", "cancelled", "unknown"]
+                            .contains(&previous.as_str())
                     {
                         return Err("agent_dsh_session_busy");
                     }
@@ -620,7 +688,7 @@ impl DshService {
                             },
                         })
                     );
-                    return Err("agent_dsh_invalid_receipt");
+                    return refuse_receipt(&s, &call, "agent_dsh_invalid_receipt").await;
                 }
                 let answer = json!({"acpSessionID":text(p,"acpSessionID")?,"operationID":text(p,"operationID")?,"status":p["status"],"output":p["output"],"images":images.iter().map(|v|json!({"mediaType":v.media_type,"byteLength":v.bytes.len(),"sha256":format!("{:x}",Sha256::digest(&v.bytes))})).collect::<Vec<_>>()});
                 let mut pending = s.queue.execution.lock().await;
@@ -652,6 +720,18 @@ impl DshService {
                     || prior_bytes + images.iter().map(|v| v.bytes.len() as u64).sum::<u64>()
                         > 4 * 1024 * 1024
                 {
+                    // The execution entry is already locked here, so settle it in
+                    // place: a refused receipt must not leave the host future on
+                    // the 120 s bound.
+                    if let Some(execution) = pending.remove(&call) {
+                        let _ = execution.tx.send(HostToolReceipt {
+                            identity: i.clone(),
+                            call_id: call.clone(),
+                            status: HostToolStatus::Unknown,
+                            output: json!({"error":"host_receipt_refused"}),
+                            images: Vec::new(),
+                        });
+                    }
                     return Err("agent_dsh_image_limit");
                 }
                 let status = match p["status"].as_str() {
@@ -673,6 +753,15 @@ impl DshService {
                                 },
                             })
                         );
+                        if let Some(execution) = pending.remove(&call) {
+                            let _ = execution.tx.send(HostToolReceipt {
+                                identity: i.clone(),
+                                call_id: call.clone(),
+                                status: HostToolStatus::Unknown,
+                                output: json!({"error":"host_receipt_refused"}),
+                                images: Vec::new(),
+                            });
+                        }
                         return Err("agent_dsh_invalid_receipt");
                     }
                 };
@@ -791,6 +880,27 @@ impl DshService {
                 if s.cancel.is_cancelled() {
                     return Err("agent_dsh_host_result_unknown");
                 }
+                if receipt.status == HostToolStatus::Rejected {
+                    // The host answered this one call and refused it. That is not
+                    // a session failure: cancelling here (the rule until
+                    // 2026-10-09) turned one bad motion id into a dead turn, with
+                    // the model told only `host_tool_unavailable` instead of the
+                    // host's own code. Hand the host's answer back verbatim, do
+                    // not count it as a success, and let the agent try something
+                    // else in the same turn.
+                    let code = receipt
+                        .output
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .or_else(|| receipt.output.get("error").and_then(Value::as_str))
+                        .unwrap_or("host_tool_unavailable");
+                    let message = receipt
+                        .output
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("宿主拒绝了这次调用。");
+                    return Ok(json!({"ok":false,"error":{"code":code,"message":message}}));
+                }
                 s.success.fetch_add(1, Ordering::AcqRel);
                 let mut reply = json!({"ok":true,"data":receipt.output});
                 if let Some(image) = receipt.images.first() {
@@ -823,8 +933,27 @@ async fn run(db: Database, s: Arc<Session>, config: Configuration) {
     let unknown=db.call({let p=p.clone();move|store|store.connection.query_row("SELECT count(*) FROM agent_tool_calls WHERE world=?1 AND scope=?2 AND run=?3 AND state IN ('unknown','inflight')",rusqlite::params![p["worldID"].as_str(),p["residentScope"].as_str(),p["runID"].as_str()],|r|r.get::<_,i64>(0)).map_err(|_|"storage_unavailable")}).await.unwrap_or(1)>0;
     let (state, reply) = result.unwrap_or((DshState::Unknown, String::new()));
     if unknown || s.active.load(Ordering::Acquire) > 0 || state == DshState::Unknown {
-        let _=db.call(move|store|{store.connection.execute("UPDATE agent_loop_events SET state='unknown' WHERE world=?1 AND scope=?2 AND run=?3 AND session=?4 AND event=?5 AND state IN ('claimed','cancel_requested')",rusqlite::params![p["worldID"].as_str(),p["residentScope"].as_str(),p["runID"].as_str(),p["hostSessionID"].as_str(),p["eventID"].as_str()]).map_err(|_|"storage_unavailable")?;Ok(())}).await;
-        *s.state.lock().await = "unknown".into();
+        // The ACP child is reaped and this run still owns a call whose effect was
+        // never learned (or the child's own outcome is unknown). Two facts must
+        // survive, and until 2026-10-09 neither did:
+        //
+        //   * the **call** stays `unknown` — never rewritten to applied/not_applied
+        //     without the host's own verification, and still blocking its own
+        //     operation at `agent_tool_begin`;
+        //   * the **turn** must not be seized by the daemon. This arm used to write
+        //     `agent_loop_events.state='unknown'` itself, which made the host's own
+        //     `agent_loop_complete` fail as `agent_loop_receipt_conflict` (its
+        //     `resident_model_turn` receipt can never equal one this daemon
+        //     invented), left the human-message row dangling in `claimed`, and
+        //     surfaced to the client as `RustDSHSessionClient error 4`
+        //     (`ClientError.unknownExecution`), which discards the whole turn —
+        //     streamed reply included.
+        //
+        // The turn receipt belongs to the host; the daemon only names the session
+        // outcome. `failed` is the honest name (the turn did not complete), and it
+        // is terminal, so the client returns a named result instead of `unknown`
+        // and the host's own settle lands on a still-`claimed` event.
+        *s.state.lock().await = "failed".into();
         return;
     }
     let status = if s.user_cancelled.load(Ordering::Acquire) && state == DshState::Cancelled {
@@ -1179,11 +1308,7 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(call.await.unwrap().unwrap()["ok"], false);
-        wait(&service, &p, "unknown").await;
-        assert_eq!(
-            service.request("agent_dsh_start", &p).await.unwrap_err(),
-            "agent_dsh_run_not_claimed"
-        );
+        // The *call* is durably unresolved — never guessed into applied/not_applied.
         let state = service
             .db
             .call(|store| {
@@ -1199,8 +1324,308 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(state, "unknown");
+        // The *turn* is over, named, and the host — not the daemon — owns its
+        // receipt. Before 2026-10-09 the daemon wrote the event `unknown` here,
+        // which made this very `agent_loop_complete` fail as
+        // `agent_loop_receipt_conflict` (the real log at 16:50:20.659) and left
+        // the human-message row dangling in `claimed`.
+        //
+        // Wait for the session to settle first: `run` finishes the ledger and the
+        // session state in that order, and asserting mid-flight would race.
+        let mut watch = crate::test_wait::StallWatch::new("agent_dsh 会话终止", Duration::from_secs(60));
+        let read = loop {
+            let read = service.request("agent_dsh_read", &p).await.unwrap();
+            if ["completed", "failed", "cancelled", "unknown"]
+                .contains(&read["state"].as_str().unwrap_or_default())
+            {
+                break read;
+            }
+            if !watch.observe(&read) {
+                panic!("{}", watch.stalled());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            read["state"], "failed",
+            "`unknown` is what RustDSHSessionClient turns into error 4"
+        );
+        let event_state = service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT state FROM agent_loop_events WHERE event='event'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(|_| "storage_unavailable")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            event_state, "claimed",
+            "the daemon must not pre-empt the host's own settle"
+        );
+        let settle = json!({
+            "worldID": p["worldID"], "residentScope": p["residentScope"],
+            "hostSessionID": p["hostSessionID"], "runID": p["runID"], "eventID": p["eventID"],
+            "status": "failed",
+            "receipt": {"kind":"resident_model_turn","invocationReturned":true,
+                        "executionNotStarted":false,"invocationStarted":true,"outcome":"failed"},
+        });
+        let accepted = service
+            .db
+            .call(move |store| {
+                crate::agent_scheduler::request(&mut store.connection, "agent_loop_complete", &settle)
+            })
+            .await
+            .unwrap();
+        assert_eq!(accepted["accepted"], true);
+        assert_eq!(accepted["duplicate"], false);
+        // The settled turn is over for good: its event can never be claimed again.
+        assert_eq!(
+            service.request("agent_dsh_start", &p).await.unwrap_err(),
+            "agent_dsh_run_not_claimed"
+        );
     }
 
+    /// A call whose owning run already settled can never produce a receipt any
+    /// more. Counting it (the rule until 2026-10-09) blocked **every** later
+    /// `agent_dsh_start` in the same world+scope with
+    /// `agent_dsh_unresolved_tools`, and the DSH path has no caller for
+    /// `agent_runtime_reconcile`, so the resident stayed mute for the life of the
+    /// database. The record is still kept and still named on stderr — it just
+    /// stops gating unrelated turns. A call whose run is still claimed is live
+    /// and still refuses.
+    #[tokio::test]
+    async fn a_stale_unconfirmed_tool_does_not_lock_every_later_start() {
+        for (event_state, expected) in [
+            ("failed", None),
+            ("claimed", Some("agent_dsh_unresolved_tools")),
+        ] {
+            let (service, p, _root) = setup(false).await;
+            let state = event_state.to_owned();
+            service
+                .db
+                .call(move |store| {
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO agent_loop_events(world,scope,event,payload,state,run,session) VALUES('w','s','old','{}',?1,'oldrun','h')",
+                            rusqlite::params![state],
+                        )
+                        .map_err(|_| "storage_unavailable")?;
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO agent_tool_calls(world,scope,run,session,call,operation,tool,input,effect,state,receipt) VALUES('w','s','oldrun','h','c-old','op-old','move','{\"target\":\"chair\"}','write','unknown',NULL)",
+                            [],
+                        )
+                        .map_err(|_| "storage_unavailable")?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            match expected {
+                None => {
+                    assert!(
+                        service.request("agent_dsh_start", &p).await.is_ok(),
+                        "a settled run's unknown call must not gate a new turn"
+                    );
+                }
+                Some(code) => {
+                    assert_eq!(
+                        service.request("agent_dsh_start", &p).await.unwrap_err(),
+                        code
+                    );
+                }
+            }
+        }
+    }
+    /// A session that ended `unknown` used to be unreplaceable, because only
+    /// `completed`/`failed`/`cancelled` were accepted as terminal. `unknown` is
+    /// what `run` still writes when its own settle fails, and it is written after
+    /// the ACP child was reaped — the session is dead. Refusing to replace it
+    /// turned one uncertain turn into a permanent `agent_dsh_session_busy` for the
+    /// whole scope.
+    #[tokio::test]
+    async fn an_unknown_session_is_replaced_instead_of_locking_the_scope() {
+        let (service, p, _root) = setup(true).await;
+        service.request("agent_dsh_start", &p).await.unwrap();
+        wait(&service, &p, "running").await;
+        // Put the live session into the one state `run` still writes when its own
+        // settle fails, so this test isolates the session gate: no unresolved call
+        // is involved at all.
+        let session = service.session.lock().await.clone().unwrap();
+        *session.state.lock().await = "unknown".into();
+        drop(session);
+        let calls: i64 = service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM agent_tool_calls", [], |r| r.get(0))
+                    .map_err(|_| "storage_unavailable")
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls, 0);
+        service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO agent_loop_events(world,scope,event,payload,state,run,session) VALUES('w','s','event2','{}','claimed','run2','h')",
+                        [],
+                    )
+                    .map_err(|_| "storage_unavailable")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut next = p.clone();
+        next["runID"] = json!("run2");
+        next["eventID"] = json!("event2");
+        next["grantToken"] = json!(uuid::Uuid::new_v4().to_string());
+        assert!(
+            service.request("agent_dsh_start", &next).await.is_ok(),
+            "an unknown session must not be permanently busy"
+        );
+    }
+    /// A refused receipt is not a receipt, but it must not leave the host future
+    /// parked on the 120 s transport bound either: nobody can answer it once the
+    /// payload was refused. The call still ends `unknown` — never confirmed.
+    #[tokio::test]
+    async fn a_refused_receipt_settles_the_pending_execution_at_once() {
+        let (service, p, _root) = setup(true).await;
+        service.request("agent_dsh_start", &p).await.unwrap();
+        wait(&service, &p, "running").await;
+        let runner = service.clone();
+        let token = p["grantToken"].as_str().unwrap().to_owned();
+        let call = tokio::spawn(async move {
+            runner
+                .host_call(
+                    &token,
+                    &json!({"v":1,"callId":"call","name":"gmgn_move","arguments":{"target":"chair"}}),
+                )
+                .await
+        });
+        let read = wait(&service, &p, "authorize").await;
+        let mut approval = read["pendingTools"][0].clone();
+        approval["decision"] = json!("approved");
+        approval["operationID"] = json!("operation");
+        service
+            .request("agent_dsh_authorize", &approval)
+            .await
+            .unwrap();
+        let read = wait(&service, &p, "execute").await;
+        let mut receipt = read["pendingTools"][0].clone();
+        receipt["status"] = json!("completed");
+        receipt["output"] =
+            json!({"padding":"x".repeat(crate::agent_tools::MAXIMUM_RECEIPT_BYTES + 4096)});
+        assert_eq!(
+            service
+                .request("agent_dsh_tool_receipt", &receipt)
+                .await
+                .unwrap_err(),
+            "agent_dsh_invalid_receipt"
+        );
+        // The executor is released by the refusal itself, not by the 120 s bound:
+        // the pending `execute` entry is gone before the receipt call returns.
+        let read = service.request("agent_dsh_read", &p).await.unwrap();
+        assert!(
+            read["pendingTools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["phase"] != "execute"),
+            "a refused receipt must release the pending execution at once: {read}"
+        );
+        assert_eq!(call.await.unwrap().unwrap()["ok"], false);
+        let state: String = service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT state FROM agent_tool_calls WHERE call='call'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| "storage_unavailable")
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "unknown");
+    }
+    /// The real 2026-10-09 16:50:19.837 shape: the model asked for a motion the
+    /// character does not have, the host refused it *by name*
+    /// (`[ResidentTool] name=play_motion ok=0 code=motion_unavailable`), and the
+    /// whole turn died. A refusal the host reported itself is an **answer**, so it
+    /// must settle terminal (`rejected`, host receipt kept), reach the model with
+    /// the host's own code, and leave the turn running to try something else.
+    #[tokio::test]
+    async fn host_reported_refusal_does_not_kill_the_turn() {
+        let (service, p, _root) = setup(false).await;
+        service.request("agent_dsh_start", &p).await.unwrap();
+        wait(&service, &p, "running").await;
+        let runner = service.clone();
+        let token = p["grantToken"].as_str().unwrap().to_owned();
+        let call = tokio::spawn(async move {
+            runner.host_call(&token,&json!({"v":1,"callId":"call","name":"gmgn_move","arguments":{"target":"chair"}})).await
+        });
+        let read = wait(&service, &p, "authorize").await;
+        let mut approval = read["pendingTools"][0].clone();
+        approval["decision"] = json!("approved");
+        approval["operationID"] = json!("operation");
+        service
+            .request("agent_dsh_authorize", &approval)
+            .await
+            .unwrap();
+        let read = wait(&service, &p, "execute").await;
+        let mut receipt = read["pendingTools"][0].clone();
+        receipt["status"] = json!("rejected");
+        receipt["output"] = json!({
+            "ok": false,
+            "code": "motion_unavailable",
+            "message": "当前角色没有这个动作",
+        });
+        service
+            .request("agent_dsh_tool_receipt", &receipt)
+            .await
+            .unwrap();
+        let answer = call.await.unwrap().unwrap();
+        assert_eq!(answer["ok"], false);
+        // The host's own answer, not the daemon's generic "宿主工具未能完成".
+        assert_eq!(answer["error"]["code"], "motion_unavailable");
+        let (state, stored): (String, String) = service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .query_row(
+                        "SELECT state,receipt FROM agent_tool_calls WHERE call='call'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|_| "storage_unavailable")
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "rejected");
+        assert!(stored.contains("motion_unavailable"));
+        // The turn was not cancelled: the resident can try another motion now.
+        assert_eq!(
+            service.request("agent_dsh_read", &p).await.unwrap()["state"],
+            "running"
+        );
+        assert_eq!(
+            service.request("agent_dsh_start", &p).await.unwrap_err(),
+            "agent_dsh_session_busy"
+        );
+    }
     /// The live space's `inspect_world` result is **host-owned** data: every enabled
     /// place, every activity with its seat projection, every camera, the motion
     /// catalogue and — while the resident is en route — `movement.waypointIDs`, one id
@@ -1303,15 +1728,10 @@ for line in sys.stdin:
         let mut receipt = read["pendingTools"][0].clone();
         receipt["status"] = json!("completed");
         receipt["output"] = json!({"padding":"x".repeat(crate::agent_tools::MAXIMUM_RECEIPT_BYTES + 4096)});
-        for _ in 0..2 {
-            assert_eq!(
-                service
-                    .request("agent_dsh_tool_receipt", &receipt)
-                    .await
-                    .unwrap_err(),
-                "agent_dsh_invalid_receipt"
-            );
-        }
+        // The status vocabulary is checked against a **live** pending execution:
+        // once a receipt has been refused, `refuse_receipt` settles that entry in
+        // place (it must not park on the 120 s transport bound), so a later call
+        // for the same callID can only be `agent_dsh_not_pending`.
         let mut bad_status = receipt.clone();
         bad_status["output"] = json!({"moved":true});
         bad_status["status"] = json!("succeeded");
@@ -1322,6 +1742,15 @@ for line in sys.stdin:
                 .unwrap_err(),
             "agent_dsh_invalid_receipt"
         );
+        for _ in 0..2 {
+            assert_eq!(
+                service
+                    .request("agent_dsh_tool_receipt", &receipt)
+                    .await
+                    .unwrap_err(),
+                "agent_dsh_invalid_receipt"
+            );
+        }
         let mut too_many_images = receipt.clone();
         too_many_images["output"] = json!({"moved":true});
         let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture");

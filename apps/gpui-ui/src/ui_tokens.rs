@@ -55,14 +55,71 @@ pub mod scene {
     pub const TEXT_MUTED: u32 = 0xffffff73;
     /// Tertiary readout: `white.opacity(0.43)`.
     pub const TEXT_DIM: u32 = 0xffffff6e;
-    /// Resting icon: `white.opacity(0.55)`.
-    pub const ICON: u32 = 0xffffff8c;
-    /// Interactive icon: `white.opacity(0.72)`.
-    pub const ICON_ACTIVE: u32 = 0xffffffb8;
+    /// **The icon palette.** Every glyph in the layer — a transport control, a
+    /// settings row, a panel button, a standalone `Icon` — resolves through
+    /// [`primitives::icon_color`], which returns exactly these four constants.
+    /// No icon may take its colour from a kit variant, a component default or
+    /// `cx.theme()`; `tests/overlay_theme_gate.rs` pins that.
+    ///
+    /// Default glyph: one bright white, raised from the original recording of
+    /// `white.opacity(0.55)` (`0xffffff8c`) on 2026-10-09 so the whole icon set
+    /// reads as one bright family on the dark `CARD_BG`/`PANEL_BG` surfaces.
+    /// The old 0.55 tone is [`ICON_MUTED`] now.
+    pub const ICON: u32 = 0xffffffd9;
+    /// Secondary glyph — a descriptive or hint-level icon (list affordance,
+    /// "nothing here yet", a de-emphasised control): `white.opacity(0.55)`
+    /// (`0xffffff8c`), the tone [`ICON`] carried before the icon pass.
+    pub const ICON_MUTED: u32 = 0xffffff8c;
+    /// Asserted / selected glyph: **the layer's selected colour**, [`SELECTED`].
+    ///
+    /// It replaces the old `ICON_ACTIVE = 0xffffffb8` (`white.opacity(0.72)`),
+    /// which was never an asserted state — it was the **resting** tone every
+    /// `icon_button` painted, so "active" named the wrong thing and a selected
+    /// control was told apart from a resting one only by [`ACCENT`].
+    ///
+    /// It is an **alias**, not a second definition: the hex lives once, in
+    /// [`SELECTED`], so an asserted glyph and a selected tab cannot drift apart.
+    pub const ICON_ACTIVE: u32 = SELECTED;
+    /// Glyph of a control the host has disabled, and of a glyph that is present
+    /// but not actionable: `white.opacity(0.35)`.
+    pub const ICON_DISABLED: u32 = 0xffffff59;
     /// Warning / notice text: `orange.opacity(0.95)`.
     pub const WARNING: u32 = 0xff9500f2;
-    /// Accent for active voice and selected state.
-    pub const ACCENT: u32 = 0x22d3ee;
+
+    /// The layer's one **selected / current / active** colour: a bright blue,
+    /// `#3B9EFF`.
+    ///
+    /// **All eight digits are written out.** `scene` tokens are `0xRRGGBBAA`,
+    /// and a six-digit literal is not "the RGB colour": `rgba` reads the low
+    /// byte as alpha. The accent this replaces was written `0x22d3ee`, which
+    /// resolves to `rgb(0, 34, 211)` at 93% — a dark navy, not the cyan its
+    /// comment claimed, and only 1.6:1 on [`CARD_BG`](self::CARD_BG). That is
+    /// the "default blue" look the layer must not have.
+    /// `selected_blue_is_written_with_all_eight_digits` pins the resolved
+    /// channels so that class of typo cannot come back.
+    ///
+    /// Why this value: hue 210°, saturation 100%, lightness 62%. It reads as
+    /// **blue** rather than cyan (the old `0x22d3ee` intent was 188°) and it is
+    /// bright — lightness above every dark surface in this module — while
+    /// clearing 4.5:1 on all of them: 5.4:1 on `CARD_BG`, 5.9:1 on `PANEL_BG`
+    /// and 6.5:1 on the transport bar's surface.
+    ///
+    /// **This is the single source** for every selected/active state in the
+    /// layer: the transport bar's asserted control, a settings row's 使用中
+    /// marker, a selected list row, the selected tab face and the 音量 track's
+    /// filled part all read this constant (or [`SELECTED_SOFT`]). Nothing else
+    /// may spell its hex, and no selected state may fall back to `cx.theme()`.
+    pub const SELECTED: u32 = 0x3b9effff;
+    /// The translucent wash *behind* a selected surface — [`SELECTED`] at 18%,
+    /// for a selected list row, a selected tab or an asserted control's own
+    /// face. Pairing it with `SELECTED` keeps one hue for "current" and only
+    /// varies how loud the state is.
+    pub const SELECTED_SOFT: u32 = 0x3b9eff2e;
+
+    /// The layer's accent — fills, rings and icon plates — **the same bright
+    /// blue** as [`SELECTED`](self::SELECTED), and an alias for the same
+    /// reason: one hue, declared once.
+    pub const ACCENT: u32 = SELECTED;
     /// Emphasis fill (primary send button): `white.opacity(0.92)`.
     pub const FILL: u32 = 0xffffffeb;
     /// Disabled emphasis fill: `white.opacity(0.25)`.
@@ -227,16 +284,18 @@ pub mod stage {
     pub const TILE_ICON_SIZE: f32 = 14.;
     /// Unselected text: `.white.opacity(0.62)`.
     pub const TILE_TEXT: u32 = 0xffffff9e;
-    /// Selected text: `Color(red: 0.48, green: 0.95, blue: 1)`.
-    pub const TILE_TEXT_SELECTED: u32 = 0x7af2ff;
+    /// Selected text: the layer's one selected colour, [`super::scene::SELECTED`].
+    pub const TILE_TEXT_SELECTED: u32 = super::scene::SELECTED;
     /// `.white.opacity(0.045)`.
     pub const TILE_FILL: u32 = 0xffffff0b;
-    /// `Color.cyan.opacity(0.16)`.
-    pub const TILE_FILL_SELECTED: u32 = 0x22d3ee29;
+    /// Selected tile fill: the layer's selected wash,
+    /// [`super::scene::SELECTED_SOFT`].
+    pub const TILE_FILL_SELECTED: u32 = super::scene::SELECTED_SOFT;
     /// `.white.opacity(0.07)`.
     pub const TILE_BORDER: u32 = 0xffffff12;
-    /// `Color.cyan.opacity(0.52)`.
-    pub const TILE_BORDER_SELECTED: u32 = 0x22d3ee85;
+    /// Selected tile hairline: the layer's one selected colour,
+    /// [`super::scene::SELECTED`].
+    pub const TILE_BORDER_SELECTED: u32 = super::scene::SELECTED;
     pub const TILE_BORDER_WIDTH: f32 = 0.8;
     pub const TILE_BORDER_WIDTH_SELECTED: f32 = 1.;
     /// Hover/press fill: one step above the resting tile fill, still fixed.
@@ -340,8 +399,10 @@ pub mod props {
     pub const ROW_PADDING: f32 = 9.;
     /// `RoundedRectangle(cornerRadius: 8)` (:241).
     pub const ROW_RADIUS: f32 = 8.;
-    /// Selected row: `Color.white.opacity(0.08)`.
-    pub const ROW_FILL_SELECTED: u32 = 0xffffff14;
+    /// Selected row: the layer's selected wash,
+    /// [`super::scene::SELECTED_SOFT`] (was `Color.white.opacity(0.08)`; a
+    /// selected row and a merely-hovered row must not both read as grey).
+    pub const ROW_FILL_SELECTED: u32 = super::scene::SELECTED_SOFT;
     /// Resting row: `Color.white.opacity(0.03)`.
     pub const ROW_FILL: u32 = 0xffffff08;
     pub const ROW_FILL_HOVER: u32 = 0xffffff14;
@@ -405,8 +466,9 @@ pub mod props {
     pub const TINT_IN_INVENTORY: u32 = 0xff9500e6;
     pub const TINT_FAILED: u32 = 0xff5a52e6;
     pub const TINT_NEUTRAL: u32 = 0xffffff73;
-    /// The selected-row checkmark is `.cyan` (:225).
-    pub const CHECK: u32 = 0x22d3ee;
+    /// The selected-row checkmark: the layer's one selected colour,
+    /// [`super::scene::SELECTED`] (:225 records `.cyan`).
+    pub const CHECK: u32 = super::scene::SELECTED;
 }
 
 /// 节目轨道 — the original `StageProgramRailView` / `StageProgramRailCard`
@@ -989,7 +1051,15 @@ mod tests {
         assert_eq!([stage::GRID_SPACING, stage::GRID_MIN_LYRICS, stage::GRID_MIN_POINT_CLOUD, stage::GRID_MIN_VIDEO], [6., 90., 110., 108.]);
         assert_eq!([stage::TILE_MIN_HEIGHT, stage::TILE_RADIUS, stage::TILE_GAP, stage::TILE_ICON_SIZE], [48., 13., 5., 14.]);
         assert_eq!([stage::AXIS_ROW_GAP, stage::AXIS_STACK_GAP, stage::REASON_SIZE, stage::ROW_STACK_GAP], [9., 5., 10., 3.]);
-        assert_eq!([stage::MODE_TEXT, stage::INFO_TEXT, stage::TILE_TEXT_SELECTED, stage::DANGER_TEXT], [0xffffffa3, 0xffffffb8, 0x7af2ff, 0xff5a52f2]);
+        assert_eq!([stage::MODE_TEXT, stage::INFO_TEXT, stage::TILE_TEXT_SELECTED, stage::DANGER_TEXT], [0xffffffa3, 0xffffffb8, 0x3b9effff, 0xff5a52f2]);
+        // Every selected-state token is the same bright blue, declared once.
+        assert_eq!(stage::TILE_TEXT_SELECTED, super::scene::SELECTED);
+        assert_eq!(stage::TILE_FILL_SELECTED, super::scene::SELECTED_SOFT);
+        assert_eq!(stage::TILE_BORDER_SELECTED, super::scene::SELECTED);
+        assert_eq!(props::ROW_FILL_SELECTED, super::scene::SELECTED_SOFT);
+        assert_eq!(props::CHECK, super::scene::SELECTED);
+        assert_eq!(super::scene::ICON_ACTIVE, super::scene::SELECTED);
+        assert_eq!(super::scene::ACCENT, super::scene::SELECTED);
         // stage_panels::metrics::props → props (PANEL_WIDTH aliases stage)
         assert_eq!(props::PANEL_WIDTH, stage::PROP_EDITOR_WIDTH);
         assert_eq!([props::PANEL_MAX_HEIGHT, props::PANEL_PADDING, props::PANEL_RADIUS], [390., 16., 16.]);
@@ -1090,5 +1160,74 @@ mod tests {
         assert_ne!(s::TEXT_MUTED, s::TEXT);
         assert_ne!(s::BORDER, s::BORDER_FOCUSED);
         assert_eq!(s::CONTROL_HEIGHT, 30.);
+    }
+
+    /// WCAG relative luminance of a resolved colour, so the contrast assertion
+    /// below is computed from the pixels rather than restated as a constant.
+    fn luminance(color: gpui_kit::gpui::Rgba) -> f64 {
+        let channel = |value: f32| {
+            let value = f64::from(value);
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+
+    fn contrast(a: gpui_kit::gpui::Rgba, b: gpui_kit::gpui::Rgba) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// 选中态 must be a **bright blue**, written with all eight `0xRRGGBBAA`
+    /// digits.
+    ///
+    /// The assertions read the colour GPUI's own `rgba` decodes — the value the
+    /// renderer paints — and pin its channels to literal numbers, so this is not
+    /// the constant compared with itself: put the old colour back (the six-digit
+    /// `0x22d3ee`, which `rgba` reads as `rgb(0, 34, 211)` — a dark navy — or
+    /// `0x7af2ff`, a cyan) and this test goes red.
+    #[test]
+    fn selected_blue_is_written_with_all_eight_digits() {
+        use super::scene as s;
+        let selected = gpui_kit::gpui::rgba(s::SELECTED);
+        let channels = [
+            (selected.r * 255.).round() as u32,
+            (selected.g * 255.).round() as u32,
+            (selected.b * 255.).round() as u32,
+            (selected.a * 255.).round() as u32,
+        ];
+        assert_eq!(
+            channels,
+            [0x3b, 0x9e, 0xff, 0xff],
+            "scene::SELECTED must resolve to the opaque bright blue #3B9EFF"
+        );
+        // Blue, not cyan and not a neutral: more blue than red, more green than
+        // red, and bright enough to read as "lit" on the dark chrome.
+        assert!(selected.b > selected.g && selected.g > selected.r, "got {channels:?}");
+        assert!(selected.b >= 0.9 && selected.g >= 0.5, "the selected blue must be bright: {channels:?}");
+        // Contrast on the fixed dark surfaces, computed from the pixels.
+        for (name, surface) in [("CARD_BG", s::CARD_BG), ("PANEL_BG", s::PANEL_BG)] {
+            let ratio = contrast(selected, gpui_kit::gpui::rgba(surface));
+            assert!(ratio >= 4.5, "SELECTED must clear 4.5:1 on {name}, got {ratio:.2}:1");
+        }
+        // The six-digit trap: `rgba` reads the low byte as alpha, so a six-digit
+        // literal is a *different, dark* colour. This is the bug that made the
+        // old ACCENT paint `rgb(0, 34, 211)`.
+        assert_ne!(
+            gpui_kit::gpui::rgba(0x3b9eff),
+            selected,
+            "a six-digit literal is not SELECTED — `rgba` would read `ff` as alpha and drop the red channel"
+        );
+        // The wash keeps the same hue and is translucent.
+        let soft = gpui_kit::gpui::rgba(s::SELECTED_SOFT);
+        assert!(soft.a < 0.5 && soft.a > 0.05, "SELECTED_SOFT is a wash, got alpha {:.3}", soft.a);
+        assert_eq!(
+            [(soft.r * 255.).round() as u32, (soft.g * 255.).round() as u32, (soft.b * 255.).round() as u32],
+            [0x3b, 0x9e, 0xff],
+            "SELECTED_SOFT must be the same hue as SELECTED"
+        );
     }
 }

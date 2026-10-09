@@ -1,0 +1,29 @@
+# The Windows host skeleton (form 甲: Unity keeps the window, this layer *is* the
+# native host, exactly like `apps/macos/UnityHost/UnityMediaHost.swift` is on
+# macOS).
+#
+# Deliberately its **own workspace** (`[workspace]` below), for the same reason
+# `apps/gpui-ui` has one: the root `Cargo.toml` belongs to the taskd/mcpd line
+# and this crate must not perturb it. Nothing here is a member of that workspace,
+# so `cargo test --manifest-path services/gmgn-taskd/Cargo.toml` is unaffected.
+#
+# **Zero dependencies on purpose.** The gate in `tests/second_host_contract.rs`
+# and the credential store in `src/credential.rs` need nothing but `std`, which
+# means `cargo check --target x86_64-pc-windows-gnu` on a macOS host has no C
+# code and no build scripts to cross-compile -- the Windows-only module
+# (`src/windows_acl.rs`) is therefore *really* type-checked for Windows in CI,
+# not merely written and hoped for.
+[package]
+name = "gmgn-windows-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Second (non-Swift) host for the GPUI overlay op contract: Windows skeleton + the consistency gate."
+
+[workspace]
+
+[dependencies]
+
+[[bin]]
+name = "gmgn-windows-host"
+path = "src/main.rs"

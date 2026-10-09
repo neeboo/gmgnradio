@@ -276,6 +276,26 @@ impl InboxPane {
     pub fn take_commands(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.state.commands)
     }
+    /// Select the row at `index` (0-based) and bring it into view.
+    ///
+    /// A rendering harness needs the **selected** row to be on screen without
+    /// synthesising input; the product itself never calls this (its keyboard
+    /// path is what selects). Selecting does not mark the entry read — only
+    /// [`can_open`]'s double-click path does.
+    pub fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .rows()
+            .get(index)
+            .and_then(|row| row["id"].as_str())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.state.select(id);
+        self.scroll.scroll_to_item(index);
+        cx.notify();
+    }
     fn move_selection(&mut self, direction: isize, cx: &mut Context<Self>) {
         self.state.move_selection(direction);
         if let Some(index) = self
@@ -289,9 +309,15 @@ impl InboxPane {
         cx.notify();
     }
 
-    /// One list row. The row is a kit `ListItem` so hover/press/selection and
-    /// the accessibility node stay kit-owned; only its copy and layout come from
-    /// the original cell (`ResidentSystemInboxUI.swift:218-255`).
+    /// One list row. The row is a kit `ListItem` so hover/press and the
+    /// accessibility node stay kit-owned; only its copy and layout come from the
+    /// original cell (`ResidentSystemInboxUI.swift:218-255`).
+    ///
+    /// The **selected** face is the layer's own: kit's `ListItem::selected(..)`
+    /// paints `cx.theme().list_active` (or `cx.theme().accent`), which is the
+    /// theme's selection colour, and `ListItem` offers no way to override that
+    /// field — so the row is not marked `.selected(..)` at all and carries
+    /// [`s::SELECTED_SOFT`]/[`s::SELECTED`] itself.
     fn row(&self, row: &Value, now: i64, cx: &mut Context<Self>) -> AnyElement {
         let id = row["id"].as_str().unwrap_or_default().to_owned();
         let title = row["title"].as_str().unwrap_or_default().to_owned();
@@ -300,24 +326,34 @@ impl InboxPane {
         let text = row_text(&title, &status, is_read, &row_relative_time(row, now));
         let selected = self.state.selected.as_deref() == Some(id.as_str());
         let click_id = id.clone();
-        ListItem::new(SharedString::from(id))
-            .selected(selected)
+        let mut item = ListItem::new(SharedString::from(id))
             .role(Role::ListItem)
             .accessibility_label(text.accessibility.clone())
             .min_h(px(m::ROW_HEIGHT))
             .px(px(m::ROW_PADDING_H))
             .py(px(m::ROW_PADDING_V))
-            .text_color(rgba(m::TITLE_TEXT))
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.state.select(click_id.clone());
-                // Double-click is the original's `doubleAction` (`:126`); a
-                // single click only shows the detail and never ACKs.
-                if event.click_count() >= 2 {
-                    this.state.open();
-                }
-                window.focus(&this.focus, cx);
-                cx.notify();
-            }))
+            // A selected row reads as the layer's bright blue: its own title in
+            // `SELECTED` over the `SELECTED_SOFT` wash. The resting row keeps the
+            // original's white title.
+            .text_color(rgba(if selected { s::SELECTED } else { m::TITLE_TEXT }));
+        if selected {
+            // `ListItem` is a kit component, not a `Div`, so the conditional is
+            // written out rather than chained with `.when(..)`.
+            item = item
+                .bg(rgba(s::SELECTED_SOFT))
+                .border_l(px(2.))
+                .border_color(rgba(s::SELECTED));
+        }
+        item.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            this.state.select(click_id.clone());
+            // Double-click is the original's `doubleAction` (`:126`); a
+            // single click only shows the detail and never ACKs.
+            if event.click_count() >= 2 {
+                this.state.open();
+            }
+            window.focus(&this.focus, cx);
+            cx.notify();
+        }))
             .child(
                 h_flex()
                     .w_full()

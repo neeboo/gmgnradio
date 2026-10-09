@@ -1,0 +1,3 @@
+# This crate is its own workspace, so its build directory is its own too -- the
+# root `.gitignore` only covers `/target/`.
+target/

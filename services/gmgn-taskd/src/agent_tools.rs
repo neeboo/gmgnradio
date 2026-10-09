@@ -640,6 +640,39 @@ pub fn request(db: &mut Connection, method: &str, p: &Value) -> Result<Value> {
             }
             json!({"finished":true})
         }
+        // A host that answers a call with its own named refusal (a bad motion id,
+        // an unavailable prop, a refused placement) has **reported** the outcome:
+        // the effect did not start. That is a different fact from `unknown`, which
+        // means "the host never told us". Recording a reported refusal as
+        // `unknown` (the rule until 2026-10-09) made one failed tool call poison
+        // its whole turn: `run` saw an unresolved call, wrote the event `unknown`
+        // and the client threw `RustDSHSessionClient error 4`, discarding a turn
+        // the model could simply have retried.
+        //
+        // `rejected` is terminal and conservative: it is *not* `not_applied`, so
+        // `agent_tool_begin`'s operation guard still refuses to redispatch the
+        // same operation, and it is *not* `finished`, so a later host
+        // verification cannot mistake it for an applied effect. Only the host's
+        // own answer is ever written here (`agent_tool_finish` for a completed
+        // call, `reconcile` for a verified one).
+        "agent_tool_refuse" => {
+            let receipt = bounded_receipt(&p["receipt"])?;
+            let run = text(p, "runID")?;
+            let session = text(p, "hostSessionID")?;
+            let call = text(p, "callID")?;
+            let old:Option<(String,Option<String>)>=tx.query_row("SELECT state,receipt FROM agent_tool_calls WHERE world=?1 AND scope=?2 AND run=?3 AND session=?4 AND call=?5",params![world,scope,run,session,call],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|"storage_unavailable")?;
+            let (state, old) = old.ok_or("agent_tool_call_not_found")?;
+            if state == "rejected" {
+                if old.as_deref() != Some(&receipt) {
+                    return Err("agent_tool_receipt_conflict");
+                }
+            } else if state == "inflight" {
+                tx.execute("UPDATE agent_tool_calls SET state='rejected',receipt=?6 WHERE world=?1 AND scope=?2 AND run=?3 AND session=?4 AND call=?5",params![world,scope,run,session,call,receipt]).map_err(|_|"storage_unavailable")?;
+            } else {
+                return Err("agent_tool_requires_reconciliation");
+            }
+            json!({"refused":true})
+        }
         "agent_tool_inspect" => {
             let op = text(p, "operationID")?;
             let mut q=tx.prepare("SELECT run,session,call,state,receipt FROM agent_tool_calls WHERE world=?1 AND scope=?2 AND operation=?3 ORDER BY rowid").map_err(|_|"storage_unavailable")?;
@@ -667,6 +700,29 @@ pub fn request(db: &mut Connection, method: &str, p: &Value) -> Result<Value> {
     tx.commit().map_err(|_| "storage_unavailable")?;
     Ok(result)
 }
+/// The host's **own** verification receipt, in the shape the runtime family
+/// already demands (its refusal is `agent_runtime_invalid_verification`,
+/// `agent_runtime.rs:942`): a bare acknowledgement (`{"verified":true}`) is not a
+/// verification. A durable row only says "we never learned the effect", so only a
+/// receipt that names how the host checked (`observedState`) and when
+/// (`verifiedAtMillis`) may settle it — nothing here is inferred from the call
+/// itself.
+fn verified_receipt(p: &Value) -> Result<&Value> {
+    let verification = &p["verificationReceipt"];
+    if !verification.is_object()
+        || verification.as_object().is_some_and(|o| o.is_empty())
+        || verification["kind"] != "host_state_verification"
+        || verification["verifiedAtMillis"].as_u64().is_none()
+        || verification["observedState"]
+            .as_object()
+            .is_none_or(|o| o.is_empty())
+        || verification.to_string().len() > MAXIMUM_ARGUMENT_BYTES
+        || !safe(verification)
+    {
+        return Err("agent_tool_invalid_verification");
+    }
+    Ok(verification)
+}
 /// Trusted host must actually verify whether the side effect happened before calling.
 pub fn reconcile(db: &mut Connection, p: &Value) -> Result<Value> {
     let world = text(p, "worldID")?;
@@ -678,14 +734,7 @@ pub fn reconcile(db: &mut Connection, p: &Value) -> Result<Value> {
     if !matches!(outcome, "applied" | "not_applied") {
         return Err("agent_tool_invalid_request");
     }
-    let receipt = bounded(&p["verificationReceipt"])?;
-    if !p["verificationReceipt"].is_object()
-        || p["verificationReceipt"]
-            .as_object()
-            .is_some_and(|o| o.is_empty())
-    {
-        return Err("agent_tool_invalid_payload");
-    }
+    let receipt = bounded(verified_receipt(p)?)?;
     let tx = db
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| "storage_unavailable")?;
@@ -695,6 +744,32 @@ pub fn reconcile(db: &mut Connection, p: &Value) -> Result<Value> {
     }
     tx.commit().map_err(|_| "storage_unavailable")?;
     Ok(json!({"reconciled":true,"outcome":outcome}))
+}
+/// Flat-host entry for `agent_tool_reconcile` — the same `agent_tool_*` family
+/// `daemon.rs` routes for the macOS host.
+///
+/// It demands exactly what `reconcile` demands **plus** the identity of the call
+/// the receipt claims to have verified: world, scope, host session, run, call and
+/// outcome must all be byte-for-byte the request's own before any row moves. The
+/// runtime family checks the same six fields before it delegates
+/// (`agent_runtime.rs:950-962`); this entry exists so a host can settle a leftover
+/// `unknown` row from a refused receipt without a live runtime session — and only
+/// with a receipt that names that very call.
+pub fn reconcile_request(db: &mut Connection, p: &Value) -> Result<Value> {
+    let verification = verified_receipt(p)?;
+    for key in [
+        "worldID",
+        "residentScope",
+        "hostSessionID",
+        "runID",
+        "callID",
+        "outcome",
+    ] {
+        if verification[key] != p[key] {
+            return Err("agent_tool_invalid_verification");
+        }
+    }
+    reconcile(db, p)
 }
 
 #[cfg(test)]
@@ -746,6 +821,57 @@ mod tests {
         assert_eq!(
             request(&mut db, "agent_tool_finish", &p).unwrap_err(),
             "agent_tool_receipt_conflict"
+        );
+    }
+    /// A host-reported refusal is a **reported** outcome, not a lost one. It must
+    /// settle terminal (`rejected`) carrying the host's own receipt — never
+    /// `unknown`, which is what made one bad `play_motion` id poison a whole turn
+    /// on the real device (2026-10-09 16:50) — and it must stay conservative: the
+    /// operation guard still refuses to redispatch the same operation, and a later
+    /// `finish` cannot pretend the call applied.
+    #[test]
+    fn host_reported_refusal_settles_rejected_not_unknown() {
+        let (mut db, mut p) = setup();
+        assert_eq!(
+            request(&mut db, "agent_tool_begin", &p).unwrap()["dispatch"],
+            true
+        );
+        p["receipt"] = json!({"ok":false,"code":"motion_unavailable","message":"没有这个动作"});
+        assert_eq!(
+            request(&mut db, "agent_tool_refuse", &p).unwrap()["refused"],
+            true
+        );
+        let (state, receipt): (String, Option<String>) = db
+            .query_row(
+                "SELECT state,receipt FROM agent_tool_calls WHERE call='c'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "rejected");
+        assert!(receipt.unwrap().contains("motion_unavailable"));
+        // The same refusal is idempotent; a different one on a settled call is not.
+        assert_eq!(
+            request(&mut db, "agent_tool_refuse", &p).unwrap()["refused"],
+            true
+        );
+        p["receipt"] = json!({"ok":false,"code":"something_else"});
+        assert_eq!(
+            request(&mut db, "agent_tool_refuse", &p).unwrap_err(),
+            "agent_tool_receipt_conflict"
+        );
+        // Conservative: only a host *verification* may unblock the operation.
+        let mut fresh = p.clone();
+        fresh["callID"] = json!("c2");
+        assert_eq!(
+            request(&mut db, "agent_tool_begin", &fresh).unwrap_err(),
+            "agent_tool_operation_blocked"
+        );
+        // A refused call is not an applied one.
+        p["receipt"] = json!({"ok":true,"applied":true});
+        assert_eq!(
+            request(&mut db, "agent_tool_finish", &p).unwrap_err(),
+            "agent_tool_requires_reconciliation"
         );
     }
     #[test]
@@ -812,13 +938,72 @@ mod tests {
         );
         p["callID"] = json!("c");
         p["outcome"] = json!("not_applied");
+        // A bare acknowledgement is refused; the host's own verification is the
+        // only thing that may settle an `unknown` row.
         p["verificationReceipt"] = json!({"observed":"unchanged"});
+        assert_eq!(
+            reconcile(&mut db, &p).unwrap_err(),
+            "agent_tool_invalid_verification"
+        );
+        p["verificationReceipt"] = verification_receipt(&p);
         reconcile(&mut db, &p).unwrap();
         p["callID"] = json!("c2");
         assert_eq!(
             request(&mut db, "agent_tool_begin", &p).unwrap()["dispatch"],
             true
         );
+    }
+    /// The flat `agent_tool_reconcile` entry is the host's own exit for a leftover
+    /// `unknown` row (the refused-receipt shape): it must exist, must settle the
+    /// row with a real verification receipt, and must refuse a receipt that names
+    /// a different call than the one it would move.
+    #[test]
+    fn the_flat_reconcile_entry_settles_only_the_call_its_receipt_names() {
+        let (mut db, mut p) = setup();
+        request(&mut db, "agent_tool_begin", &p).unwrap();
+        recover(&db).unwrap();
+        p["outcome"] = json!("not_applied");
+        p["verificationReceipt"] = json!({"verified":true});
+        assert_eq!(
+            reconcile_request(&mut db, &p).unwrap_err(),
+            "agent_tool_invalid_verification"
+        );
+        assert_eq!(call_state(&db), "unknown");
+        p["verificationReceipt"] = verification_receipt(&p);
+        p["verificationReceipt"]["callID"] = json!("someone-else");
+        assert_eq!(
+            reconcile_request(&mut db, &p).unwrap_err(),
+            "agent_tool_invalid_verification"
+        );
+        assert_eq!(call_state(&db), "unknown");
+        p["verificationReceipt"] = verification_receipt(&p);
+        assert_eq!(
+            reconcile_request(&mut db, &p).unwrap()["reconciled"],
+            true
+        );
+        assert_eq!(call_state(&db), "not_applied");
+    }
+    fn call_state(db: &Connection) -> String {
+        db.query_row("SELECT state FROM agent_tool_calls WHERE call='c'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+    /// The receipt the host must present: it names the call, when the host looked
+    /// and what it saw. Identity is filled from the request so a test can override
+    /// one field and watch the entry refuse.
+    fn verification_receipt(p: &Value) -> Value {
+        json!({
+            "kind": "host_state_verification",
+            "verifiedAtMillis": 123,
+            "observedState": {"objectPosition": "unchanged"},
+            "worldID": p["worldID"],
+            "residentScope": p["residentScope"],
+            "hostSessionID": p["hostSessionID"],
+            "runID": p["runID"],
+            "callID": p["callID"],
+            "outcome": p["outcome"],
+        })
     }
     #[test]
     fn cancellation_session_scope_and_schema_fail_closed() {

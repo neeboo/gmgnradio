@@ -29,7 +29,7 @@ namespace GMGN.UnityPlayer
         WorldRuntimeBridge world;
         NativePlayerBackend backend;
         readonly byte[] commandBuffer = new byte[256 * 1024];
-        string latestSnapshot;
+        JObject latestProjection;
         JArray inventory = new JArray();
         JObject lastUICommandResult;
         JObject localSettingsResult;
@@ -64,24 +64,22 @@ namespace GMGN.UnityPlayer
         void ApplyInventory(JArray value) { inventory = (JArray)value.DeepClone(); }
         public void BindBackend(NativePlayerBackend existingBackend)
         {
-            if (backend != null) backend.GPUIHostSnapshot -= ApplySnapshot;
+            if (backend != null) backend.GPUIHostProjection -= ApplySnapshot;
             backend = existingBackend;
-            if (backend != null) backend.GPUIHostSnapshot += ApplySnapshot;
+            if (backend != null) backend.GPUIHostProjection += ApplySnapshot;
         }
-        void ApplySnapshot(string json)
+        // One parse and one serialization per poll. `projection` is the tree the backend parsed
+        // this tick; the adjuncts below are added to it in place and it is written straight to UTF-8
+        // bytes for the native boundary, so no UTF-16 string of the whole envelope is materialized
+        // and no second parse of our own output happens.
+        void ApplySnapshot(JObject projection)
         {
-            latestSnapshot = json;
+            latestProjection = projection;
             if (!mounted) return;
-            var projection = JObject.Parse(json);
-            projection["unityInventory"] = inventory.DeepClone();
-            projection["unityWorldAuthority"] = world?.AuthorityProjection?.DeepClone();
-            if (LocalUIProjection != null) projection["ui"] = LocalUIProjection();
-            if (lastUICommandResult != null) projection["unityUICommandResult"] = lastUICommandResult.DeepClone();
-            if (projection["settings"] is JObject settings && settings["supportedCommands"] is JArray supported &&
-                !supported.Contains("stage.camera.reset")) supported.Add("stage.camera.reset");
-            if (localSettingsResult != null) projection["settingsCommandResult"] = localSettingsResult.DeepClone();
-            var bytes = Encoding.UTF8.GetBytes(projection.ToString(Newtonsoft.Json.Formatting.None));
-            if (bytes.Length > 4 * 1024 * 1024 || gmgn_gpui_chat_snapshot(bytes, (UIntPtr)bytes.Length) != 0) {
+            GPUIProjectionPayload.Augment(projection, inventory.DeepClone(), world?.AuthorityProjection?.DeepClone(),
+                LocalUIProjection?.Invoke(), lastUICommandResult?.DeepClone(), localSettingsResult?.DeepClone());
+            var bytes = GPUIProjectionPayload.Encode(projection);
+            if (bytes.Length > GPUIProjectionPayload.Capacity || gmgn_gpui_chat_snapshot(bytes, (UIntPtr)bytes.Length) != 0) {
                 if (!projectionFailureReported) ReportFailure("GPUI: host snapshot projection rejected.");
                 projectionFailureReported = true;
             } else {
@@ -108,7 +106,7 @@ namespace GMGN.UnityPlayer
                         catch (InvalidOperationException) { }
                         localSettingsResult = new JObject { ["requestID"] = command["requestID"],
                             ["status"] = reset ? "accepted" : "failed", ["code"] = reset ? null : "camera_reset_unavailable" };
-                        if (latestSnapshot != null) ApplySnapshot(latestSnapshot);
+                        if (latestProjection != null) ApplySnapshot(latestProjection);
                     }
                     else if ((string)command["op"] == "ui.chat.dropRegion") {
                         composerDropRect = new Rect((float?)command["x"] ?? 0, (float?)command["y"] ?? 0,
@@ -126,8 +124,8 @@ namespace GMGN.UnityPlayer
                         bool started = false;
                         if ((string)command["op"] == "ui.inventory.place")
                             started = command["objectID"]?.Type == JTokenType.String && world != null && world.BeginInventoryPlacement((string)command["objectID"]);
-                        else if (command["templateID"]?.Type == JTokenType.String && latestSnapshot != null) {
-                            var templates = JObject.Parse(latestSnapshot)["builtinDevices"]?["templates"] as JArray;
+                        else if (command["templateID"]?.Type == JTokenType.String && latestProjection != null) {
+                            var templates = latestProjection["builtinDevices"]?["templates"] as JArray;
                             if (templates != null) foreach (var item in templates) {
                                 if (item is JObject template && (string)template["id"] == (string)command["templateID"]) {
                                     started = world != null && world.BeginDevicePlacement(template); break;
@@ -136,14 +134,14 @@ namespace GMGN.UnityPlayer
                         }
                         lastUICommandResult = new JObject { ["op"] = command["op"], ["requestID"] = command["requestID"],
                             ["status"] = started ? "started" : "rejected", ["code"] = started ? null : "placement_not_ready" };
-                        if (latestSnapshot != null) ApplySnapshot(latestSnapshot);
+                        if (latestProjection != null) ApplySnapshot(latestProjection);
                     } else {
                         if ((string)command["op"] == "ui.settings.command") localSettingsResult = null;
                         if (!backend.SendGPUICommand(command)) {
                             if ((string)command["op"] == "ui.settings.command") {
                                 localSettingsResult = new JObject { ["requestID"] = command["requestID"],
                                     ["status"] = "failed", ["code"] = "settings_command_not_accepted" };
-                                if (latestSnapshot != null) ApplySnapshot(latestSnapshot);
+                                if (latestProjection != null) ApplySnapshot(latestProjection);
                             }
                             Debug.LogWarning("GPUI: host command not accepted.");
                         }
@@ -161,9 +159,9 @@ namespace GMGN.UnityPlayer
         IEnumerator Start()
         {
             float deadline = Time.realtimeSinceStartup + 60;
-            while (latestSnapshot == null && Time.realtimeSinceStartup < deadline)
+            while (latestProjection == null && Time.realtimeSinceStartup < deadline)
                 yield return null;
-            if (backend == null || latestSnapshot == null) {
+            if (backend == null || latestProjection == null) {
                 ReportFailure("GPUI: existing host snapshot unavailable; controls not mounted."); yield break;
             }
             // The existing world remains the sole owner. Mount only after its real startup projection.
@@ -182,10 +180,9 @@ namespace GMGN.UnityPlayer
                     gmgn_overlay_set_panel_expanded(0);
                     composerDropRect = Rect.zero; PublishDropRegion();
                     Debug.Log("聊天2: actual GPUI mounted in existing Unity window; existing host transport.");
-                    if (latestSnapshot != null) {
-                        var initial = JObject.Parse(latestSnapshot);
-                        if (initial["chat"] is JObject chat) chat["events"] = new JArray();
-                        ApplySnapshot(initial.ToString(Newtonsoft.Json.Formatting.None));
+                    if (latestProjection != null) {
+                        if (latestProjection["chat"] is JObject chat) chat["events"] = new JArray();
+                        ApplySnapshot(latestProjection);
                     }
                 }
                 else ReportFailure("GPUI: actual GPUI mount failed.");
@@ -194,7 +191,7 @@ namespace GMGN.UnityPlayer
         }
         public void Shutdown() {
             if (world != null) world.InventoryUpdated -= ApplyInventory;
-            if (backend != null) backend.GPUIHostSnapshot -= ApplySnapshot;
+            if (backend != null) backend.GPUIHostProjection -= ApplySnapshot;
             if (mounted) { gmgn_unity_chat_image_drop_region(0, 0, 0, 0); gmgn_gpui_probe_unmount(); mounted = false; }
             projectionReady = false; backend = null; world = null;
         }

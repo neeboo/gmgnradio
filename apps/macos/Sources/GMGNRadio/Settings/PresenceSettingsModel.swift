@@ -3,6 +3,7 @@ import Foundation
 import MotionDistribution
 import Observation
 import UniformTypeIdentifiers
+import os
 
 extension Notification.Name {
     static let gmgnManualMotionWillActivate = Notification.Name(
@@ -52,6 +53,14 @@ final class PresenceSettingsModel {
     private let renderPolicy: String
     private let supportedEngines: Set<String>
     private var selectionTask: Task<Void, Never>?
+    /// When the live `selectionTask` started. `presence.remove` runs through
+    /// `runSelection`, bypassing the bridge's own operation gate, so a task that
+    /// never returned used to pin `isWorking` and answer every later 选定动作
+    /// busy for ever (2026-10-09).
+    private var selectionTaskStartedAt: Date?
+    /// A `selectionTask` at or past this age is treated as non-existent.
+    private static let selectionStaleAfter: TimeInterval = 20
+    static let selectionLog = Logger(subsystem: "ai.gmgn.radio", category: "PresenceSelection")
 
     private enum MotionPreferenceKey {
         static let vrm = "gmgn.presence.motion.preferred.vrm"
@@ -151,11 +160,20 @@ final class PresenceSettingsModel {
         onSelectionChanged?()
     }
     private func runSelection(_ body: @escaping @MainActor () async throws -> Void) {
+        if let startedAt = selectionTaskStartedAt, Date().timeIntervalSince(startedAt) >= Self.selectionStaleAfter {
+            let ageMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            Self.selectionLog.error("code=presence_selection_stale_cleared op=selection.task ageMs=\(ageMs, privacy: .public) reason=runSelection")
+            selectionTask?.cancel(); selectionTask = nil; selectionTaskStartedAt = nil; isWorking = false
+        }
         guard selectionTask == nil else { return }
         isWorking = true
+        selectionTaskStartedAt = Date()
         selectionTask = Task { [weak self] in
+            // The clear is installed before `guard let self` and covers every
+            // exit path, including cancellation: a stale marker must not outlive
+            // the model, and a later selection must see `selectionTask == nil`.
+            defer { self?.isWorking = false; self?.selectionTask = nil; self?.selectionTaskStartedAt = nil }
             guard let self else { return }
-            defer { isWorking = false; selectionTask = nil }
             do { try await body() } catch { show(error: error) }
         }
     }

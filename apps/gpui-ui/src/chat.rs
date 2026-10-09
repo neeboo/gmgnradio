@@ -631,7 +631,10 @@ impl ResidentChatPane {
                     .w(px(m::ATTACH_BUTTON))
                     .h(px(m::ATTACH_BUTTON))
                     .rounded(px(m::ATTACH_BUTTON_RADIUS))
-                    .text_color(rgba(s::ICON_ACTIVE))
+                    .text_color(ui::icon_color(
+                        false,
+                        !(self.state.attachments_preparing || self.state.attachments.len() >= 4),
+                    ))
                     .tooltip("添加图片，也可以直接粘贴图片")
                     .accessibility_label("添加图片附件")
                     .disabled(
@@ -668,7 +671,7 @@ impl ResidentChatPane {
                     .w(px(s::CONTROL_HEIGHT))
                     .h(px(s::CONTROL_HEIGHT))
                     .rounded(px(s::CONTROL_RADIUS))
-                    .text_color(rgba(s::ICON_ACTIVE))
+                    .text_color(ui::icon_color(false, true))
                     .tooltip(stop_label)
                     .accessibility_label(stop_label)
                     .accessibility_id("stage.resident-stop")

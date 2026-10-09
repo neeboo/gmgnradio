@@ -172,10 +172,29 @@ impl HostToolExecutor for LedgerHostTools {
                 pending.unknown().await?;
                 return Err("host_tool_receipt_identity_mismatch".into());
             }
-            if cancellation.is_cancelled() || receipt.status != HostToolStatus::Completed {
+            if cancellation.is_cancelled() {
                 pending.unknown().await?;
                 return Err("host_tool_result_unknown".into());
             }
+            // Three different facts, three different durable states:
+            //   * `Completed` — the host ran the call and returned its result
+            //     (`finished`, receipt kept);
+            //   * `Rejected`  — the host **answered** with its own named refusal
+            //     (bad motion id, unavailable prop, refused placement): the effect
+            //     did not start. That is a reported outcome, not a lost one, so it
+            //     is settled as the terminal `rejected` and the host's own receipt
+            //     is returned unchanged so the model can adapt instead of seeing an
+            //     opaque "unknown";
+            //   * `Unknown`   — the host could not tell. Only this one is durable
+            //     `unknown` (never guessed into applied/not_applied).
+            let method = match receipt.status {
+                HostToolStatus::Completed => "agent_tool_finish",
+                HostToolStatus::Rejected => "agent_tool_refuse",
+                HostToolStatus::Unknown => {
+                    pending.unknown().await?;
+                    return Err("host_tool_result_unknown".into());
+                }
+            };
             p["receipt"] = match persisted_receipt(&receipt) {
                 Ok(value) => value,
                 Err(code) => {
@@ -183,7 +202,7 @@ impl HostToolExecutor for LedgerHostTools {
                     return Err(code);
                 }
             };
-            db.call(move |s| agent_tools::request(&mut s.connection, "agent_tool_finish", &p))
+            db.call(move |s| agent_tools::request(&mut s.connection, method, &p))
                 .await
                 .map_err(str::to_owned)?;
             pending.settled = true;

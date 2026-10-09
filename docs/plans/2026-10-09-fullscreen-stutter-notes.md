@@ -26,3 +26,81 @@
 
 ## 不要做的事
 - 不要再为这个问题起一堆实验包（会把机器堆满内存/IO，反而制造"卡"）；不要合成点击；不要改系统分辨率/音量/设备。
+
+---
+
+## 2026-10-09 17:20 定位完成 + 修复（工作树 `codex/rust-full-migration` @ 97b50cb，已装 228）
+
+### 结论先说
+「切全屏会卡」那一帧的主线程成本**不是**像素、不是 GPU、也不是显示模式切换，
+而是 **GPUI 轮询快照的 Newtonsoft Json.NET 树**：20 Hz 的 `NativePlayerBackend.Tick()`
+把整份宿主信封（真机实测 **158 472 B**）**解析 2 次、整树深拷 1 次、序列化 2 次**，
+再把字符串交给 `GPUIChat2Probe.ApplySnapshot()` **重新解析**一次，最后编码成 UTF-16
+字符串再转 UTF-8。窗口态就已经是这样，全屏只是把同一份成本叠在更小的像素预算上。
+
+### 怎么量出来的（不需要点界面）
+`sample <pid> 5` 的调用图里主线程 71 % 是 Mono JIT 的 `<unknown binary>`；用
+`lldb -p <pid>` + Mono 导出的 `mono_pmip()` 把地址还原成方法名（脚本留在
+`tmp/fs-stutter/resolve_jit.py`），得到（全屏态那一份，3392 个采样）：
+
+| 采样点 | 占比 | 是什么 |
+|---|---|---|
+| `PlayerScreen.Update()` | 71 % | 2420/3392 |
+| └ `NativePlayerBackend.Tick()` | 43 % | 20 Hz（`nextPoll = Time.unscaledTime + .05f`） |
+| &nbsp;&nbsp;├ `gmgn_unity_host_snapshot`（原生） | 12.8 % | 宿主现造 158 KB JSON |
+| &nbsp;&nbsp;├ `JObject.Parse(json)` | 13.1 % | 解析 ①（Tick:261） |
+| &nbsp;&nbsp;├ `PublishGPUIProjection` → `JToken.DeepClone()` | 9.3 % | 整树深拷 |
+| &nbsp;&nbsp;├ `PublishGPUIProjection` → `JToken.ToString(None)` | 4.1 % | 序列化 ① |
+| &nbsp;&nbsp;├ `ApplySnapshot` → `JObject.Parse(string)` | 11.8 % | 解析 ②（自己刚写出来的字符串） |
+| &nbsp;&nbsp;├ `ApplySnapshot` → `JToken.ToString(None)` | 4.1 % | 序列化 ②（走 UTF-16） |
+| &nbsp;&nbsp;└ `gmgn_gpui_chat_snapshot`（原生） | 12.2 % | overlay 用 serde 再解析一次 + 重投影面板 |
+
+窗口态同一份采样形状完全一样（`CallUpdateMethod` 3163/3532、`PlayerScreen.Update`
+3102/3532、`Tick` 1816/3532），所以**窗口态与全屏是同一条热点**。
+
+### 数字（同一会话，已装 228 实例）
+| 条件 | fps | framesOver50ms/5 s | cpuMs（轮询帧 / 无轮询帧） | gpuMs |
+|---|---|---|---|---|
+| 窗口态 1440×900，`stageActive=False points=0` | 31.0–34.6 | 12–23 | 40.3 / 13.6 | 6.9 |
+| 全屏 4096×2304 `FullScreenWindow` | 12–30 | 28–83 | 53.0–62.8 | 15.4（2.2×） |
+| 窗口态 `stageActive=True points=22536`（`Player-prev.log`） | 11.3 均 | 57 均 | 80.8–92.5 | 1.0–7.0 |
+
+**显示模式没有变**：`system_profiler` 主屏 U3277WB 原生 4096×2304「UI looks like
+2048×1152 @60Hz」；`Player.log` 里窗口态与全屏态都是 `display=4096x2304`，全屏只是
+`Metal RecreateSurface surface size 4096x2304`（1440×900 → 4096×2304，8.1× 像素）；
+`log show` 在 16:50–16:58 的 WindowServer / SkyLight / loginwindow 里 **0 条**
+`reconfig|modeset|DisplayMode` —— 本次主屏全屏**没有切显示模式**，第 1 条历史假设
+（模式切换）在这一格不成立。
+
+### 修了什么
+1. 新增 `apps/unity-player/Assets/GMGN/GPUIProjectionPayload.cs`：一次轮询只许
+   `Parse` 一次、`Encode` 一次（UTF-8 直写、无 BOM、无 UTF-16 中转），`Augment`
+   就地加主线程附件、不再整树 `DeepClone`。
+2. `NativePlayerBackend.PublishGPUIProjection`：把**解析好的树**交给探针
+   （事件 `Action<string> GPUIHostSnapshot` → `Action<JObject> GPUIHostProjection`），
+   去掉整树 `DeepClone()` 与 `ToString()`；Tick 里 3 处 `JObject.Parse(json)["…"]`
+   改成读同一棵树。
+3. `GPUIChat2Probe.ApplySnapshot(JObject)`：不再解析自己刚序列化的字符串。
+   载荷逐字节不变（有判据）。
+4. 判据 `tools/test-gpui-projection-cost.py`（挂在 `make _test-harnesses`）：结构 6 条
+   必须绿、且**在 HEAD 的源码上必须条条红**；代价用真代码编译实测，**必须与改前
+   逐字节相同（无 BOM）且中位耗时 ≤ 改前的 60 %**，负对照是改前实现本身。
+
+真机 158 472 B 信封实测（同一进程内跑改前实现 vs 现在的实现）：
+
+    payload 161 521 B，逐字节相同、无 BOM
+    中位一次轮询 29.2 ms → 6.5 ms（22.4 %）；p95 62.1 → 18.9 ms
+    每次轮询分配 9.86 MB → 3.87 MB
+
+### 还没覆盖到的（需要一次 Unity Player 重建，本轮按要求没打包）
+- 端到端 fps/`framesOver50ms` 的前后对比要重出 player：本轮「不许打包装机、不占版本号」，
+  所以只交代码 + 判据 + 同会话量测。
+- 剩余主线程成本（改后仍占大头）：`gmgn_unity_host_snapshot` 12.8 %（宿主把
+  overlay 明确丢弃的 world/grid blob 也塞进信封）、overlay 侧 `gmgn_gpui_chat_snapshot`
+  12.2 %（每次轮询都重算 `visual_projection` 两遍、`normalize_chat(旧)` 两遍，并
+  无条件刷新设置窗——和已修的 `availableMotions` 是同一类「每帧重建投影」）。
+  这两处都在其它线正在改的文件里（`apps/macos/UnityHost/**`、`tools/fixtures/gpui-unity-overlay-probe/**`），
+  本轮按红线没有同时改。
+- 全屏每像素 pass（`GpuLyricsView` 的预算）：本次会话 `gpuMs` 全屏只 15.4 ms 而
+  `cpuMs` 40–125 ms ⇒ **不是**这一格的瓶颈；等 CPU 修完、重出 player 后再看
+  `gpuMs`/`stageSubmitMs` 才有意义（历史基线 73–75 fps 说明这一格曾经够用）。

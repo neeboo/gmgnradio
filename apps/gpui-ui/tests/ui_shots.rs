@@ -11,8 +11,9 @@
 //! pixels), so a pane that renders nothing, or renders off its own bounds, fails
 //! here instead of passing silently.
 //!
-//! Set `GMGN_SHOTS_DIR=/some/dir` to also write `chat-inbox.png` there.
-//! See the module docs above.
+//! Set `GMGN_SHOTS_DIR=/some/dir` to also write `chat-inbox.png`,
+//! `selected-states.png` (the same frame, named for the 选中态 evidence) and
+//! `settings.png` there. See the module docs above.
 #![recursion_limit = "256"]
 
 use std::sync::Arc;
@@ -20,6 +21,8 @@ use std::sync::Arc;
 
 use gmgn_gpui_ui::chat::ResidentChatPane;
 use gmgn_gpui_ui::inbox::InboxPane;
+use gmgn_gpui_ui::primitives as ui;
+use gmgn_gpui_ui::settings::AgentSettingsPane;
 use gmgn_gpui_ui::state::TranscriptLine;
 use gmgn_gpui_ui::shell::{self, TransportControl};
 use gmgn_gpui_ui::ui_tokens::{inbox as inbox_metrics, scene};
@@ -31,6 +34,9 @@ use serde_json::json;
 struct Shots {
     chat: Entity<ResidentChatPane>,
     inbox: Entity<InboxPane>,
+    /// The 音量 track's state, so the shot can paint a real kit `Slider` through
+    /// [`gmgn_gpui_ui::primitives::scene_slider`] and show its filled part.
+    volume: Entity<gpui_kit::component::slider::SliderState>,
 }
 
 fn transcript() -> Vec<TranscriptLine> {
@@ -122,6 +128,50 @@ impl Render for Shots {
                     ))
                     .child(shell::transport_bar(transport_controls(), |_, _, _| {}, |_, _, _, _| {})),
             )
+            // 选中态 — the shipping selected surfaces, side by side: the
+            // segmented picker's current face, the settings 使用中 marker, an
+            // on/off switch and the 音量 track. Every one of them is built by
+            // `primitives`, which paints them from `scene::SELECTED`.
+            .child(
+                div()
+                    .id("shots-selected")
+                    .w(px(320.))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.))
+                    .child(ui::selected_tabs(
+                        "shots-selected-tabs",
+                        vec![
+                            ui::TabFace::text("经典"),
+                            ui::TabFace::text("渐变"),
+                            ui::TabFace::text("海报"),
+                        ],
+                        1,
+                        |_, _, _| {},
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(ui::selected_marker(
+                                "shots-selected-marker",
+                                gpui_kit::assets::IconName::Check,
+                                "使用中",
+                            ))
+                            .child(ui::selected_switch("shots-selected-on").checked(true))
+                            .child(ui::selected_switch("shots-selected-off").checked(false)),
+                    )
+                    .child(
+                        div()
+                            .w(px(220.))
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .child(ui::scene_slider(&self.volume)),
+                    ),
+            )
     }
 }
 
@@ -159,6 +209,22 @@ fn ink(image: &image::RgbaImage, background: [u8; 4]) -> (u64, usize) {
     (coloured, seen.len())
 }
 
+/// Pixels carrying the layer's selected blue, `scene::SELECTED = #3B9EFF`.
+///
+/// The box is tight enough to exclude the kit theme's blue (`#1d4ed8`, only
+/// 0x1d red and 0x4e green) and the old cyan (`#7af2ff`, 0x7a red), so this is a
+/// real "the selected state painted the token" check rather than "something blue
+/// is on screen".
+fn selected_blue_pixels(image: &image::RgbaImage) -> u64 {
+    image
+        .pixels()
+        .filter(|pixel| {
+            let (r, g, b) = (i32::from(pixel[0]), i32::from(pixel[1]), i32::from(pixel[2]));
+            (r - 0x3b).abs() <= 8 && (g - 0x9e).abs() <= 8 && (b - 0xff).abs() <= 8
+        })
+        .count() as u64
+}
+
 /// GPUI's macOS platform must be created on the main thread, so this is a
 /// `harness = false` test binary (like gpui-kit's own rendering suite) rather
 /// than a `#[test]`.
@@ -174,7 +240,7 @@ fn real_panes_paint_visible_content_and_can_be_captured() {
         gpui_kit::platform::current_headless_renderer,
     );
     cx.update(gpui_kit::init);
-    let (width, height) = (2040., 560.);
+    let (width, height) = (2560., 560.);
     let (handle, _) = cx
         .update(|cx| {
             gpui_kit::open_window(
@@ -198,9 +264,14 @@ fn real_panes_paint_visible_content_and_can_be_captured() {
                     let inbox = cx.new(|cx| {
                         let mut pane = InboxPane::new(cx);
                         pane.update_snapshot(inbox_snapshot(), cx);
+                        // The **selected** row is part of the picture: a harness
+                        // may not synthesise input, so the pane exposes the
+                        // selection directly.
+                        pane.select_index(0, cx);
                         pane
                     });
-                    cx.new(|_| Shots { chat, inbox })
+                    let volume = cx.new(|_| gpui_kit::component::slider::SliderState::new());
+                    cx.new(|_| Shots { chat, inbox, volume })
                 },
             )
         })
@@ -224,6 +295,15 @@ fn real_panes_paint_visible_content_and_can_be_captured() {
         colours > 24,
         "a painted chat + inbox frame has text, icons and chrome, not {colours} colours"
     );
+    // 选中态: the asserted transport controls (播放 / 聊天), the selected inbox row
+    // and the 选中态 column must all be painted with `scene::SELECTED`.
+    let selected = selected_blue_pixels(&shot);
+    assert!(
+        selected > 400,
+        "the selected state must paint `scene::SELECTED` (#3B9EFF): the frame carries only \
+         {selected} such pixel(s), so a selected surface is drawing a theme colour again"
+    );
+    eprintln!("SHOTS selected-blue pixels in the bar/inbox/选中态 frame: {selected}");
 
     if let Some(dir) = std::env::var_os("GMGN_SHOTS_DIR") {
         let dir = std::path::PathBuf::from(dir);
@@ -231,5 +311,116 @@ fn real_panes_paint_visible_content_and_can_be_captured() {
         let path = dir.join("chat-inbox.png");
         shot.save(&path).expect("write png");
         eprintln!("SHOTS wrote {}", path.display());
+        let path = dir.join("selected-states.png");
+        shot.save(&path).expect("write png");
+        eprintln!("SHOTS wrote {}", path.display());
     }
+
+    // 设置页 — the real `AgentSettingsPane` at its original 580×500, on the
+    // 角色 page: the five-tab header's icons and the row icons are the ones the
+    // icon-colour pass re-tones.
+    let (settings_handle, _) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(
+                            px(gmgn_gpui_ui::ui_tokens::settings::WINDOW_WIDTH),
+                            px(gmgn_gpui_ui::ui_tokens::settings::WINDOW_HEIGHT),
+                        ),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let pane = cx.new(|cx| AgentSettingsPane::new(window, cx));
+                    pane.update(cx, |pane, cx| {
+                        pane.update_snapshot(settings_snapshot(), window, cx);
+                        pane.select_page("presence", cx);
+                    });
+                    pane
+                },
+            )
+        })
+        .expect("headless settings window");
+    cx.update_window(settings_handle, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let settings_shot = cx
+        .capture_screenshot(settings_handle)
+        .expect("GPUI's headless Metal renderer must be available on macOS");
+    let (settings_ink, settings_colours) = ink(&settings_shot, [0x00, 0x00, 0x00, 0x00]);
+    assert!(
+        settings_colours > 24,
+        "a painted settings page has text, icons and chrome, not {settings_colours} colours"
+    );
+    assert!(
+        settings_ink > 0,
+        "the settings page must paint visible content"
+    );
+    // The page's own selected states: the 使用中 marker on the active 角色 row,
+    // the five-segment header's current tab and the 动作 category picker.
+    let settings_selected = selected_blue_pixels(&settings_shot);
+    assert!(
+        settings_selected > 100,
+        "the settings page must paint its current/使用中 state with `scene::SELECTED`; it \
+         carries only {settings_selected} such pixel(s)"
+    );
+    eprintln!("SHOTS selected-blue pixels on the settings page: {settings_selected}");
+    if let Some(dir) = std::env::var_os("GMGN_SHOTS_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("shots dir");
+        let path = dir.join("settings.png");
+        settings_shot.save(&path).expect("write png");
+        eprintln!("SHOTS wrote {}", path.display());
+    }
+}
+
+/// A host-shaped settings projection: one active 角色, one connected 音乐
+/// account and the shortcut page, so every icon role on the page has a face.
+fn settings_snapshot() -> serde_json::Value {
+    json!({
+        "locale": "zh-CN",
+        "presence": {
+            "packages": [
+                {"id": "orb", "name": "呼吸球", "engine": "orb", "isBuiltIn": true,
+                 "isActive": true, "rendererAvailable": true},
+                {"id": "fox", "name": "狐娘", "engine": "pmx", "isBuiltIn": false,
+                 "isActive": false, "rendererAvailable": true}
+            ],
+            "motions": [], "publishedMotions": [], "working": false,
+            "catalogURL": "https://example.test/catalog.json"
+        },
+        "music": {
+            "providers": [
+                {"id": "netease", "name": "网易云音乐", "status": "connected", "connected": true},
+                {"id": "qq-music", "name": "QQ 音乐", "status": "disconnected", "connected": false}
+            ],
+            "working": false
+        },
+        "space": {
+            "options": [{"id": "living-pod", "name": "飞船生活舱（Marble）", "detail": "Marble 生成舱体"}],
+            "defaultSpace": "living-pod", "credentialConfigured": true,
+            "generationEndpoint": "https://example.test/gen", "propSaveEndpoint": "https://example.test/prop",
+            "marbleKeyConfigured": true
+        },
+        "shortcuts": {
+            "assignments": [
+                {"id": "play", "title": "播放 / 暂停", "local": "Space", "global": ""},
+                {"id": "chat", "title": "打开聊天", "local": "KeyC", "global": ""}
+            ],
+            "globalEnabled": true, "mediaKeysEnabled": false
+        },
+        "agent": {"codexState": "signedOut", "backends": [], "budgetOptions": [0, 6]},
+        "tts": {"providers": [], "voices": [], "models": [], "loading": false, "isSpeaking": false},
+        "asr": {"providers": [], "microphoneDevices": [], "models": []},
+        "spaceLibrary": {"worlds": [], "marblePresets": []},
+        "video": {"selectedID": null, "activeID": null, "playing": false, "mode": "once"},
+        "generation": {"configured": true, "checking": false},
+        "isSaving": false
+    })
 }

@@ -23,7 +23,6 @@ use gmgn_gpui_ui::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    Disableable,
     input::{Input, InputState},
     scroll::ScrollableElement,
 };
@@ -626,8 +625,7 @@ impl MediaPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let icon = command_icon(command["op"].as_str().unwrap_or(""));
-        let control = ui::icon_button(SharedString::from(id), icon, label.clone(), false)
-            .disabled(disabled)
+        let control = ui::icon_button(SharedString::from(id), icon, label.clone(), false, !disabled)
             .on_click(cx.listener(move |this, _, _, cx| this.submit(command.clone(), cx)));
         media_row(label, false, control).into_any_element()
     }
@@ -677,6 +675,7 @@ impl MediaPane {
                     IconName::PanelRight,
                     "选择此屏幕",
                     selected,
+                    true,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected_screen = Some(id.clone());
@@ -691,7 +690,7 @@ impl MediaPane {
         body=body.child(div().flex().flex_col().gap_2().child("视频链接").child(Input::new(&self.url).disabled(disabled)))
             .child("支持视频、直播与 YouTube 播放列表。播放进度以屏幕回执为准。")
             .child(div().flex().gap_2()
-                .child(ui::icon_button("screen-play", IconName::Play, "播放链接", false).disabled(disabled)
+                .child(ui::icon_button("screen-play", IconName::Play, "播放链接", false, !disabled)
                     .on_click(cx.listener(|this,_,_,cx|{
                         let url=this.url.read(cx).value().trim().to_owned();
                         if url.trim().is_empty() {this.notice="请填写视频链接".into();cx.notify();return;}
@@ -827,8 +826,13 @@ impl Render for MediaPane {
                     .items_center()
                     .child(ui::card_title(section_title(self.section)))
                     .child(
-                        ui::icon_button("media-refresh", IconName::RefreshCw, "刷新", false)
-                            .disabled(state["pending"] == true || self.section == 1)
+                        ui::icon_button(
+                            "media-refresh",
+                            IconName::RefreshCw,
+                            "刷新",
+                            false,
+                            !(state["pending"] == true || self.section == 1),
+                        )
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )

@@ -32,7 +32,11 @@ namespace GMGN.UnityPlayer
         readonly Dictionary<ulong, string> requestIds = new();
         readonly Dictionary<ulong, ulong> gpuiRequests = new();
         readonly List<JObject> gpuiFailures = new();
-        public event Action<string> GPUIHostSnapshot;
+        // The host projection leaves here as the parsed tree, not as a string. Serializing it here and
+        // re-parsing it in `GPUIChat2Probe` was two full tree walks of the whole envelope at 20 Hz
+        // (see docs/plans/2026-10-09-fullscreen-stutter-notes.md); the probe now adds the
+        // main-thread adjuncts to this tree and serializes exactly once, at the native boundary.
+        public event Action<JObject> GPUIHostProjection;
         public void BeginGPUIEpoch() { gpuiRequests.Clear(); gpuiFailures.Clear(); }
         public bool SendGPUICommand(JObject value)
         {
@@ -62,10 +66,13 @@ namespace GMGN.UnityPlayer
             }
             return ExecuteWorld(command);
         }
-        void PublishGPUIProjection(JObject original)
+        // `projection` is this tick's freshly parsed envelope and the caller only reads subtrees from
+        // it after this returns, so the request-id rewrite happens in place. The previous shape deep
+        // cloned the entire envelope and then re-parsed the string it serialized — three whole-tree
+        // passes per poll whose only product was the same bytes.
+        void PublishGPUIProjection(JObject projection)
         {
-            if (GPUIHostSnapshot == null) return;
-            var projection = (JObject)original.DeepClone();
+            if (GPUIHostProjection == null) return;
             if (projection["chat"] is JObject chat) {
                 var mapped = new JArray();
                 if (chat["events"] is JArray events) foreach (var token in events) {
@@ -79,7 +86,7 @@ namespace GMGN.UnityPlayer
                 foreach (var failure in gpuiFailures) mapped.Add(failure);
                 gpuiFailures.Clear(); chat["events"] = mapped;
             }
-            GPUIHostSnapshot.Invoke(projection.ToString(Newtonsoft.Json.Formatting.None));
+            GPUIHostProjection.Invoke(projection);
         }
         IntPtr host;
         ulong sequence;
@@ -258,7 +265,7 @@ namespace GMGN.UnityPlayer
             Envelope value; string json;
             try { json = Marshal.PtrToStringUTF8(pointer); value = JsonUtility.FromJson<Envelope>(json); }
             finally { gmgn_unity_host_string_free(pointer); }
-            var projection = JObject.Parse(json);
+            var projection = GPUIProjectionPayload.Parse(json);
             PublishGPUIProjection(projection);
             if (projection["worldPhysicsProbes"] is JObject physicsRequest && physicsRequest["requestID"] != null)
                 WorldPhysicsProbeRequested?.Invoke(physicsRequest);
@@ -358,17 +365,15 @@ namespace GMGN.UnityPlayer
             }
             if (value.inbox != null && inboxGeneration != value.inbox.generation) {
                 inboxGeneration = value.inbox.generation;
-                var notification = JObject.Parse(json)["inbox"] as JObject;
-                if (notification != null) InboxUpdated?.Invoke(notification);
+                if (projection["inbox"] is JObject notification) InboxUpdated?.Invoke(notification);
             }
             if (value.musicLibrary != null && musicLibraryGeneration != value.musicLibrary.generation) {
                 musicLibraryGeneration = value.musicLibrary.generation;
-                var library = JObject.Parse(json)["musicLibrary"] as JObject;
-                if (library != null) MusicLibraryUpdated?.Invoke(library);
+                if (projection["musicLibrary"] is JObject library) MusicLibraryUpdated?.Invoke(library);
             }
             if (value.world != null && worldGeneration != value.world.generation) {
                 worldGeneration = value.world.generation;
-                var update = JObject.Parse(json)["world"] as JObject;
+                var update = projection["world"] as JObject;
                 if (update != null && update["status"] != null) {
                     if ((string)update["operation"] == "world.placement.evaluate" || (string)update["operation"] == "world.prop.preview") {
                         PlacementEvaluated?.Invoke(update);

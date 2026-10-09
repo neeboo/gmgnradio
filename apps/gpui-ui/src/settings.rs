@@ -49,16 +49,14 @@ use crate::ui_tokens as tokens;
 use crate::ui_tokens::scene as s;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::InputEvent;
-use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
     collapsible::Collapsible,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     button::*,
     input::*,
     menu::*,
-    slider::{Slider, SliderEvent, SliderState},
+    slider::{SliderEvent, SliderState},
     spinner::Spinner,
-    switch::Switch,
     *,
 };
 use gpui_kit::prelude::{FluentBuilder, InteractiveElement as _};
@@ -743,13 +741,21 @@ fn field_row(label: impl Into<SharedString>, control: impl IntoElement) -> Div {
         .child(control)
 }
 
-fn check_icon(checked: bool) -> Icon {
+/// `active` picks the palette entry: an asserted/selected check takes
+/// [`s::ICON_ACTIVE`], a merely informational one takes [`s::ICON_MUTED`]. The
+/// colour is named here so a row can never inherit one from the container.
+fn check_icon(checked: bool, active: bool) -> Icon {
     Icon::new(if checked {
         IconName::CircleCheck
     } else {
         IconName::Circle
     })
     .size(px(metrics::NOTICE_ICON))
+    .text_color(if active {
+        rgba(s::ICON_ACTIVE)
+    } else {
+        rgba(s::ICON_MUTED)
+    })
 }
 
 /// The face of one [`AgentSettingsPane::command_button`].
@@ -876,7 +882,7 @@ fn presence_preview(package: &Value) -> AnyElement {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgba(s::ACCENT).opacity(metrics::PREVIEW_GLYPH_ALPHA))
+            .text_color(ui::icon_color(true, true).opacity(metrics::PREVIEW_GLYPH_ALPHA))
             .child(
                 Icon::new(if package["engine"].as_str() == Some("pmx") {
                     IconName::PersonStanding
@@ -1029,8 +1035,8 @@ impl AgentSettingsPane {
                                     if working { "正在下载…" } else { "下载并安装" },
                                 ),
                                 false,
+                                !disabled,
                             )
-                            .disabled(disabled)
                                 .on_click(move |_, _, cx| {
                                     _ = submit.update(cx, |this, cx| {
                                         this.commands.push(json!({"op":"presence.import.link","url":this.extra_inputs[4].read(cx).value().to_string()}));
@@ -1078,9 +1084,11 @@ impl AgentSettingsPane {
         }
         let label = settings_copy(locale, label);
         Button::new(id)
+            .ghost()
             .role(role)
             .accessibility_label(name)
             .icon(IconName::Ellipsis)
+            .text_color(ui::icon_color(false, true))
             .small()
             .w(px(metrics::NOTICE_ICON + 8.))
             .h(px(metrics::NOTICE_ICON + 8.))
@@ -1785,7 +1793,7 @@ impl AgentSettingsPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let locale = UiLocale::from_settings(&self.snapshot);
-        Switch::new(id)
+        ui::selected_switch(id)
             .label(settings_copy(locale, label))
             .accessibility_label(settings_copy(locale, label))
             .checked(self.draft["agent"][field].as_bool().unwrap_or(false))
@@ -1830,7 +1838,7 @@ impl AgentSettingsPane {
         // Clearing the stored Marble key is the one irreversible action behind
         // this helper: it also arms the pending-mutation guard the host answers.
         let clears_key = operation == "space.key.clear";
-        let mut button = ui::icon_button(id, command_icon(&operation), label, false);
+        let mut button = ui::icon_button(id, command_icon(&operation), label, false, true);
         if clears_key {
             button = button.text_color(rgba(tokens::stage::DANGER_TEXT));
         }
@@ -1920,8 +1928,10 @@ impl AgentSettingsPane {
                     .gap(px(tokens::SPACING_8))
                     .child(
                         Button::new("character-position-apply")
+                            .ghost()
                             .small()
                             .icon(IconName::Map)
+                            .text_color(ui::icon_color(false, !(unavailable || working)))
                             .tooltip(settings_copy(locale, "移动到坐标"))
                             .accessibility_label(settings_copy(locale, "移动到坐标"))
                             .disabled(unavailable || working)
@@ -1961,8 +1971,10 @@ impl AgentSettingsPane {
                     )
                     .child(
                         Button::new("character-position-reset")
+                            .ghost()
                             .small()
                             .icon(IconName::Undo2)
+                            .text_color(ui::icon_color(false, !(unavailable || working)))
                             .tooltip(settings_copy(locale, "重置"))
                             .accessibility_label(settings_copy(locale, "重置"))
                             .disabled(unavailable || working)
@@ -2010,12 +2022,17 @@ impl AgentSettingsPane {
                 ))
                 .child(
                     Button::new("unity-video-play")
+                        .ghost()
                         .small()
                         .icon(if video["playing"].as_bool() == Some(true) {
                             IconName::Pause
                         } else {
                             IconName::Play
                         })
+                        .text_color(ui::icon_color(
+                            video["playing"].as_bool() == Some(true),
+                            !(video["selectedID"].is_null() && video["activeID"].is_null()),
+                        ))
                         .tooltip(settings_copy(
                             locale,
                             if video["playing"].as_bool() == Some(true) {
@@ -2084,27 +2101,33 @@ impl AgentSettingsPane {
                         .min_w(px(0.))
                         .child(ui::body(asset["name"].as_str().unwrap_or(id).to_owned())),
                 )
-                .child(
+                .child(if selected {
+                    // The current asset is a **selected state**, so it is the
+                    // layer's own marker: bright blue on the selected wash, not
+                    // a kit disabled `Button` whose fill comes from the theme.
+                    ui::selected_marker(
+                        format!("unity-video-select-{id}"),
+                        IconName::Check,
+                        settings_copy(locale, "使用中"),
+                    )
+                    .into_any_element()
+                } else {
                     Button::new(format!("unity-video-select-{id}"))
+                        .ghost()
                         .small()
-                        .icon(if selected { IconName::Check } else { IconName::Play })
-                        .tooltip(settings_copy(
-                            locale,
-                            if selected { "使用中" } else { "选择并播放" },
-                        ))
-                        .accessibility_label(settings_copy(
-                            locale,
-                            if selected { "使用中" } else { "选择并播放" },
-                        ))
-                        .disabled(selected)
+                        .icon(IconName::Play)
+                        .text_color(ui::icon_color(false, true))
+                        .tooltip(settings_copy(locale, "选择并播放"))
+                        .accessibility_label(settings_copy(locale, "选择并播放"))
                         .on_click(cx.listener({
                             let id = id.to_owned();
                             move |this, _, _, cx| {
                                 this.commands.push(json!({"op":"video.select","id":id}));
                                 cx.notify();
                             }
-                        })),
-                )
+                        }))
+                        .into_any_element()
+                })
                 .child(self.remove_menu(
                     format!("unity-video-remove-{id}"),
                     "移出素材库",
@@ -2166,12 +2189,17 @@ impl AgentSettingsPane {
         for (id, label) in [("once", "单次"), ("loop", "循环"), ("randomSequence", "随机拼接")] {
             modes = modes.child(
                 Button::new(format!("unity-video-mode-{id}"))
+                    .ghost()
                     .small()
                     .icon(match id {
                         "once" => IconName::Square,
                         "loop" => IconName::RotateCw,
                         _ => IconName::RefreshCw,
                     })
+                    .text_color(ui::icon_color(
+                        video["mode"].as_str() == Some(id),
+                        video["mode"].as_str() != Some(id),
+                    ))
                     .tooltip(settings_copy(locale, label))
                     .accessibility_label(settings_copy(locale, label))
                     .disabled(video["mode"].as_str() == Some(id))
@@ -2194,7 +2222,7 @@ impl AgentSettingsPane {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .child(Slider::new(&self.video_brightness)),
+                            .child(ui::scene_slider(&self.video_brightness)),
                     ),
             );
         v_flex()
@@ -2233,8 +2261,8 @@ impl AgentSettingsPane {
                                 .flex_1()
                                 .items_center()
                                 .gap(px(tokens::SPACING_4))
-                                .text_color(rgba(if configured { s::ACCENT } else { s::TEXT_MUTED }))
-                                .child(check_icon(configured))
+                                .text_color(if configured { ui::icon_color(true, true) } else { rgba(s::ICON_MUTED) })
+                                .child(check_icon(configured, configured))
                                 .child(ui::muted(settings_copy(
                                     locale,
                                     if configured { "已配置" } else { "未配置" },
@@ -2242,8 +2270,17 @@ impl AgentSettingsPane {
                         )
                         .child(
                             Button::new("generation-check")
+                                .ghost()
                                 .small()
                                 .icon(IconName::Network)
+                                .text_color(ui::icon_color(
+                                    false,
+                                    generation_check_enabled(
+                                        configured,
+                                        checking,
+                                        replacement_empty,
+                                    ),
+                                ))
                                 .tooltip(settings_copy(
                                     locale,
                                     if checking { "检测中…" } else { "检测连接" },
@@ -2269,12 +2306,12 @@ impl AgentSettingsPane {
                                 IconName::Check,
                                 settings_copy(locale, "保存"),
                                 false,
-                            )
-                            .accessibility_id("settings.space.generation.save")
-                                .disabled(!generation_save_enabled(
+                                generation_save_enabled(
                                     self.extra_inputs[5].read(cx).value().as_str(),
                                     checking,
-                                ))
+                                ),
+                            )
+                            .accessibility_id("settings.space.generation.save")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.commands.push(json!({"op":"generation.save","endpoint":this.extra_inputs[5].read(cx).value().to_string(),"token":this.extra_inputs[6].read(cx).value().to_string()}));
                                     cx.notify();
@@ -2321,7 +2358,7 @@ impl AgentSettingsPane {
                     } else {
                         s::TEXT_MUTED
                     }))
-                    .child(check_icon(configured_prop))
+                    .child(check_icon(configured_prop, configured_prop))
                     .child(ui::muted(settings_copy(
                         locale,
                         if configured_prop { "已配置" } else { "未配置" },
@@ -2330,7 +2367,16 @@ impl AgentSettingsPane {
             .when(prop_check_supported, |row| {
                 row.child(
                     Button::new("prop-check")
+                        .ghost()
                         .icon(IconName::Network)
+                        .text_color(ui::icon_color(
+                            false,
+                            prop_check_enabled(
+                                configured_prop,
+                                prop_checking,
+                                self.extra_inputs[6].read(cx).value().is_empty(),
+                            ),
+                        ))
                         .tooltip(settings_copy(
                             locale,
                             if prop_checking { "检测中…" } else { "检测连接" },
@@ -2358,11 +2404,11 @@ impl AgentSettingsPane {
                         IconName::Check,
                         settings_copy(locale, "保存"),
                         false,
+                        prop_save_enabled(
+                            self.extra_inputs[5].read(cx).value().as_str(),
+                        ),
                     )
                     .accessibility_id("settings.space.prop.save")
-                        .disabled(!prop_save_enabled(
-                            self.extra_inputs[5].read(cx).value().as_str(),
-                        ))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let endpoint = this.extra_inputs[5].read(cx).value().to_string();
                             let key = this.extra_inputs[6].read(cx).value().to_string();
@@ -2446,7 +2492,7 @@ impl AgentSettingsPane {
                             .items_center()
                             .gap(px(tokens::SPACING_4))
                             .flex_shrink_0()
-                            .text_color(rgba(s::ACCENT))
+                            .text_color(ui::icon_color(true, true))
                             .child(
                                 Icon::new(IconName::CircleCheck).size(px(metrics::NOTICE_ICON)),
                             )
@@ -2472,7 +2518,9 @@ impl AgentSettingsPane {
                 PresenceAction::Select => {
                     row = row.child(
                         Button::new(format!("avatar-{id}"))
+                            .ghost()
                             .icon(IconName::Check)
+                            .text_color(ui::icon_color(false, true))
                             .tooltip(settings_copy(locale, "选择"))
                             .small()
                             .accessibility_id(format!("settings.presence.select.{id}"))
@@ -2519,33 +2567,21 @@ impl AgentSettingsPane {
             .iter()
             .position(|(id, _)| id.as_str() == Some(&self.motion_category))
             .unwrap_or(0);
-        motions = motions.child(
-            TabBar::new("settings.presence.motion-category")
-                .segmented()
-                .small()
-                .w_full()
-                .selected_index(selected)
-                .children(category_values.iter().map(|(_, name)| {
-                    Tab::new()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .aria_label(name.clone())
-                        .child(
-                            div()
-                                .text_size(px(tokens::CAPTION))
-                                .min_w(px(0.))
-                                .whitespace_nowrap()
-                                .child(name.clone()),
-                        )
-                }))
-                .on_click(move |index, _, cx| {
-                    _ = weak.update(cx, |this, cx| {
-                        this.motion_category =
-                            category_values[*index].0.as_str().unwrap_or("").to_owned();
-                        cx.notify();
-                    });
-                }),
-        );
+        motions = motions.child(ui::selected_tabs(
+            "settings.presence.motion-category",
+            category_values
+                .iter()
+                .map(|(_, name)| ui::TabFace::text(name.clone()))
+                .collect(),
+            selected,
+            move |index, _, cx| {
+                _ = weak.update(cx, |this, cx| {
+                    this.motion_category =
+                        category_values[index].0.as_str().unwrap_or("").to_owned();
+                    cx.notify();
+                });
+            },
+        ));
         if let Some(notice) = self.snapshot["presence"]["motionNotice"].as_str() {
             motions = motions.child(ui::notice(settings_notice(locale, notice)));
         }
@@ -2595,7 +2631,7 @@ impl AgentSettingsPane {
                         .rounded(px(metrics::MOTION_ICON_RADIUS))
                         .bg(rgba(if compatible { s::ACCENT } else { s::ICON })
                             .opacity(metrics::MOTION_ICON_ALPHA))
-                        .text_color(rgba(if compatible { s::ACCENT } else { s::TEXT_MUTED }))
+                        .text_color(if compatible { ui::icon_color(true, true) } else { rgba(s::ICON_MUTED) })
                         .child(Icon::new(IconName::Activity).size(px(metrics::MOTION_ICON_SIZE))),
                 )
                 .child(
@@ -2625,7 +2661,7 @@ impl AgentSettingsPane {
                             .items_center()
                             .gap(px(tokens::SPACING_4))
                             .flex_shrink_0()
-                            .text_color(rgba(s::ACCENT))
+                            .text_color(ui::icon_color(true, true))
                             .child(
                                 Icon::new(IconName::CircleCheck).size(px(metrics::NOTICE_ICON)),
                             )
@@ -2638,7 +2674,9 @@ impl AgentSettingsPane {
                     let selectable = motion_select_enabled(motion, working);
                     row = row.child(
                         Button::new(format!("motion-{id}"))
+                            .ghost()
                             .icon(IconName::Check)
+                            .text_color(ui::icon_color(false, selectable))
                             .tooltip(settings_copy(locale, "选择"))
                             .small()
                             .disabled(!selectable)
@@ -2692,7 +2730,13 @@ impl AgentSettingsPane {
                 )
                 .child(
                     Button::new("catalog-refresh")
+                        .ghost()
                         .icon(IconName::RefreshCw)
+                        .text_color(ui::icon_color(
+                            false,
+                            !(self.snapshot["presence"]["working"].as_bool() == Some(true)
+                                || self.extra_inputs[3].read(cx).value().trim().is_empty()),
+                        ))
                         .tooltip(settings_copy(locale, "获取动作列表"))
                         .accessibility_label(settings_copy(locale, "获取动作列表"))
                         .small()
@@ -2725,7 +2769,8 @@ impl AgentSettingsPane {
                             } else {
                                 IconName::Activity
                             })
-                            .size(px(metrics::PUBLISHED_ICON_SIZE)),
+                            .size(px(metrics::PUBLISHED_ICON_SIZE))
+                            .text_color(ui::icon_color(false, true)),
                         ),
                 )
                 .child(
@@ -2748,14 +2793,19 @@ impl AgentSettingsPane {
                         .items_center()
                         .gap(px(tokens::SPACING_4))
                         .flex_shrink_0()
-                        .text_color(rgba(s::ACCENT))
+                        .text_color(ui::icon_color(true, true))
                         .child(Icon::new(IconName::CircleCheck).size(px(metrics::NOTICE_ICON)))
                         .child(ui::muted(settings_copy(locale, "已安装"))),
                 );
             } else {
                 row = row.child(
                     Button::new(format!("install-motion-{identity}"))
+                        .ghost()
                         .icon(IconName::Plus)
+                        .text_color(ui::icon_color(
+                            false,
+                            self.snapshot["presence"]["working"].as_bool() != Some(true),
+                        ))
                         .tooltip(
                             settings_copy(
                                 locale,
@@ -2812,7 +2862,7 @@ impl AgentSettingsPane {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .child(Slider::new(&self.orb_intensity)),
+                                    .child(ui::scene_slider(&self.orb_intensity)),
                             )
                             .child(
                                 div()
@@ -2863,7 +2913,7 @@ impl AgentSettingsPane {
                         .justify_center()
                         .rounded(px(metrics::PROVIDER_ICON_RADIUS))
                         .bg(rgba(s::ACCENT).opacity(metrics::PROVIDER_ICON_ALPHA))
-                        .text_color(rgba(s::ACCENT))
+                        .text_color(ui::icon_color(true, true))
                         .child(
                             Icon::new(match id.as_str() {
                                 Some("qq-music") => IconName::ListMusic,
@@ -2901,6 +2951,7 @@ impl AgentSettingsPane {
                             } else {
                                 IconName::RefreshCw
                             })
+                            .text_color(ui::icon_color(syncing, !(working || syncing)))
                             .tooltip(if syncing {
                                 settings_copy(locale, "正在同步…")
                             } else {
@@ -2940,6 +2991,7 @@ impl AgentSettingsPane {
                         .small()
                         .when(connected, |button| button.ghost())
                         .icon(IconName::ExternalLink)
+                        .text_color(ui::icon_color(connected, !working))
                         .tooltip(settings_copy(locale, music_connect_label(connected)))
                         .accessibility_label(settings_copy(locale, music_connect_label(connected)))
                         .accessibility_id(format!("settings.music.connect.{id}"))
@@ -3006,7 +3058,7 @@ impl AgentSettingsPane {
                         div()
                             .w(px(metrics::MARBLE_ICON_COLUMN))
                             .flex_shrink_0()
-                            .text_color(rgba(s::ACCENT))
+                            .text_color(ui::icon_color(true, true))
                             .child(Icon::new(IconName::Box).size(px(metrics::MARBLE_ICON_SIZE))),
                     )
                     .child(
@@ -3025,8 +3077,8 @@ impl AgentSettingsPane {
                             .items_center()
                             .gap(px(tokens::SPACING_4))
                             .flex_shrink_0()
-                            .text_color(rgba(if configured { s::ACCENT } else { s::TEXT_MUTED }))
-                            .child(check_icon(configured))
+                            .text_color(if configured { ui::icon_color(true, true) } else { rgba(s::ICON_MUTED) })
+                            .child(check_icon(configured, configured))
                             .child(ui::muted(settings_copy(
                                 locale,
                                 if configured { "已配置" } else { "未配置" },
@@ -3064,11 +3116,11 @@ impl AgentSettingsPane {
                                     IconName::Check,
                                     settings_copy(locale, "保存 Key"),
                                     false,
+                                    marble_save_enabled(
+                                        self.extra_inputs[2].read(cx).value().as_str(),
+                                    ),
                                 )
                                 .accessibility_id("settings.space.marble.save")
-                                    .disabled(!marble_save_enabled(
-                                        self.extra_inputs[2].read(cx).value().as_str(),
-                                    ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let key = this.extra_inputs[2].read(cx).value().to_string();
                                         this.pending_marble = Some((
@@ -3126,26 +3178,33 @@ impl AgentSettingsPane {
                             .min_w(px(0.))
                             .child(ui::body(world["name"].as_str().unwrap_or(&id).to_owned())),
                     )
-                    .child(
+                    .child(if selected {
+                        // 使用中 — the layer's selected marker (token fill and
+                        // glyph), keeping the pane's recorded accessibility id.
+                        ui::selected_marker(
+                            format!("space-library-{id}"),
+                            IconName::Check,
+                            settings_copy(locale, "使用中"),
+                        )
+                        .accessibility_id(format!("settings.space.library.{id}"))
+                        .into_any_element()
+                    } else {
                         Button::new(format!("space-library-{id}"))
+                            .ghost()
                             .small()
-                            .icon(if selected { IconName::Check } else { IconName::Play })
-                            .tooltip(settings_copy(
-                                locale,
-                                if selected { "使用中" } else { "选择" },
-                            ))
-                            .accessibility_label(settings_copy(
-                                locale,
-                                if selected { "使用中" } else { "选择" },
-                            ))
+                            .icon(IconName::Play)
+                            .text_color(ui::icon_color(false, !library_working))
+                            .tooltip(settings_copy(locale, "选择"))
+                            .accessibility_label(settings_copy(locale, "选择"))
                             .accessibility_id(format!("settings.space.library.{id}"))
-                            .disabled(library_working || selected)
+                            .disabled(library_working)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.commands
                                     .push(json!({"op":"space.library.select","id":id}));
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                            .into_any_element()
+                    }),
             );
         }
         if let Some(code) = library["noticeCode"].as_str() {
@@ -3205,8 +3264,10 @@ impl AgentSettingsPane {
                     )
                     .child(
                         Button::new(format!("marble-generate-{id}"))
+                            .ghost()
                             .small()
                             .icon(IconName::Star)
+                            .text_color(ui::icon_color(false, enabled))
                             .tooltip(settings_copy(locale, "生成（付费）"))
                             .accessibility_label(settings_copy(locale, "生成（付费）"))
                             .accessibility_id(format!("settings.space.marble.generate.{id}"))
@@ -3241,7 +3302,18 @@ impl AgentSettingsPane {
                 )
                 .child(
                     Button::new("marble-import")
+                        .ghost()
                         .icon(IconName::ArrowDown)
+                        .text_color(ui::icon_color(
+                            false,
+                            configured
+                                && marble_command(
+                                    library,
+                                    "space.marble.import",
+                                    self.extra_inputs[7].read(cx).value().as_str(),
+                                )
+                                .is_some(),
+                        ))
                         .tooltip(settings_copy(locale, "按 World ID 导入"))
                         .accessibility_label(settings_copy(locale, "按 World ID 导入"))
                         .small()
@@ -3272,7 +3344,12 @@ impl AgentSettingsPane {
         if pending.is_some() {
             controls = controls.child(
                 Button::new("marble-resume")
+                    .ghost()
                     .icon(IconName::Undo2)
+                    .text_color(ui::icon_color(
+                        false,
+                        configured && marble_command(library, "space.marble.resume", "").is_some(),
+                    ))
                     .tooltip(settings_copy(locale, "恢复原任务"))
                     .accessibility_label(settings_copy(locale, "恢复原任务"))
                     .small()
@@ -3295,7 +3372,9 @@ impl AgentSettingsPane {
         if marble_working {
             controls = controls.child(
                 Button::new("marble-cancel")
+                    .ghost()
                     .icon(IconName::CircleX)
+                    .text_color(ui::icon_color(false, true))
                     .tooltip(settings_copy(locale, "取消本机等待"))
                     .accessibility_label(settings_copy(locale, "取消本机等待"))
                     .small()
@@ -3456,7 +3535,7 @@ impl AgentSettingsPane {
         let mut toggles = SettingsSection::new("");
         toggles = toggles
             .child(
-                Switch::new("settings.shortcuts.global")
+                ui::selected_switch("settings.shortcuts.global")
                     .label(settings_copy(locale, "启用全局快捷键"))
                     .accessibility_label(settings_copy(locale, "启用全局快捷键"))
                     .checked(
@@ -3471,7 +3550,7 @@ impl AgentSettingsPane {
             )
             .child(row_detail(settings_copy(locale, "gmgn radio 在后台时也能响应。")))
             .child(
-                Switch::new("settings.shortcuts.media")
+                ui::selected_switch("settings.shortcuts.media")
                     .label(settings_copy(locale, "使用系统媒体快捷键"))
                     .accessibility_label(settings_copy(locale, "使用系统媒体快捷键"))
                     .checked(
@@ -3552,7 +3631,7 @@ impl AgentSettingsPane {
                             .justify_center()
                             .rounded(px(metrics::AGENT_ICON_RADIUS))
                             .bg(rgba(s::ACCENT).opacity(metrics::AGENT_ICON_ALPHA))
-                            .text_color(rgba(s::ACCENT))
+                            .text_color(ui::icon_color(true, true))
                             .child(
                                 Icon::new(IconName::Terminal).size(px(metrics::AGENT_ICON_SIZE)),
                             ),
@@ -3572,6 +3651,7 @@ impl AgentSettingsPane {
                     )
                     .child(
                         Button::new("codex-login")
+                            .ghost()
                             .icon(if signed_in {
                                 IconName::CircleUser
                             } else {
@@ -3587,6 +3667,7 @@ impl AgentSettingsPane {
                             ))
                             .small()
                             .accessibility_id("settings.agent.codex")
+                            .text_color(ui::icon_color(signed_in, !(working || unavailable)))
                             .disabled(working || unavailable)
                             .on_click(cx.listener(|this, _, _, _| {
                                 this.commands.push(json!({
@@ -3667,6 +3748,7 @@ impl AgentSettingsPane {
                             IconName::Check,
                             settings_copy(locale, "保存"),
                             false,
+                            true,
                         )
                         .flex_shrink_0()
                         .accessibility_id("settings.agent.persona.save")
@@ -3711,6 +3793,7 @@ impl AgentSettingsPane {
                             IconName::Check,
                             settings_copy(locale, "保存"),
                             false,
+                            true,
                         )
                         .flex_shrink_0()
                         .accessibility_id("settings.agent.resident-persona.save")
@@ -3842,7 +3925,12 @@ impl AgentSettingsPane {
                     )
                     .child(
                         Button::new("refresh-voices")
+                            .ghost()
                             .icon(IconName::RefreshCw)
+                            .text_color(ui::icon_color(
+                                false,
+                                self.snapshot["tts"]["loading"].as_bool() != Some(true),
+                            ))
                             .small()
                             .tooltip(settings_copy(locale, "刷新声音"))
                             .accessibility_label(settings_copy(locale, "刷新声音"))
@@ -3851,6 +3939,7 @@ impl AgentSettingsPane {
                     )
                     .child(
                         Button::new("preview-tts")
+                            .ghost()
                             .icon(
                                 if self.snapshot["tts"]["isSpeaking"].as_bool() == Some(true) {
                                     IconName::Pause
@@ -3876,6 +3965,13 @@ impl AgentSettingsPane {
                             ))
                             .small()
                             .accessibility_id("settings.tts.preview")
+                            .text_color(ui::icon_color(
+                                self.snapshot["tts"]["isSpeaking"].as_bool() == Some(true),
+                                tts_preview_enabled(
+                                    valid_model,
+                                    self.inputs[3].read(cx).value().as_str(),
+                                ),
+                            ))
                             .disabled(!tts_preview_enabled(
                                 valid_model,
                                 self.inputs[3].read(cx).value().as_str(),
@@ -3905,6 +4001,7 @@ impl AgentSettingsPane {
                             } else {
                                 IconName::ChevronRight
                             })
+                            .text_color(ui::icon_color(self.custom_voice_open, true))
                             .small()
                             .accessibility_id("settings.tts.advanced")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -3973,9 +4070,9 @@ impl AgentSettingsPane {
                     IconName::Check,
                     settings_copy(locale, "保存配置"),
                     false,
+                    tts_save_enabled(valid_model),
                 )
                     .accessibility_id("settings.tts.save")
-                    .disabled(!tts_save_enabled(valid_model))
                     .on_click(cx.listener(|this, _, _, cx| this.tts_action("tts.save", cx))),
             )
             .when_some(
@@ -4039,9 +4136,9 @@ impl AgentSettingsPane {
                     IconName::Check,
                     settings_copy(locale, "保存配置"),
                     false,
+                    asr_save_enabled(asr_valid),
                 )
                     .accessibility_id("settings.asr.save")
-                    .disabled(!asr_save_enabled(asr_valid))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let mut value = this.draft["asr"].clone();
                         value["op"] = json!("asr.save");
@@ -4083,30 +4180,22 @@ impl AgentSettingsPane {
             let weak = cx.entity().downgrade();
             column = column.child(
                 div().flex_shrink_0().pb(px(metrics::SECTION_CONTENT_GAP)).child(
-                    TabBar::new("settings.stage-sections")
-                        .segmented()
-                        .small()
-                        .w_full()
-                        .selected_index(selected)
-                        .children(sections.iter().map(|section| {
-                            Tab::new()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .aria_label(localized_route(locale, section).to_string())
-                                .child(
-                                    div()
-                                        .text_size(px(tokens::CAPTION))
-                                        .min_w(px(0.))
-                                        .whitespace_nowrap()
-                                        .child(localized_route(locale, section).to_string()),
-                                )
-                        }))
-                        .on_click(move |index, _, cx| {
-                            let section = sections[*index];
+                    ui::selected_tabs(
+                        "settings.stage-sections",
+                        sections
+                            .iter()
+                            .map(|section| {
+                                ui::TabFace::text(localized_route(locale, section).to_string())
+                            })
+                            .collect(),
+                        selected,
+                        move |index, _, cx| {
+                            let section = sections[index];
                             _ = weak.update(cx, |this, cx| {
                                 this.select_section(key, section, cx);
                             });
-                        }),
+                        },
+                    ),
                 ),
             );
         }
@@ -4141,6 +4230,11 @@ impl AgentSettingsPane {
                 IconName::CircleCheck
             })
             .size(px(metrics::NOTICE_ICON))
+            .text_color(if error {
+                rgba(s::WARNING)
+            } else {
+                ui::icon_color(true, true)
+            })
             .into_any_element()
         };
         Some(
@@ -4167,12 +4261,19 @@ impl AgentSettingsPane {
     fn import_menu(&self, locale: UiLocale, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
         Button::new("presence-import")
+            .ghost()
             .icon(IconName::ArrowDown)
             .tooltip(settings_copy(locale, "导入"))
             .accessibility_label(settings_copy(locale, "导入"))
             .dropdown_caret(true)
             .small()
             .accessibility_id("settings.presence.import")
+            .text_color(ui::icon_color(
+                false,
+                import_menu_enabled(
+                    self.snapshot["presence"]["working"].as_bool() == Some(true),
+                ),
+            ))
             .disabled(!import_menu_enabled(
                 self.snapshot["presence"]["working"].as_bool() == Some(true),
             ))
@@ -4281,29 +4382,25 @@ impl AgentSettingsPane {
             .pt(px(tokens::settings::SEGMENT_TOP))
             .pb(px(tokens::settings::SEGMENT_BOTTOM))
             .child(
-                TabBar::new("settings.tabs")
-                    .segmented()
-                    .small()
-                    .w(px(tokens::settings::SEGMENT_WIDTH))
-                    .when_some(tab_index_for_page(self.page), |bar, index| {
-                        bar.selected_index(index)
-                    })
-                    .children(tabs.map(|tab| {
-                        let page = localized_route(locale, tab.label).to_string();
-                        Tab::new()
-                            .icon(settings_tab_icon(tab.key))
-                            .aria_label(page.clone())
-                            .tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(page.clone())
-                                    .build(window, cx)
-                            })
-                            .flex_1()
-                            .min_w(px(0.))
-                    }))
-                    .on_click(move |index, _, cx| {
-                        let key = tabs[*index].key;
+                ui::selected_tabs(
+                    "settings.tabs",
+                    tabs.into_iter()
+                        .map(|tab| {
+                            ui::TabFace::icon(
+                                settings_tab_icon(tab.key),
+                                localized_route(locale, tab.label).to_string(),
+                            )
+                        })
+                        .collect(),
+                    // `None` selects nothing, exactly as the kit bar did when the
+                    // current page matched no tab.
+                    tab_index_for_page(self.page).unwrap_or(usize::MAX),
+                    move |index, _, cx| {
+                        let key = tabs[index].key;
                         _ = weak.update(cx, |this, cx| this.select_page(key, cx));
-                    }),
+                    },
+                )
+                .w(px(tokens::settings::SEGMENT_WIDTH)),
             )
             .into_any_element()
     }

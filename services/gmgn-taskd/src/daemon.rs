@@ -345,6 +345,19 @@ impl Service {
                     crate::agent_tools::request(&mut s.connection, &method, &params)
                 }).await
             }
+            // The host's own exit for a call whose receipt was refused: without it
+            // the durable `unknown` row has no production path that can settle it
+            // (the runtime family's `agent_runtime_reconcile` needs a runtime
+            // session). Same family, same verification rule: the receipt must be
+            // the host's own `host_state_verification` and must name this call.
+            "agent_tool_reconcile" => {
+                if self.has_configured_secret(&params).await {
+                    return Err("secret_in_input");
+                }
+                self.db.call(move |s| {
+                    crate::agent_tools::reconcile_request(&mut s.connection, &params)
+                }).await
+            }
             "world_activity_route" => {
                 if self.has_configured_secret(&params).await {
                     return Err("secret_in_input");
@@ -1338,6 +1351,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let service = Service::new(Database::open(dir.clone(), None).unwrap()).unwrap();
         (service, dir)
+    }
+
+    /// The flat `agent_tool_reconcile` route exists, and it keeps the family's
+    /// verification rule: a bare acknowledgement is refused **by name**, not
+    /// swallowed and not `unknown_method` (the shape the harness measured three
+    /// times before this route existed). Without it a host whose tool receipt was
+    /// refused has no way to settle the durable `unknown` row.
+    #[tokio::test]
+    async fn the_flat_tool_reconcile_route_exists_and_requires_host_verification() {
+        let (service, dir) = service().await;
+        let params = json!({
+            "worldID": "w", "residentScope": "s", "hostSessionID": "h",
+            "runID": "r", "callID": "c", "outcome": "not_applied",
+            "verificationReceipt": {"verified": true},
+        });
+        assert_eq!(
+            service.request("agent_tool_reconcile", params).await,
+            Err("agent_tool_invalid_verification")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn submission(wish: &str) -> Value {

@@ -54,8 +54,7 @@ use gpui_kit::component::empty::{
 };
 use gpui_kit::component::{
     button::*,
-    slider::{Slider, SliderEvent, SliderState},
-    tab::{Tab, TabBar},
+    slider::{SliderEvent, SliderState},
     *,
 };
 use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _, StatefulInteractiveElement as _};
@@ -494,12 +493,13 @@ impl ResidentPropEditorPane {
         let label: SharedString = label.into();
         let disabled = disabled || self.snapshot["isSaving"].as_bool() == Some(true);
         let text = if disabled { s::TEXT_DIM } else { s::TEXT };
+        let icon_tone = ui::icon_color(false, !disabled);
         Button::new(id)
             .custom(scene_variant(cx, 0x00000000, 0xffffff14, text))
             .small()
             .icon(icon)
             .rounded(px(m::ROW_RADIUS))
-            .text_color(rgba(text))
+            .text_color(icon_tone)
             .disabled(disabled)
             .tooltip(label.clone())
             .accessibility_label(label)
@@ -677,6 +677,7 @@ impl ResidentPropEditorPane {
                     Button::new(format!("props-{id}-claim-unavailable"))
                         .small()
                         .icon(AssetIcon::ArrowDown)
+                        .text_color(ui::icon_color(false, false))
                         .tooltip("领取")
                         .rounded(px(m::ROW_RADIUS))
                         .disabled(true)
@@ -836,26 +837,32 @@ impl ResidentPropEditorPane {
             .position(|slot| slot["id"] == selected["holdPoint"]);
         let width = m::SLOT_PICKER_WIDTH / (points.len().max(1) as f32);
         let points = points.to_vec();
-        TabBar::new("prop-hold-points")
-            .segmented()
-            .small()
-            .w(px(m::SLOT_PICKER_WIDTH))
-            .h(px(m::SLOT_PICKER_HEIGHT))
-            .when_some(active, |bar, index| bar.selected_index(index))
-            .children(points.iter().map(|slot| {
-                Tab::new()
-                    .label(slot["name"].as_str().unwrap_or("").to_owned())
-                    .w(px(width))
-                    .disabled(saving)
-            }))
-            .on_click(cx.listener(move |this, index: &usize, _, cx| {
-                if let Some(point) = points.get(*index) {
-                    this.commands
-                        .push(json!({"op":"stage.props.hold","point":point["id"]}));
-                    cx.notify();
+        ui::selected_tabs(
+            "prop-hold-points",
+            points
+                .iter()
+                .map(|slot| {
+                    ui::TabFace::text(slot["name"].as_str().unwrap_or("").to_owned())
+                        .width(width)
+                        .disabled(saving)
+                })
+                .collect(),
+            active.unwrap_or(usize::MAX),
+            {
+                let weak = cx.entity().downgrade();
+                move |index: usize, _: &mut Window, cx: &mut App| {
+                    _ = weak.update(cx, |this, cx| {
+                        if let Some(point) = points.get(index) {
+                            this.commands
+                                .push(json!({"op":"stage.props.hold","point":point["id"]}));
+                            cx.notify();
+                        }
+                    });
                 }
-            }))
-            .into_any_element()
+            },
+        )
+        .w(px(m::SLOT_PICKER_WIDTH))
+        .into_any_element()
     }
 
     /// The size block (`sizeControl`, `:338-373`): step buttons with the
@@ -924,7 +931,7 @@ impl ResidentPropEditorPane {
                             .role(Role::Slider)
                             .aria_label("物件最长边")
                             .child(
-                                Slider::new(&self.size)
+                                ui::scene_slider(&self.size)
                                     .disabled(self.snapshot["isSaving"].as_bool() == Some(true)),
                             ),
                     )
@@ -1495,34 +1502,35 @@ impl Render for ResidentPropEditorPane {
         let scope = ownership_scope(placed_only);
         let saving = self.snapshot["isSaving"].as_bool() == Some(true);
         let mut content = v_flex().w_full().gap(px(m::SECTION_GAP));
-        content = content.child(
-            TabBar::new("props-filter")
-                .segmented()
-                .small()
-                .w_full()
-                .selected_index(ownership_scope_index(placed_only))
-                .children([ownership_scope(false), ownership_scope(true)].map(|scope| {
+        content = content.child(ui::selected_tabs(
+            "props-filter",
+            [ownership_scope(false), ownership_scope(true)]
+                .into_iter()
+                .map(|scope| {
                     // The scope picker is a control: icon on the face, words in
                     // the accessibility label and the tooltip.
-                    Tab::new()
-                        .icon(if scope.title == "房间里" {
+                    ui::TabFace::icon(
+                        if scope.title == "房间里" {
                             AssetIcon::Map
                         } else {
                             AssetIcon::Folder
-                        })
-                        .aria_label(scope.title)
-                        .flex_1()
-                        .min_w(px(0.))
-                        .tooltip(move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(scope.title).build(window, cx)
-                        })
-                }))
-                .on_click(cx.listener(|this, index: &usize, _, cx| {
-                    this.commands
-                        .push(json!({"op":"stage.props.filter","placedOnly":*index==1}));
-                    cx.notify();
-                })),
-        );
+                        },
+                        scope.title,
+                    )
+                })
+                .collect(),
+            ownership_scope_index(placed_only),
+            {
+                let weak = cx.entity().downgrade();
+                move |index: usize, _: &mut Window, cx: &mut App| {
+                    _ = weak.update(cx, |this, cx| {
+                        this.commands
+                            .push(json!({"op":"stage.props.filter","placedOnly":index==1}));
+                        cx.notify();
+                    });
+                }
+            },
+        ));
         let sections = self.snapshot["sections"]
             .as_array()
             .cloned()

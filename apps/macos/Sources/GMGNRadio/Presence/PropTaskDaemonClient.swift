@@ -587,6 +587,12 @@ enum PropTaskDaemonError: LocalizedError {
         case TaskdHTTPError.timedOut: return PropTaskDaemonError.timedOut
         case TaskdHTTPError.unavailable: return PropTaskDaemonError.unavailable
         case TaskdHTTPError.rejected(let code): return PropTaskDaemonError.requestRejectedWith(code: code)
+        // 传输层把三类故障分开了（正常流结束 / 连接失败 / 非 200 无码），但**这条路**
+        // 对外只有一句"后台服务还没连上"，改动前这三类也都是 `.unavailable`：
+        // 这里显式列出、逐字保持旧映射，绝不让新 case 掉进 `default` 把原始
+        // `TaskdHTTPError` 泄漏给调用方（那会是一次静默的行为变化）。
+        case TaskdHTTPError.streamEnded, TaskdHTTPError.connectionFailed, TaskdHTTPError.httpStatus:
+            return PropTaskDaemonError.unavailable
         default: return error
         }
     }

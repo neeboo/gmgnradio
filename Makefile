@@ -337,6 +337,20 @@ _test-harnesses:
 	# 占 92 ms 主线程帧的 57%，渲染侧资产装载卡在同一根主线程上）。负对照就是改前
 	# 那一行，必须红。
 	swift tools/test-presence-snapshot-projection.swift
+	# 手动选动作的**门禁状态机**：读操作（`presence.load` / `presence.catalog*`）不许再
+	# 把一次点击拒成 `presence_selection_busy`（2026-10-09 真机：全目录 bind 占着全局门，
+	# 点击被拒并丢弃）；标记必须有上界、迟到完成不许清新标记；渲染回执身份按 pending 的
+	# 权威 revision。它把状态机抽成纯值类型直接驱动，三条「改回旧行为」注入必须红，并真实
+	# 驱动生产 `Serial`（一个不返回的请求不再卡死后续）。DB 只用只读 `.bak` 副本。
+	swift tools/test-presence-selection-gate.swift
+	# GPUI 轮询快照的**代价**门禁：一次 20 Hz 轮询只许解析一次宿主信封、只许写一次
+	# 边界载荷（`tools/test-gpui-projection-cost.py`，编译 `GPUIProjectionPayload` 实测）。
+	# 改前每轮多出整树 `DeepClone` ＋ `ToString`→`JObject.Parse` 字符串往返 ＋ 一次
+	# UTF-16 中转；2026-10-09 真机 `sample` 经 `mono_pmip` 解析后，主线程 71% 落在
+	# 这条 Newtonsoft 树上，就是「切全屏会卡」那一帧。判据两半都在：载荷必须与改前
+	# 逐字节相同（无 BOM），且中位耗时不得超过改前的 60%；负对照是 HEAD 的源码与
+	# 改前的实现，都必须红。
+	$(PYTHON) tools/test-gpui-projection-cost.py
 	# 用户可见文案门禁（用户 2026-10-02：「所有的提示，所有的错误提示和 warning 都需要
 	# 简化」）：机械扫描全量中文文案，命中内部术语 / key=value / UUID / 文件路径 /
 	# 省略号堆叠 / 打勾打叉 / 超长（>60 汉字或 >2 句）⇒ 红。豁免逐条写明理由（日志出口、
@@ -488,6 +502,14 @@ _test-harnesses:
 	swift tools/test-resident-state-convergence.swift
 	swift tools/test-world-authority-single-writer.swift
 	swift tools/test-world-authority-projection.swift
+	# 权威传输层的**故障分类 / 重连 / 不误报**：正常流结束、连接失败、非 200 无码
+	# 必须三种三句；事件流的空闲上限必须由流式请求自己决定（权威每 15 秒一次
+	# `: heartbeat`，改动前订阅用的是 RPC 的 5 秒预算 ⇒ 健康的流每 5 秒自杀一次、
+	# 退避后重连，真机日志里就是每 ~40 秒一条「世界状态权威不可达：HTTP connection
+	# ended」）。行为探针用进程内 HTTP 夹具把三种故障分别造出来，并证明传输层瞬时
+	# 失败只按权威**自己的**幂等合同（`requestID`）原样重发一次、权威答复过的失败
+	# 一次都不重发。注入负对照（去掉流式空闲上限）必须红。
+	swift tools/test-world-authority-transport-classification.swift
 	# 生成结果的**归属与身份**判据（P-B1）。
 	# B-1「状态声明的入库 ⇔ 权威里存在该条目」三层各自独立可断言；
 	# B-4 资产身份必须等于**产物**字节的 sha256、且不得等于输入图哈希。

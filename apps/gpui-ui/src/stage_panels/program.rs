@@ -1450,7 +1450,7 @@ impl StageProgramRailPane {
         } else {
             m::REPLAN_BUTTON
         };
-        let text = if planning { s::WARNING } else { s::ACCENT };
+        let text = if planning { s::WARNING } else { s::ICON_ACTIVE };
         Button::new(id)
             .custom(scene_variant(
                 cx,
@@ -1461,7 +1461,11 @@ impl StageProgramRailPane {
             .w(px(size))
             .h(px(size))
             .rounded(px(size / 2.))
-            .text_color(rgba(if back { s::ICON_ACTIVE } else { text }))
+            .text_color(if back {
+                rgba(s::ICON_ACTIVE)
+            } else {
+                rgba(text)
+            })
             .icon(if planning {
                 AssetIcon::Hourglass
             } else {

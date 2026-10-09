@@ -134,10 +134,42 @@ final class RustPresenceSelectionClient: @unchecked Sendable {
     }
     private actor Serial {
         private var prior: Task<Snapshot, Error>?
+        /// Upper bound on waiting for the previous authoritative call. One call
+        /// that never returned used to wedge every later call behind it, so a
+        /// selection's `event` never reached the daemon and the host answered
+        /// `presence_selection_busy` for ever (2026-10-09).
+        static let priorWaitMillis: UInt64 = 5_000
         func run(_ body: @escaping @Sendable () async throws -> Snapshot) async throws -> Snapshot {
             let previous = prior
-            let task = Task { if let previous { _ = try? await previous.value }; return try await body() }
+            let task = Task {
+                if let previous { await Self.awaitPrior(previous, timeoutMillis: Self.priorWaitMillis) }
+                return try await body()
+            }
             prior = task; return try await task.value
+        }
+        /// Waits for `prior` but never longer than `timeoutMillis`: the body then
+        /// runs anyway, and its own transport timeout still applies to its request.
+        private static func awaitPrior(_ prior: Task<Snapshot, Error>, timeoutMillis: UInt64) async {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let once = ResumeOnce(continuation)
+                Task { _ = try? await prior.value; once.finish() }
+                Task { try? await Task.sleep(nanoseconds: timeoutMillis * 1_000_000); once.finish() }
+            }
+        }
+
+        /// Resumes the continuation exactly once, whichever of the predecessor or
+        /// the deadline finishes first. The loser keeps running unattended and is
+        /// never waited on — that is the whole point of the bound (a task group
+        /// would structurally wait for the uncancellable `prior.value`).
+        private final class ResumeOnce: @unchecked Sendable {
+            private let lock = NSLock()
+            private var done = false
+            private let continuation: CheckedContinuation<Void, Never>
+            init(_ continuation: CheckedContinuation<Void, Never>) { self.continuation = continuation }
+            func finish() {
+                lock.lock(); let alreadyDone = done; done = true; lock.unlock()
+                if !alreadyDone { continuation.resume() }
+            }
         }
     }
 }

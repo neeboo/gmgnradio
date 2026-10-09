@@ -26,6 +26,10 @@ enum WorldAuthorityError: LocalizedError, Equatable {
     case staleProjection(local: UInt64, authority: UInt64)
     /// 读不到权威记录、也没有遗留预像 —— 冷启动 fail-closed，绝不凭空空造一个世界。
     case noAuthorityRecord
+    /// 事件流被对端正常收尾（EOF，没有传输错误）。**不是**不可达：订阅端立刻从
+    /// 投影游标续上，既不报错、也不退避。它单独成为一个 case，就是为了让
+    /// "正常流结束"再也回不到 `.unavailable` 那条路上。
+    case streamEnded
 
     /// 界面只留**一句人话**；原始细节（原因、错误码、两侧 revision）一条不少地进日志。
     /// 失败在这里构造，所以日志在这里落 —— 调用方不必记得再打一行。
@@ -35,6 +39,10 @@ enum WorldAuthorityError: LocalizedError, Equatable {
         diagnosticLog.error("世界状态权威不可达：\(detail, privacy: .public)")
         return .unavailable(detail)
     }
+
+    /// 正常收尾**不落不可达日志**：这是链路按预期收工，不是故障。真机上那条
+    /// 每 ~40 秒一次的"权威不可达：HTTP connection ended"就是它被误报的产物。
+    static func streamEnded() -> WorldAuthorityError { .streamEnded }
 
     static func daemonCode(_ code: String) -> WorldAuthorityError {
         diagnosticLog.error("世界状态权威拒绝：code=\(code, privacy: .public)")
@@ -62,6 +70,10 @@ enum WorldAuthorityError: LocalizedError, Equatable {
             "空间数据不是最新的，这次没有保存。请稍后重试。"
         case .noAuthorityRecord:
             "找不到这个空间，请重新打开。"
+        case .streamEnded:
+            // 按设计到不了界面（订阅端把它当正常收尾直接重连）；留着是为了
+            // 万一漏出去也**不新增用户可见文案**。
+            "暂时连不上空间服务，这次没有保存。请稍后重试。"
         }
     }
 }
@@ -211,6 +223,13 @@ final class TaskdHTTPAuthorityClient: @unchecked Sendable {
         guard let url = URL(string: "http://\(endpoint.address)/rpc") else { throw WorldAuthorityError.invalidResponse }
         return url
     }
+    /// `/health` 是**只读**存活探针，一次瞬时失败不该升级成"空间服务不可达"。
+    ///
+    /// 真机 12 小时里有 224 条 `HTTP endpoint unavailable`，它们全部来自这里：
+    /// 非 launch 的客户端（音乐/舞台视频这一批，`timeout: 1`）只有**一次**探针
+    /// 机会，主线程稍忙就会撞上 1 秒上限。会 launch helper 的客户端在外层已经
+    /// 重试 50 次，所以这里绝不叠加，避免把最坏阻塞翻几十倍。
+    private var healthProbeAttempts: Int { allowsLaunching ? 1 : 2 }
     private func endpoint() throws -> Endpoint {
         for attempt in 0..<(allowsLaunching ? 50 : 1) {
             if let data = try? Data(contentsOf: URL(fileURLWithPath: endpointFile)),
@@ -224,23 +243,32 @@ final class TaskdHTTPAuthorityClient: @unchecked Sendable {
         throw WorldAuthorityError.unreachable("HTTP endpoint unavailable")
     }
     private func isHealthy(_ endpoint: Endpoint) throws -> Bool {
-        let response = WorldHTTPResponse()
-        let transport = TaskdHTTPTransport(streaming: false, maximumBytes: 64 * 1024,
-            receive: { response.receive($0) }, completion: { response.finish($0) })
-        var request = URLRequest(url: URL(string: "http://\(endpoint.address)/health")!, timeoutInterval: min(timeout, 1))
-        request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
-        transport.start(request); defer { transport.cancel() }
-        let data: Data
-        do { data = try response.wait(timeout: min(timeout, 1)) }
-        catch WorldAuthorityError.unavailable { return false }
-        guard let health = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              health["version"] as? Int == 2, health["transport"] as? String == "http" else {
-            throw WorldAuthorityError.invalidResponse
+        for attempt in 0..<healthProbeAttempts {
+            let response = WorldHTTPResponse()
+            let transport = TaskdHTTPTransport(streaming: false, maximumBytes: 64 * 1024,
+                receive: { response.receive($0) }, completion: { response.finish($0) })
+            var request = URLRequest(url: URL(string: "http://\(endpoint.address)/health")!, timeoutInterval: min(timeout, 1))
+            request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
+            transport.start(request); defer { transport.cancel() }
+            let data: Data
+            do { data = try response.wait(timeout: min(timeout, 1)) }
+            catch WorldAuthorityError.unavailable {
+                // 只重探"链路抖了一下"的失败。非 200 / 鉴权被拒这类**服务端给了
+                // 答复**的失败一次都不重发（判据与幂等合同无关，纯粹是别把拒绝
+                // 当成抖动）。
+                if attempt + 1 < healthProbeAttempts, response.isTransportFailure { continue }
+                return false
+            }
+            guard let health = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  health["version"] as? Int == 2, health["transport"] as? String == "http" else {
+                throw WorldAuthorityError.invalidResponse
+            }
+            return true
         }
-        return true
+        return false
     }
-    private func request(path: String, method: String, params: [String: Any]) throws -> (URLRequest, String) {
-        let endpoint = try endpoint()
+    private func request(endpoint: Endpoint, path: String, method: String,
+                         params: [String: Any]) throws -> (URLRequest, String) {
         let id = UUID().uuidString
         let data = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": params])
         guard data.count <= Self.maximumFrame else { throw WorldAuthorityError.invalidResponse }
@@ -250,23 +278,66 @@ final class TaskdHTTPAuthorityClient: @unchecked Sendable {
         request.setValue("Bearer \(endpoint.token)", forHTTPHeaderField: "Authorization")
         return (request, id)
     }
+    private func request(path: String, method: String, params: [String: Any]) throws -> (URLRequest, String) {
+        try request(endpoint: try endpoint(), path: path, method: method, params: params)
+    }
+    /// 传输层失败的最多重发次数。请求逐字节相同（**含同一个 `requestID`**），
+    /// 权威按它自己声明的幂等合同（`services/gmgn-taskd/src/contract.rs` 的
+    /// `idempotency.requestID`："同 requestID 同内容重放返回同一结果并带
+    /// replayed=true"）回放，不会产生第二次副作用。幂等机制本身一个字没动。
+    private static let transportRetryAttempts = 1
+    /// 一次 RPC 的结局：权威**答复过**（绝不重发）／传输层失败（没有任何答复）。
+    private enum RPCFailure: Error {
+        case answered(WorldAuthorityError)
+        case transport(WorldAuthorityError)
+    }
     /// Delegate callbacks run outside the main actor, including when a legacy synchronous caller is on it.
     func call(method: String, params: [String: Any]) throws -> [String: Any] {
-        let (request, id) = try request(path: "rpc", method: method, params: params)
+        // 端点（含存活探针）**只解析一次**：重发不再重新探活，否则最坏情形会把
+        // 调用方（常常是主线程）的阻塞预算再翻一倍。
+        let endpoint = try endpoint()
+        // 幂等键由权威合同定义；只有带它的请求才允许被原样重发。
+        let replayable = params["requestID"] is String
+        var attempt = 0
+        while true {
+            do { return try performCall(endpoint: endpoint, method: method, params: params) }
+            catch RPCFailure.answered(let error) { throw error }
+            catch RPCFailure.transport(let error) {
+                guard replayable, attempt < Self.transportRetryAttempts else { throw error }
+                attempt += 1
+            }
+        }
+    }
+    private func performCall(endpoint: Endpoint, method: String,
+                             params: [String: Any]) throws -> [String: Any] {
+        let (request, id) = try request(endpoint: endpoint, path: "rpc", method: method, params: params)
         let response = WorldHTTPResponse()
         let transport = TaskdHTTPTransport(streaming: false, receive: { response.receive($0) }, completion: { response.finish($0) })
         transport.start(request)
         defer { transport.cancel() }
-        let data = try response.wait(timeout: timeout)
+        let data: Data
+        do { data = try response.wait(timeout: timeout) }
+        catch let error as WorldAuthorityError {
+            // 权威没给任何答复 ⇒ 归类为可重发；权威答复过（daemon 码 / 看不懂的
+            // 数据）⇒ 原样抛出，一次都不重发。
+            guard case .unavailable = error, response.isTransportFailure else {
+                throw RPCFailure.answered(error)
+            }
+            throw RPCFailure.transport(error)
+        }
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["id"] as? String == id else { throw WorldAuthorityError.invalidResponse }
-        if let error = object["error"] as? [String: Any], let code = error["code"] as? String { throw WorldAuthorityError.daemonCode(code) }
-        guard let result = object["result"] as? [String: Any] else { throw WorldAuthorityError.invalidResponse }
+              object["id"] as? String == id else { throw RPCFailure.answered(WorldAuthorityError.invalidResponse) }
+        if let error = object["error"] as? [String: Any], let code = error["code"] as? String {
+            throw RPCFailure.answered(WorldAuthorityError.daemonCode(code))
+        }
+        guard let result = object["result"] as? [String: Any] else {
+            throw RPCFailure.answered(WorldAuthorityError.invalidResponse)
+        }
         return result
     }
     func stream(method: String, params: [String: Any], stop: () -> Bool, onFrame: ([String: Any]) -> Void) throws {
         let (request, _) = try request(path: "events", method: method, params: params)
-        let response = WorldHTTPResponse()
+        let response = WorldHTTPResponse(streaming: true)
         let transport = TaskdHTTPTransport(streaming: true, receive: { response.receive($0) }, completion: { response.finish($0) })
         transport.start(request)
         defer { transport.cancel() }
@@ -301,10 +372,23 @@ final class TaskdHTTPAuthorityClient: @unchecked Sendable {
 }
 private final class WorldHTTPResponse: @unchecked Sendable {
     private let condition = NSCondition()
+    private let streaming: Bool
     private var frames: [Data] = []
     private var bytes = 0
     private var complete = false
     private var error: Error?
+    /// `finish` 收到的原始传输失败。它是"这是哪一类故障"以及"能不能原样重发"
+    /// 的**唯一**判据 —— 不靠 `unavailable` 关联值里的字符串去猜。
+    private(set) var transportFailure: TaskdHTTPError?
+    init(streaming: Bool = false) { self.streaming = streaming }
+    /// 是否"一个字节的答复都没拿到"的传输类失败：只有这些可以按权威声明的
+    /// 幂等合同（`contract.rs` 的 `idempotency.requestID`）原样重发。
+    var isTransportFailure: Bool {
+        switch transportFailure {
+        case .timedOut, .connectionFailed, .streamEnded, .unavailable: return true
+        case .rejected, .invalidFrame, .httpStatus, .none: return false
+        }
+    }
     func receive(_ data: Data) {
         condition.lock(); defer { condition.unlock() }
         guard !complete else { return }
@@ -314,7 +398,27 @@ private final class WorldHTTPResponse: @unchecked Sendable {
         frames.append(data); bytes += data.count; condition.signal()
     }
     func finish(_ error: Error?) {
-        condition.lock(); self.error = self.error ?? error; complete = true; condition.broadcast(); condition.unlock()
+        condition.lock()
+        self.error = self.error ?? error
+        if let failure = self.error as? TaskdHTTPError { transportFailure = failure }
+        complete = true; condition.broadcast(); condition.unlock()
+    }
+    /// 三种故障各说各的：正常流结束 / 连接失败 / 非 200 无码。并带上 status、
+    /// `URLError` 码与"是否 streaming"，让下一次真机日志本身就够诊断。
+    private func classify(_ error: TaskdHTTPError) -> WorldAuthorityError {
+        switch error {
+        case .rejected(let code): return WorldAuthorityError.daemonCode(code)
+        case .invalidFrame: return WorldAuthorityError.invalidResponse
+        case .streamEnded: return WorldAuthorityError.streamEnded()
+        case .timedOut:
+            return WorldAuthorityError.unreachable("HTTP request timed out (streaming=\(streaming))")
+        case .connectionFailed(let code):
+            return WorldAuthorityError.unreachable("HTTP connection failed (URLError=\(code) streaming=\(streaming))")
+        case .httpStatus(let status):
+            return WorldAuthorityError.unreachable("HTTP status \(status) without error.code (streaming=\(streaming))")
+        case .unavailable:
+            return WorldAuthorityError.unreachable("HTTP transport unavailable (streaming=\(streaming))")
+        }
     }
     func poll(timeout: TimeInterval) throws -> Data? {
         condition.lock(); defer { condition.unlock() }
@@ -322,14 +426,8 @@ private final class WorldHTTPResponse: @unchecked Sendable {
         if !frames.isEmpty { let data = frames.removeFirst(); bytes -= data.count; return data }
         if complete {
             if let error = error as? WorldAuthorityError { throw error }
-            if let error = error as? TaskdHTTPError {
-                switch error {
-                case .rejected(let code): throw WorldAuthorityError.daemonCode(code)
-                case .invalidFrame: throw WorldAuthorityError.invalidResponse
-                case .unavailable, .timedOut: break
-                }
-            }
-            throw WorldAuthorityError.unreachable("HTTP connection ended")
+            if let error = error as? TaskdHTTPError { throw classify(error) }
+            throw WorldAuthorityError.unreachable("HTTP response ended without a result (streaming=\(streaming))")
         }
         return nil
     }
@@ -338,7 +436,7 @@ private final class WorldHTTPResponse: @unchecked Sendable {
         while Date() < deadline {
             if let data = try poll(timeout: max(0, deadline.timeIntervalSinceNow)) { return data }
         }
-        throw WorldAuthorityError.unreachable("HTTP request timed out")
+        throw WorldAuthorityError.unreachable("HTTP request timed out (streaming=\(streaming), timeout=\(timeout)s)")
     }
 }
 
@@ -672,6 +770,14 @@ final class WorldAuthoritySubscription: @unchecked Sendable {
                           let fact = WorldAuthorityClient.fact(from: entry) else { return }
                     self.onFact(fact)
                 }
+            } catch WorldAuthorityError.streamEnded {
+                // 事件流被对端**正常收尾**：订阅按设计从游标续上，所以这不是
+                // "权威不可达"——不计失败、不退避、不落日志。只留一个最小的让步，
+                // 免得对端刚关闭就忙转。
+                if isStopped { return }
+                reconnectFailures = 0
+                Thread.sleep(forTimeInterval: 0.1)
+                continue
             } catch {
                 // 权威不可达：按共享策略退避后重试（只影响投影新鲜度，不影响渲染）。
                 if isStopped { return }

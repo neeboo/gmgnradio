@@ -2833,7 +2833,9 @@ impl Render for StageBoundVideoPromptPane {
                     .child(div().flex_1())
                     .child(
                         Button::new("bound-video-play")
+                            .ghost()
                             .icon(gpui_kit::assets::IconName::Play)
+                            .text_color(rgba(crate::ui_tokens::scene::ICON))
                             .tooltip("播放")
                             .accessibility_label("播放")
                             .with_size(gpui_kit::component::Size::Small)
@@ -2847,7 +2849,9 @@ impl Render for StageBoundVideoPromptPane {
             .child(
                 div().absolute().top(px(7.)).right(px(7.)).child(
                     Button::new("bound-video-dismiss")
+                        .ghost()
                         .icon(gpui_kit::assets::IconName::Close)
+                        .text_color(rgba(crate::ui_tokens::scene::ICON_MUTED))
                         .tooltip("忽略绑定视频")
                         .accessibility_label("忽略绑定视频")
                         .with_size(gpui_kit::component::Size::XSmall)

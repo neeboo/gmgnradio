@@ -389,6 +389,13 @@ final class AgentSpeechAnnouncer {
         case TaskdHTTPError.invalidFrame: return "http_invalid_frame"
         case TaskdHTTPError.timedOut: return "http_timed_out"
         case TaskdHTTPError.unavailable: return "http_unavailable"
+        // 传输层把三类故障分开了（正常流结束 / 连接失败 / 非 200 无码），但**这条
+        // 语音诊断**改动前三类都落到 `http_unavailable`：这里显式列出、逐字保持
+        // 旧诊断码，避免它们掉进 `default` 变成 `speech_output_failure`（那会把
+        // 一次传输失败误报成"语音输出失败"）。更细的原因在权威那一路的
+        // `WorldAuthorityError.unavailable` 关联值里，本来就不经过这里。
+        case TaskdHTTPError.streamEnded, TaskdHTTPError.connectionFailed, TaskdHTTPError.httpStatus:
+            return "http_unavailable"
         default: return "speech_output_failure"
         }
     }

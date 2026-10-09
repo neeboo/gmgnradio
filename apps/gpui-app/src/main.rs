@@ -691,12 +691,16 @@ impl GMGNProductUI {
     fn compact_control(&self,id:&'static str,label:&'static str,action:&'static str,cx:&mut Context<Self>)->AnyElement {
         let icon=if id=="voice" {voice_icon(self.runtime_state["voiceState"].as_str())} else {control_icon(id)};
         let active=match id {"chat"=>self.chat_open,"props"=>self.props_open,_=>false};
-        let button=ui::icon_button(id,icon,label,active)
+        // The compact column keeps its own white tint while resting, but an
+        // **asserted** control takes the layer's selected blue — the same token
+        // the full bar paints, so the two columns cannot disagree.
+        let tint=if active {scene_tokens::SELECTED} else {shell_metrics::COMPACT_TINT};
+        let button=ui::icon_button(id,icon,label,active,true)
             .w(px(shell_metrics::COMPACT_CONTROL)).h(px(shell_metrics::COMPACT_CONTROL))
             .rounded(px(scene_tokens::CONTROL_RADIUS))
             .bg(rgba(shell_metrics::COMPACT_CONTROL_BG))
             .border_1().border_color(rgba(shell_metrics::COMPACT_CONTROL_BORDER))
-            .text_color(rgba(shell_metrics::COMPACT_TINT));
+            .text_color(rgba(tint));
         let mut control=if id=="player" {
             let snapshot=self.runtime_state["liveCamPlayerMenu"].clone();let weak=cx.entity().downgrade();let popup_weak=weak.clone();
             button.dropdown_menu(move |menu,_,_| {
@@ -769,8 +773,12 @@ impl GMGNProductUI {
             let label=if id=="mode" {window_mode_content(fullscreen).1.to_owned()} else {label};
             let mut control=TransportControl::new(id,action,icon,label)
                 .active(active).enabled(enabled).ends_group(id=="next").hold(id=="voice");
+            // The asserted face is the **layer's** selected wash
+            // (`ui_tokens::scene::SELECTED_SOFT`, painted by the bar for any
+            // active control). The host used to override 聊天 with
+            // `NSColor.systemBlue` here — a system tint that follows the OS
+            // appearance, and the "default blue" the overlay palette replaced.
             if id=="visual" {control=control.face_text(if self.stage_panel_open{"收起"}else{"设置"});}
-            if id=="chat"&&self.chat_open {control=control.active_fill(system_symbol::system_blue_background());}
             if id=="inbox" {
                 let count=inbox_unread(&self.runtime_state);
                 if count>0 {control=control.badge(if count>99{"99+".to_owned()}else{count.to_string()});}
@@ -1052,7 +1060,7 @@ impl Render for GMGNProductUI {
                         root.child(bubble
                             .on_click(cx.listener(|this,_,_,cx|{this.chat_open=true;this.composer_focus_pending=true;cx.notify();}))
                             .child(content)
-                            .child(ui::icon_button("livecam.reply-dismiss",IconName::X,"关闭回复气泡",false)
+                            .child(ui::icon_button("livecam.reply-dismiss",IconName::X,"关闭回复气泡",false,true)
                                 .w(px(shell_metrics::COMPACT_DISMISS)).h(px(shell_metrics::COMPACT_DISMISS))
                                 .on_click(cx.listener(|this,_,_,cx|{cx.stop_propagation();this.dismissed_reply_revision=latest_reply_revision(&this.runtime_state);cx.notify();}))))
                     }

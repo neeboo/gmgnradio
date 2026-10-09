@@ -1171,7 +1171,11 @@ final class UnityMediaHost {
 
     private func publishCharacterSelection(_ snapshot: StageAvatarRuntimeSnapshot) {
         guard !closed else { return }
-        characterSelectionRevision &+= 1
+        // The identity the renderer echoes is the authority's own revision for
+        // this selection, not a per-publish counter: a load that outlives several
+        // refreshes used to be answered with a revision that no longer matched
+        // (2026-10-09 W2, `pendingRenderer` never cleared).
+        characterSelectionRevision = presenceSettings.rendererSelectionRevision
         characterRuntimeRevision = snapshot.revision
         let active = presenceSettings.model.packages.first(where: \.isActive)
         let avatar: [String: Any]
@@ -1339,9 +1343,14 @@ final class UnityMediaHost {
                       let motionID = value["motionID"] as? String else { return false }
                 return presenceSettings.completeSelectedMotion(revision: characterRuntimeRevision, motionID: motionID)
             case "presence.runtime.result":
-                guard let revision = value["revision"] as? UInt64, revision == characterSelectionRevision,
-                      let success = value["success"] as? Bool else { return false }
-                let accepted = presenceSettings.command(["op": "presence.runtime.result", "revision": characterRuntimeRevision, "success": success])
+                // Identity comes from the bridge's *pending* selection (the
+                // authority's revision), not from `characterSelectionRevision`
+                // equalling a volatile per-publish counter: the counter advanced
+                // on every snapshot refresh, so a real asset load's receipt was
+                // rejected and `pendingRenderer` never cleared (2026-10-09 W2).
+                guard let revision = value["revision"] as? UInt64, let success = value["success"] as? Bool,
+                      presenceSettings.acceptsRendererReceipt(revision: revision) else { return false }
+                let accepted = presenceSettings.command(["op": "presence.runtime.result", "revision": revision, "success": success])
                 if accepted && success,
                    let avatar = characterSelection["avatar"] as? [String: Any],
                    let format = avatar["format"] as? String, let engine = PresenceEngine(rawValue: format) {
@@ -1783,7 +1792,7 @@ final class UnityMediaHost {
             // drew as selectable can therefore no longer be refused here, and a
             // refusal that does happen names itself instead of vanishing.
             if let refusal = presenceSettings.motionSelectionRefusal(id) {
-                return settingsRefusal(op: op, code: refusal, detail: id)
+                return settingsRefusal(op: op, code: refusal, detail: presenceSettings.selectionRefusalDetail(for: id))
             }
             residentAutonomy?.pauseByUser()
             do { try worldSession?.prepareManualMotionSelection() }
@@ -1794,7 +1803,8 @@ final class UnityMediaHost {
                 return settingsRefusal(op: op, code: "presence_world_not_ready", detail: detail)
             }
             guard presenceSettings.command(value) else {
-                return settingsRefusal(op: op, code: presenceSettings.motionSelectionRefusal(id) ?? "presence_selection_rejected", detail: id)
+                let code = presenceSettings.motionSelectionRefusal(id) ?? "presence_selection_rejected"
+                return settingsRefusal(op: op, code: code, detail: presenceSettings.selectionRefusalDetail(for: id))
             }
             return true
         case _ where UnityPresenceSettingsBridge.supportedCommands.contains(op): return presenceSettings.command(value)

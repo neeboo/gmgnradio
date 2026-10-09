@@ -289,6 +289,9 @@ const CHAIN_HEADS: &[&str] = &[
     "MenuItem::new(",
     "PopupMenu::new(",
     "Toggle::new(",
+    // `primitives::selected_switch` is the same kit `Switch` with its checked
+    // track re-coloured, so its `.label(..)` is the same row-text role.
+    "selected_switch(",
 ];
 
 /// The text a `.label(` draws is allowed only inside these code contexts.
@@ -466,7 +469,9 @@ fn allowed_reason(path: &str, masked: &str, raw: &str, offset: usize) -> Option<
         return Some(Allowed::Menu);
     }
     // 3a. kit's Switch paints its label as the row's text, not on the toggle.
-    if head == "Switch" {
+    // `primitives::selected_switch` is that very `Switch` (it only re-colours
+    // the checked track from `scene::SELECTED`), so it is the same role.
+    if head == "Switch" || chain.contains("selected_switch(") {
         return Some(Allowed::SwitchRowLabel);
     }
     // 3b. a tab bar over runtime data.

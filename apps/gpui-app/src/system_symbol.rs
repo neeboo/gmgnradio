@@ -11,14 +11,10 @@ unsafe extern "C" {
         width: *mut i32,
         height: *mut i32,
     ) -> *mut u8;
-    fn gmgn_system_color_rgba(color: i32) -> u32;
     fn gmgn_system_symbol_free(data: *mut c_void);
 }
 pub fn image(name: &str) -> Option<Arc<RenderImage>> {
     tinted_image(name, 0)
-}
-pub fn system_blue_background() -> u32 {
-    unsafe { (gmgn_system_color_rgba(2) & 0xffffff00) | 71 }
 }
 pub fn tinted_image(name: &str, tint: i32) -> Option<Arc<RenderImage>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<RenderImage>>>> = OnceLock::new();

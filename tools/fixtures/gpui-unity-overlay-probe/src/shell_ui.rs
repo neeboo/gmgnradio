@@ -732,14 +732,13 @@ impl ShellPane {
             ("inbox", Some(_)) => self.media_action == Some("inbox"),
             _ => false,
         };
-        let button = ui::icon_button(id, compact_icon(id), label, active)
+        let button = ui::icon_button(id, compact_icon(id), label, active, true)
             .w(px(metrics::COMPACT_CONTROL))
             .h(px(metrics::COMPACT_CONTROL))
             .rounded(px(scene::CONTROL_RADIUS))
             .bg(rgba(metrics::COMPACT_CONTROL_BG))
             .border_1()
-            .border_color(rgba(metrics::COMPACT_CONTROL_BORDER))
-            .text_color(rgba(metrics::COMPACT_TINT));
+            .border_color(rgba(metrics::COMPACT_CONTROL_BORDER));
         if id == "player" {
             // 播放器 opens the original's `livecamPlayerMenu`
             // (`PlayerScreen.cs:185`): 上一首 ｜ 播放/暂停 ｜ 下一首, the three
@@ -972,7 +971,8 @@ impl Render for ShellPane {
                     },
                 ))
                 .child(shell::destination_button(
-                    gpui_kit::component::Icon::new(IconName::Globe),
+                    gpui_kit::component::Icon::new(IconName::Globe)
+                        .text_color(ui::icon_color(true, true)),
                     "切换空间",
                     true,
                     move |_, _, cx| {

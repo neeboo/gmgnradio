@@ -97,15 +97,70 @@ fn choose(catalog: &Value, state: &mut Value, avatar: &str, motion: &str) {
     state["motionID"] = json!(motion);
     state["effectiveMotionID"] = effective(catalog, avatar, motion);
     state["pendingRenderer"] = json!(true);
+    state["pendingSinceMillis"] = json!(now_millis());
+    state["rendererRecovery"] = Value::Null;
     state["rendererStatus"] = json!("loading");
     state["pendingPreference"] = Value::Null;
     if avatar == ORB {
         state["pendingRenderer"] = json!(false);
+        state["pendingSinceMillis"] = json!(0);
         state["rendererStatus"] = json!("not_required");
         state["confirmedAvatarID"] = json!(ORB);
         state["confirmedMotionID"] = json!(IDLE);
         state["confirmedEffectiveMotionID"] = Value::Null;
     }
+}
+/// How long a proposed avatar/motion may wait for the renderer's own receipt.
+/// `pendingRenderer` is cleared only by `renderer_ack`; if the renderer crashed,
+/// was replaced by a build without the ack, or simply never answered, 选定动作
+/// stayed refused for the life of the daemon (2026-10-09 report: the settings
+/// rows were drawn unselectable and every retry returned
+/// `presence_renderer_pending`). 180 s matches the host's own
+/// `world_prepare_unanswered` watchdog: generous enough for a first-time PMX/VRM
+/// decode, still bounded.
+const RENDERER_ACK_BUDGET_MILLIS: i64 = 180_000;
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+/// Bounded self-heal for a renderer receipt that never came.
+///
+/// This restores the **last confirmed** selection — byte for byte the state a
+/// failed `renderer_ack` produces — so an unconfirmed proposal is abandoned,
+/// never promoted. It is not a relaxation of the receipt rule: a proposal still
+/// becomes current only through a real ack.
+fn recover_stale_renderer(catalog: &Value, state: &mut Value) -> Option<&'static str> {
+    if state["pendingRenderer"] != true {
+        return None;
+    }
+    let since = state["pendingSinceMillis"].as_i64().unwrap_or(0);
+    let now = now_millis();
+    if since <= 0 || now <= 0 || now.saturating_sub(since) <= RENDERER_ACK_BUDGET_MILLIS {
+        return None;
+    }
+    let avatar = state["confirmedAvatarID"]
+        .as_str()
+        .filter(|id| available(catalog, id))
+        .unwrap_or(ORB)
+        .to_owned();
+    let motion = state["confirmedMotionID"]
+        .as_str()
+        .filter(|id| usable(catalog, &avatar, id))
+        .unwrap_or(IDLE)
+        .to_owned();
+    choose(catalog, state, &avatar, &motion);
+    state["pendingRenderer"] = json!(false);
+    state["pendingSinceMillis"] = json!(0);
+    state["pendingPreference"] = Value::Null;
+    state["rendererStatus"] = json!("failed");
+    state["rendererRecovery"] = json!("presence_renderer_ack_timeout");
+    eprintln!(
+        "gmgn-taskd: {}",
+        json!({"event":"recovered","code":"presence_renderer_ack_timeout"})
+    );
+    Some("presence_renderer_ack_timeout")
 }
 fn validate_file(record: &Value, root: &Path, kind: &str) -> Result<()> {
     let id = text(record, "id")?;
@@ -278,7 +333,16 @@ fn dispatch(c: &mut Connection, method: &str, p: &Value) -> Result<Value> {
     }
     let scope = text(p, "scope")?;
     if method == "presence_selection_read" {
-        let (r, cat, s) = load(c, scope)?;
+        let (r, cat, mut s) = load(c, scope)?;
+        // The panel polls this. A receipt that never came must stop being reported
+        // as `loading` here too, so the drawn state and the durable state agree.
+        if recover_stale_renderer(&cat, &mut s).is_some() {
+            let next = r.checked_add(1).ok_or("presence_invalid_state")?;
+            let tx = c.transaction().map_err(|_| "storage_unavailable")?;
+            tx.execute("INSERT INTO presence_selection(scope,revision,catalog,state) VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,catalog=excluded.catalog,state=excluded.state",params![scope,next,cat.to_string(),s.to_string()]).map_err(|_|"storage_unavailable")?;
+            tx.commit().map_err(|_| "storage_unavailable")?;
+            return Ok(projection(next, &cat, &s));
+        }
         return Ok(projection(r, &cat, &s));
     }
     let request = text(p, "requestID")?;
@@ -318,6 +382,10 @@ fn dispatch(c: &mut Connection, method: &str, p: &Value) -> Result<Value> {
                 ) {
                     return Err("presence_removal_pending");
                 }
+                // Loading the settings panel is also a chance to notice that the
+                // renderer never answered: otherwise the panel is drawn with every
+                // row unselectable and no way to tell why.
+                recover_stale_renderer(&cat, &mut s);
                 let avatar = s["avatarID"]
                     .as_str()
                     .filter(|id| available(&cat, id))
@@ -514,6 +582,7 @@ fn dispatch(c: &mut Connection, method: &str, p: &Value) -> Result<Value> {
                             s["preferences"][engine] = json!(id);
                         }
                         s["rendererStatus"] = json!("ready");
+                        s["rendererRecovery"] = Value::Null;
                     } else {
                         let avatar = s["confirmedAvatarID"]
                             .as_str()
@@ -529,10 +598,13 @@ fn dispatch(c: &mut Connection, method: &str, p: &Value) -> Result<Value> {
                         s["rendererStatus"] = json!("failed");
                     }
                     s["pendingRenderer"] = json!(false);
+                    s["pendingSinceMillis"] = json!(0);
                     s["pendingPreference"] = Value::Null;
                 }
                 event => {
-                    if s["pendingRenderer"] == true {
+                    if s["pendingRenderer"] == true
+                        && recover_stale_renderer(&cat, &mut s).is_none()
+                    {
                         return Err("presence_renderer_pending");
                     }
                     let avatar = s["avatarID"].as_str().unwrap_or(ORB).to_owned();
@@ -690,6 +762,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+    /// Rewrite the durable `pendingSinceMillis` so a test can stand where the
+    /// real clock would be after the renderer's receipt budget elapsed, without
+    /// sleeping for it.
+    fn age_pending_renderer(f: &Fixture, age_millis: i64) {
+        let stored: String = f
+            .c
+            .query_row("SELECT state FROM presence_selection", [], |r| r.get(0))
+            .unwrap();
+        let mut value: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(value["pendingRenderer"], true);
+        value["pendingSinceMillis"] = json!(now_millis() - age_millis);
+        f.c.execute(
+            "UPDATE presence_selection SET state=?1",
+            params![value.to_string()],
+        )
+        .unwrap();
     }
     fn reverse_objects(value: &Value) -> Value {
         match value {
@@ -944,6 +1033,41 @@ mod tests {
             f.event("renderer_ack", None, Some(true)).unwrap_err(),
             "presence_renderer_receipt_stale"
         );
+    }
+    /// A renderer receipt that never arrives must not lock 选定动作 forever.
+    ///
+    /// `pendingRenderer` is cleared only by `renderer_ack`. The 2026-10-09 report
+    /// was a panel whose every row was drawn unselectable and whose every retry
+    /// came back `presence_renderer_pending`, with the durable state still
+    /// `loading` long after. Ageing `pendingSinceMillis` past the receipt budget
+    /// must let the next selection through, and the recovery must restore the
+    /// **last confirmed** selection — an unconfirmed proposal is abandoned, never
+    /// promoted. A fresh proposal is still refused, so this is a bound, not a
+    /// bypass of the receipt rule.
+    #[test]
+    fn a_renderer_receipt_that_never_came_is_recovered_not_left_pending() {
+        let mut f = Fixture::new("unity");
+        f.bind();
+        let selected = f.event("select_avatar", Some("test.pmx"), None).unwrap();
+        assert_eq!(selected["pendingRenderer"], true);
+        assert_eq!(selected["confirmedAvatarID"], ORB);
+        assert_eq!(
+            f.event("select_motion", Some("test.vmd"), None).unwrap_err(),
+            "presence_renderer_pending"
+        );
+        age_pending_renderer(&f, RENDERER_ACK_BUDGET_MILLIS + 60_000);
+        // Loading the settings panel is the next request; it must notice.
+        f.bind["requestID"] = json!("bind-after-renderer-timeout");
+        let recovered = request(&mut f.c, "presence_selection_bind_catalog", &f.bind).unwrap();
+        assert_eq!(recovered["pendingRenderer"], false);
+        assert_eq!(recovered["rendererStatus"], "failed");
+        assert_eq!(recovered["rendererRecovery"], "presence_renderer_ack_timeout");
+        assert_eq!(recovered["avatarID"], ORB);
+        assert_eq!(recovered["confirmedAvatarID"], ORB);
+        // The next selection is accepted instead of refused.
+        let next = f.event("select_motion", Some(IDLE), None).unwrap();
+        assert_eq!(next["avatarID"], ORB);
+        assert_eq!(next["rendererStatus"], "not_required");
     }
     /// A refused selection has to be readable from this daemon's own log: the
     /// method, the authority's code, and the motion the person clicked. The

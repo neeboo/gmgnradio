@@ -773,6 +773,86 @@ mod tests {
         drop(service);
         std::fs::remove_dir_all(root).unwrap();
     }
+    /// A run that already settled can still own an unresolved call.
+    ///
+    /// That is the shape the daemon itself produces: the host receipt was refused
+    /// (or the turn was reaped) *after* `agent_loop_complete` wrote the terminal
+    /// state, and `run` then marked the call `unknown`. Until 2026-10-09 there was
+    /// no RPC that could settle it — this one demanded `state=unknown`,
+    /// `agent_loop_reconcile` demands the same, and `agent_tool_finish` refuses
+    /// `unknown` — so the operation could never be retried. The host's own
+    /// verification receipt is still what decides the outcome.
+    #[tokio::test]
+    async fn a_run_that_already_failed_can_still_settle_its_leftover_unknown_call() {
+        let (service, mut p, root) = setup().await;
+        p["input"] = json!("move");
+        service.request("agent_runtime_start", &p).await.unwrap();
+        wait(&service, &p, true).await;
+        service
+            .db
+            .call(|store| {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE agent_loop_events SET state='failed',receipt=NULL WHERE event='e'",
+                        [],
+                    )
+                    .map_err(|_| "storage_unavailable")?;
+                store
+                    .connection
+                    .execute(
+                        "UPDATE agent_tool_calls SET state='unknown',receipt=NULL",
+                        [],
+                    )
+                    .map_err(|_| "storage_unavailable")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut verification = json!({"worldID":"w","residentScope":"s","hostSessionID":"h","originalHostSessionID":"h","runID":"r","eventID":"e","callID":"c","operationID":"trusted-op","outcome":"not_applied"});
+        let mut receipt = verification.clone();
+        receipt["kind"] = json!("host_state_verification");
+        receipt["verifiedAtMillis"] = json!(123);
+        receipt["observedState"] = json!({"objectPosition":"unchanged"});
+        verification["verificationReceipt"] = receipt;
+        let settled = service
+            .request("agent_runtime_reconcile", &verification)
+            .await
+            .unwrap();
+        assert_eq!(settled["reconciled"], true);
+        assert_eq!(settled["remainingUnknownTools"], 0);
+        // The run was already terminal, so there is no claim left to release …
+        assert_eq!(settled["runReleased"], false);
+        assert_eq!(settled["state"], "failed");
+        // … but the call itself is settled by the host's own verification.
+        let (call, event): (String, String) = service
+            .db
+            .call(|store| {
+                let call = store
+                    .connection
+                    .query_row(
+                        "SELECT state FROM agent_tool_calls WHERE call='c'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| "storage_unavailable")?;
+                let event = store
+                    .connection
+                    .query_row(
+                        "SELECT state FROM agent_loop_events WHERE event='e'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| "storage_unavailable")?;
+                Ok((call, event))
+            })
+            .await
+            .unwrap();
+        assert_eq!(call, "not_applied");
+        assert_eq!(event, "failed");
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[tokio::test]
     async fn cancellation_of_dispatched_tool_remains_unknown() {
         let (service, mut p, root) = setup().await;
@@ -893,7 +973,8 @@ impl RuntimeService {
                         && event_record["receipt"]["source"]=="rutis-runtime-reconciliation"
                         && event_record["receipt"]["allToolsVerified"]==true
                         && crate::canonical_json::to_string(&event_record["receipt"]["lastVerification"]).map_err(|_|"agent_runtime_invalid_verification")?==encoded;
-                    if event_record["state"]!="unknown"&&!duplicate_run{return Err("agent_runtime_reconciliation_mismatch");}
+                    let event_state=event_record["state"].as_str().ok_or("agent_runtime_reconciliation_mismatch")?.to_owned();
+                    let terminal=["completed","failed","cancelled"].contains(&event_state.as_str());
                     use rusqlite::OptionalExtension;
                     let row:Option<(String,String,Option<String>)>=store.connection.query_row(
                         "SELECT operation,state,receipt FROM agent_tool_calls WHERE world=?1 AND scope=?2 AND run=?3 AND session=?4 AND call=?5",
@@ -901,6 +982,16 @@ impl RuntimeService {
                         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
                     ).optional().map_err(|_|"storage_unavailable")?;
                     let (stored_operation,tool_state,old_receipt)=row.ok_or("agent_runtime_reconciliation_mismatch")?;
+                    // A run can already be terminal and still own an unresolved
+                    // call: the host receipt was refused (or the turn was reaped)
+                    // *after* `agent_loop_complete` wrote the terminal state, and
+                    // `run` then marked the call `unknown`. Until 2026-10-09 that
+                    // combination had no exit at all — this RPC demanded
+                    // `state=unknown`, `agent_loop_reconcile` demands the same, and
+                    // `agent_tool_finish` refuses `unknown` — so the operation
+                    // could never be retried. The host's own verification receipt
+                    // is still mandatory and is still what decides the outcome.
+                    if event_state!="unknown"&&!duplicate_run&&!(terminal&&tool_state=="unknown"){return Err("agent_runtime_reconciliation_mismatch");}
                     if stored_operation!=operation{return Err("agent_runtime_reconciliation_mismatch");}
                     let mut tool_params=request.clone();tool_params["hostSessionID"]=json!(original);
                     if tool_state=="unknown" {
@@ -913,6 +1004,11 @@ impl RuntimeService {
                     let remaining:i64=store.connection.query_row("SELECT count(*) FROM agent_tool_calls WHERE world=?1 AND scope=?2 AND run=?3 AND state IN ('unknown','inflight')",rusqlite::params![request["worldID"].as_str(),request["residentScope"].as_str(),request["runID"].as_str()],|r|r.get(0)).map_err(|_|"storage_unavailable")?;
                     if remaining>0{return Ok(json!({"reconciled":true,"remainingUnknownTools":remaining,"runReleased":false}));}
                     if duplicate_run{return Ok(json!({"reconciled":true,"duplicate":true,"remainingUnknownTools":0,"runReleased":true,"state":"failed"}));}
+                    if terminal {
+                        // The run already settled; there is no claim left to
+                        // release, only the call to settle.
+                        return Ok(json!({"reconciled":true,"remainingUnknownTools":0,"runReleased":false,"state":event_state}));
+                    }
                     let mut run_params=request.clone();run_params["outcome"]=json!("failed");run_params["receipt"]=json!({"source":"rutis-runtime-reconciliation","status":"failed","allToolsVerified":true,"lastVerification":request["verificationReceipt"]});
                     agent_scheduler::request(&mut store.connection,"agent_loop_reconcile",&run_params)?;
                     Ok(json!({"reconciled":true,"remainingUnknownTools":0,"runReleased":true,"state":"failed"}))
