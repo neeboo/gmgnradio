@@ -447,6 +447,11 @@ final class UnityMediaHost {
         characterPosition?.close()
         inboxAgent?.close(); inboxAgent = nil
         worldSession = composition
+        // 进到空间之后，启动落空间的尝试计数回到零：它是"这一轮启动"的上界，不是
+        // 整个会话的终身额度。不归零的话，之后任何一次切换空间的抖动都会发现自己
+        // 的额度已经被上一次启动用光了（`scheduleStartupSpaceRetry` 的第一道守卫）。
+        startupSpaceAttempts = 0
+        startupSpaceRetryTask?.cancel(); startupSpaceRetryTask = nil
         let spawn = composition.context.manifest.spawn.position
         func positionState(_ state: WorldState, movement: String?) -> UnityCharacterPositionBridge.State {
             let p = state.agentTransform.position
@@ -785,7 +790,8 @@ final class UnityMediaHost {
     private func schedulePrepareWatchdog(id: String, revision: UInt64) {
         prepareWatchdogTask?.cancel()
         prepareWatchdogTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: Self.prepareWatchdogDelay)
+            do { try await Task.sleep(for: Self.prepareWatchdogDelay) }
+            catch { return }
             guard let self, !self.closed else { return }
             guard self.worldSelection["revision"] as? UInt64 == revision,
                   self.worldSelection["worldID"] as? String == id,
@@ -800,7 +806,10 @@ final class UnityMediaHost {
             // 迟到的成功回执会因为 `phase != prepare` 被 `completeWorldSelection`
             // 拒绝，所以这里不会和渲染侧的成功重入打架。
             _ = self.spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
-            if self.worldSession == nil { _ = self.scheduleStartupSpaceRetry(failureCode: "world_prepare_unanswered") }
+            // 回执没来也是**同一条**收口：有界重试，用尽才具名终局。
+            if self.worldSession == nil {
+                _ = self.retryStartupSpaceOrPublishFailure("world_prepare_unanswered")
+            }
         }
     }
     /// 启动默认落空间的**有界**重试。次数与间隔都是常量：权威一直不起来时
@@ -811,13 +820,60 @@ final class UnityMediaHost {
         let attempt = startupSpaceAttempts
         startupSpaceRetryTask?.cancel()
         startupSpaceRetryTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: Self.startupSpaceRetryDelay)
+            do { try await Task.sleep(for: Self.startupSpaceRetryDelay) }
+            catch { return }
             guard let self, !self.closed, self.worldSession == nil,
                   self.worldSelectionTask == nil, self.pendingWorldPackage == nil else { return }
             NSLog("[UnityMediaHost] space startup retry %ld after %@", attempt, failureCode)
             self.startExistingWorldSession()
         }
         return true
+    }
+    /// 哪些启动失败值得重试。
+    ///
+    /// 渲染侧**自己给了条件名**的拒绝（`world_prepare_rejected`：`InvalidDataException`
+    /// / `NotSupportedException` / `InvalidOperationException`，见
+    /// `WorldRuntimeBridge.cs:417-421`）是确定性的——重试只会把同一句拒绝再说四遍，
+    /// 还把用户看到那句红字的时间推后。其余（超时、未具名的载入失败、回执没来、
+    /// 载入期间状态前进、包在载入期间变化）都是"这一次没成"的抖动，同一条有界重试
+    /// 能救回来。未知的新码默认**可重试**：宁可多试一次有界次数，也不要一次抖动
+    /// 就把整场会话停在播放器。
+    static func startupSpaceFailureIsRetryable(_ failureCode: String) -> Bool {
+        failureCode != "world_prepare_rejected"
+    }
+    /// **启动落空间的唯一收口**：先按 [`scheduleStartupSpaceRetry`] 有界重试；重试用尽
+    /// 才把失败**具名**落到 `worldSelection`，并给出一句可操作的下一步。
+    ///
+    /// 为什么要收成一个口（2026-10-09 现场）：三条失败路径里只有"候选循环走完"
+    /// （`:776`）和"回执没来"（`:804`）会调重试，而这次真机冷启动走的是**第四条**——
+    /// 渲染侧正常回执但 `success=false`（`code=world_prepare_timeout`，
+    /// `WorldRuntimeBridge.cs:410-414`）。那条路径一次失败就停在播放器，`startupSpaceAttempts`
+    /// 不涨、日志里没有 `space startup retry`，而同一份资产在同一台机器上一小时前
+    /// 17.1 s 就进过空间（`Player-prev.log` 19:10:46.778 → 19:11:03.885）。一次
+    /// **可重试**的载入抖动因此变成了整场会话进不去。
+    ///
+    /// 收口的另一半同样重要：所有失败路径都必须把 `pendingWorldPackage` /
+    /// `worldSelectionTask` / watchdog 清干净，否则第二次 prepare 会被
+    /// `prepareWorldSelection` 自己的入口守卫（`:883`）挡掉——重试就成了空话。
+    @discardableResult
+    private func retryStartupSpaceOrPublishFailure(_ failureCode: String) -> Bool {
+        if scheduleStartupSpaceRetry(failureCode: failureCode) { return true }
+        publishStartupSpaceFailure(failureCode)
+        return false
+    }
+    /// 有界重试**用尽**之后的终局：具名 code + 一句能照着做的下一步。
+    ///
+    /// 文案沿用这条链已经在用、并且已经在加载态登记表里收走的那一句
+    /// （`RETIRED_COPY` 绑定到 `world.authority`）：这里不新造一句"没 ready"，
+    /// 具名由 `code` 与日志行给出。
+    private func publishStartupSpaceFailure(_ failureCode: String) {
+        worldSelectionTask?.cancel(); worldSelectionTask = nil
+        prepareWatchdogTask?.cancel(); prepareWatchdogTask = nil
+        pendingWorldPackage = nil
+        worldSelection = ["revision": UInt64(0), "phase": "failed", "code": failureCode,
+            "message": "空间暂时无法连接，音乐和聊天仍可使用。请重新选择空间或稍后重试。"]
+        NSLog("[UnityMediaHost] space startup exhausted: %@ attempts=%ld/%ld; audio/chat retained",
+              failureCode, startupSpaceAttempts, Self.startupSpaceAttemptLimit)
     }
     /// 首次启动的**一次性**只读预像导入（`AuthorityWorldStatePersistence.load()`
     /// 只在权威没有记录时导入）。返回是否确实拿到了这个世界。
@@ -920,8 +976,13 @@ final class UnityMediaHost {
                 schedulePrepareWatchdog(id: id, revision: revision)
             } catch {
                 pendingWorldPackage = nil
-                worldSelection = ["revision": revision, "worldID": id, "phase": "failed", "message": "空间准备失败，当前空间已保留。"]
+                worldSelection = ["revision": revision, "worldID": id, "phase": "failed",
+                    "code": "world_prepare_host_failed", "message": "空间准备失败，当前空间已保留。"]
+                NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=world_prepare_host_failed", id)
                 _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
+                // 宿主这一侧的准备失败（权威读不到、清单/任务投影读不到）也是启动
+                // 落空间的一次抖动：走同一条有界重试，而不是一次就停在播放器。
+                if worldSession == nil { _ = retryStartupSpaceOrPublishFailure("world_prepare_host_failed") }
             }
         }
         return true
@@ -1093,13 +1154,32 @@ final class UnityMediaHost {
             worldSelection["message"] = value["message"] as? String ?? "空间画面未能载入，原空间已保留。"
             NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=%@", id, rendererCode)
             _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
+            // 正常回执但 `success=false` 也是**同一条**收口：可重试的载入抖动走有界
+            // 重试，用尽（或渲染侧已经给了确定性的条件名）才具名终局。以前这里
+            // 一次都不重试，而真机 20:40 那次 `code=world_prepare_timeout` 正是走的
+            // 这条路——同一份资产一小时前 17.1 s 就进过空间。
+            if worldSession == nil {
+                if Self.startupSpaceFailureIsRetryable(rendererCode) {
+                    _ = retryStartupSpaceOrPublishFailure(rendererCode)
+                } else {
+                    // 渲染侧自己给了条件名（`world_prepare_rejected` 的那三类异常）：
+                    // 重试只会把同一句拒绝再说四遍。这句更具体的说明留在
+                    // `worldSelection["message"]` 里，终局仍然具名。
+                    NSLog("[UnityMediaHost] space startup not retryable: %@ attempts=%ld/%ld",
+                          rendererCode, startupSpaceAttempts, Self.startupSpaceAttemptLimit)
+                }
+            }
             return true
         }
         // Revalidate before retiring the old context. A render receipt cannot
         // authorize a package that changed during the asynchronous load.
         guard spaceLibrary.package(for: id) != nil else {
             pendingWorldPackage = nil; worldSelection["phase"] = "failed"
+            worldSelection["code"] = "world_package_changed"
+            worldSelection["message"] = "空间包在载入期间发生了变化，请重新选择空间。"
+            NSLog("[UnityMediaHost] world selection: world=%@ phase=failed code=world_package_changed", id)
             _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
+            if worldSession == nil { _ = retryStartupSpaceOrPublishFailure("world_package_changed") }
             return true
         }
         let next: UnityWorldSessionComposition
@@ -1122,7 +1202,8 @@ final class UnityMediaHost {
             _ = spaceLibrary.completeSelection(revision: revision, worldID: id, success: false)
             // 默认路径（还没有任何 worldSession）遇到"载入期间状态前进"时按启动竞态
             // 处理：有界重试，而不是让启动停在播放器、等用户手动重新选一次空间。
-            if worldSession == nil { _ = scheduleStartupSpaceRetry(failureCode: "world_authority_activation_failed") }
+            // 重试用尽同样具名终局（`publishStartupSpaceFailure`）。
+            if worldSession == nil { _ = retryStartupSpaceOrPublishFailure("world_authority_activation_failed") }
             return true
         }
         residentAutonomy?.close(); devicePlacement?.close(); generationConfiguration?.close()

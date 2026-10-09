@@ -229,7 +229,7 @@ pub const STARTUP_ITEMS: &[ReadinessItem] = &[
     ReadinessItem {
         id: "world.authority",
         label: "空间记录",
-        source: "apps/macos/UnityHost/UnityMediaHost.swift:778",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:783",
         ready_when: "`WorldAuthorityClient.snapshot()` 拿得到世界记录（`phase=reading` 有世界 id）",
         fails_when: "权威 helper 冷启动未起（`world_authority_unavailable`）、这台机器从未进过这个世界（`world_authority_record_missing`）、载入期间状态前进（`world_authority_activation_failed`）",
         failure_code: "world_authority_unavailable",
@@ -244,7 +244,7 @@ pub const STARTUP_ITEMS: &[ReadinessItem] = &[
         label: "空间画面与物件",
         source: "apps/unity-player/Assets/GMGN/WorldRuntimeBridge.cs:409",
         ready_when: "`[WorldPrepare] step=ready world=… items=N`，且 N 个物件 `Status != \"failed\"`",
-        fails_when: "背景格式未接入（`:396`）、物件没完整载入（`:406`）、超时（`:411` `world_prepare_timeout`）、回执丢失（`UnityMediaHost.swift:797` `world_prepare_unanswered`）",
+        fails_when: "背景格式未接入（`:396`）、物件没完整载入（`:406`）、超时（`:411` `world_prepare_timeout`）、回执丢失（`UnityMediaHost.swift:805` `world_prepare_unanswered`）",
         failure_code: "world_prepare_timeout",
         user_copy: "空间画面准备超时，当前空间已保留。",
         role: GateRole::Blocking,
@@ -685,6 +685,62 @@ impl StartupSignals {
         // 不给就一直是未就绪，于是它会在加载态里**具名**出现，而不是进门后才炸。
         self
     }
+    /// **产品壳**（Unity 播放器里那条 overlay）的信封形状 → 同一批信号。
+    ///
+    /// 为什么需要它：装机产品的那层 GPUI 壳是
+    /// `tools/fixtures/gpui-unity-overlay-probe`（打成
+    /// `libgmgn_gpui_overlay_probe.dylib`），它接的是
+    /// `UnityMediaHost.settingsSnapshot()` 的信封——和独立应用
+    /// `apps/gpui-app` 的 `ProductHost.snapshot()` **不是同一个形状**。差别只有两处，
+    /// 都不是新事实：
+    ///
+    /// 1. **路径**：Unity 宿主把舞台表面嵌在 `settings.stage`
+    ///    （`apps/macos/UnityHost/UnityMediaHost.swift:1995` 的
+    ///    `settings["stage"] = stageSnapshot(...)`），独立应用放在根上。这里只做一次
+    ///    搬运，判定仍然只有 [`observe_snapshot`](Self::observe_snapshot) 那一份。
+    /// 2. **同义键**：电视/播放器菜单/装修面在这层壳里由**别的投影**表达，而它们正是
+    ///    这层壳真正渲染所用的键（下面逐条引到行）。凡是某个键在这层壳里根本不存在，
+    ///    就**不设**对应的信号——不发明真相，那一项会按清单自己的上界**具名**落地。
+    ///
+    /// 面板文案与门禁登记（[`STARTUP_ITEMS`] / [`RETIRED_COPY`]）不因壳而变：两个壳
+    /// 加载的是同一份清单、同一台状态机、同一个 [`StartupGatePane`]。
+    pub fn observe_product_shell_envelope(&mut self, envelope: &Value) -> &mut Self {
+        let settings = &envelope["settings"];
+        let stage = &settings["stage"];
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("stage".to_owned(), stage.clone());
+        canonical.insert("activities".to_owned(), stage["activities"].clone());
+        for key in ["settings", "inbox", "wish", "musicLibrary", "screenVideo"] {
+            canonical.insert(key.to_owned(), envelope[key].clone());
+        }
+        self.observe_snapshot(&Value::Object(canonical));
+        let presentation = &stage["presentation"];
+        // 这层壳**没有** `screenOperation`（那是 AppKit/`ProductHost` 的投影，
+        // `apps/macos/Sources/GMGNRadio/App/GMGNRadioApp.swift:1008`）。它判断"电视投影
+        // 已到达"用的是 `screenVideo.screens`——就是 `media_ui.rs` 渲染电视所读的那个
+        // 数组（`UnityScreenVideoBridge.swift:369` 的 `"screens": surfaces`）。同一个事实。
+        self.set(
+            Signal::ScreenProjection,
+            envelope["screenVideo"]["screens"].is_array(),
+        );
+        // 这层壳**没有** `liveCamPlayerMenu`（`ProductHost.swift:177`）。它自己的
+        // 播放器菜单由 `music` 的可切歌标志决定（`shell_ui.rs` 的
+        // `shell_projection` 只搬 `canPrevious`/`canNext`/`isPlaying`）。
+        let music = &envelope["music"];
+        self.set(
+            Signal::PlayerMenu,
+            music["canPrevious"].is_boolean() && music["canNext"].is_boolean(),
+        );
+        // 这层壳**没有** `propEditor`（`ProductHost.swift:178`）。它的装修面读
+        // `presentation.propsAvailable` 加自己的库存投影 `unityInventory`
+        // （`inventory_ui.rs`）。两个键都必须在，且 `propsAvailable` 必须为真。
+        self.set(
+            Signal::PlacementSurface,
+            presentation["propsAvailable"].as_bool() == Some(true)
+                && envelope["unityInventory"].is_object(),
+        );
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1098,7 @@ pub const RETIRED_COPY: &[RetiredCopy] = &[
     },
     RetiredCopy {
         text: "空间暂时无法连接，音乐和聊天仍可使用。请重新选择空间或稍后重试。",
-        source: "apps/macos/UnityHost/UnityMediaHost.swift:778",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:783",
         gate_item: "world.authority",
         disposition: Disposition::Blocks,
         why: "权威不可达是**进门前**就该知道的事（helper 冷启动），不是进去以后才弹的红字。",
@@ -1400,7 +1456,7 @@ pub const ALLOWED_AFTER_READY: &[Allowance] = &[
     },
     Allowance {
         text: "该页面尚未完成 Unity 运行时接线。",
-        source: "apps/macos/UnityHost/UnityMediaHost.swift:1905",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1986",
         why: "Unity 宿主侧的同一句兜底；`ui.settings` 已绑定 UI 层那一份，这里只豁免宿主副本的呈现位置。",
     },
     Allowance {
@@ -1550,12 +1606,12 @@ pub const ALLOWED_AFTER_READY: &[Allowance] = &[
     },
     Allowance {
         text: "居民本轮没有返回内容或安排等待",
-        source: "apps/macos/UnityHost/UnityMediaHost.swift:591",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:596",
         why: "一轮**已完成**但没有内容的结束语（真结局），不是 ready 问题。",
     },
     Allowance {
         text: "许愿输出预览暂不可用（",
-        source: "apps/macos/UnityHost/UnityMediaHost.swift:1155",
+        source: "apps/macos/UnityHost/UnityMediaHost.swift:1236",
         why: "许愿输出预览的数据缺陷；许愿相关项都已声明 Deferred。",
     },
     Allowance {

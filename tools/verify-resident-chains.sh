@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 四链无人值守验证的**一条命令**入口。
+# 五链无人值守验证的**一条命令**入口。
 #
-#     tools/verify-resident-chains.sh              # 跑全部四条链
-#     tools/verify-resident-chains.sh --only B     # 只跑 B 链
+#     tools/verify-resident-chains.sh              # 跑全部五条链
+#     tools/verify-resident-chains.sh --only B     # 只跑 B 链（A/B/C/D/E 均可）
 #     tools/verify-resident-chains.sh --json tmp/verify-chains/ledger.json
 #
 # 它做的事只有三件：确保有一个真 `gmgn-taskd` 二进制、调用

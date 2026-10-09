@@ -85,6 +85,27 @@ def startup_retry_limit(text: str) -> int:
     return int(match.group(1))
 
 
+def startup_retry_backoff_ms(text: str) -> int:
+    match = re.search(r"startupSpaceRetryDelay\s*=\s*Duration\.milliseconds\((\d+)\)", text)
+    if not match:
+        raise LookupError("startupSpaceRetryDelay 不在生产源码里")
+    return int(match.group(1))
+
+
+def non_retryable_startup_code(text: str) -> str:
+    """从生产的分类器里**读**出那一个（唯一一个）不值得重试的码。"""
+    body = declaration(text, "static func startupSpaceFailureIsRetryable(")
+    match = re.search(r'failureCode\s*!=\s*"([^"]+)"', body)
+    if not match:
+        raise LookupError("startupSpaceFailureIsRetryable 不再是『默认可重试 + 一个确定性的码』的形状")
+    return match.group(1)
+
+
+def startup_retryable(failure_code: str, *, non_retryable: str) -> bool:
+    """`startupSpaceFailureIsRetryable` 的等价判定（非重试码从生产源码里读出来）。"""
+    return failure_code != non_retryable
+
+
 # ---------------------------------------------------------------------------
 # 等价状态表：prepare → (activate | failed)，以及唯一的两条失败入口
 # ---------------------------------------------------------------------------
@@ -96,11 +117,13 @@ class Host:
     每个 `step_*` 的守卫逐条对应生产源码，见每个方法上的 file:line 注记。
     """
 
-    def __init__(self, revision: int, world: str, watchdog: int, retry_limit: int) -> None:
+    def __init__(self, revision: int, world: str, watchdog: int, retry_limit: int,
+                 non_retryable: str = "world_prepare_rejected") -> None:
         self.revision = revision
         self.world = world
         self.watchdog = watchdog
         self.retry_limit = retry_limit
+        self.non_retryable = non_retryable
         self.phase = "idle"
         self.code: str | None = None
         self.selection_session: str | None = None
@@ -151,7 +174,7 @@ class Host:
     def complete(self, revision: int, world: str, success: bool, *,
                  package_known: bool = True, renderer_code: str | None = None,
                  composition_matches: bool = True, has_session: bool = False) -> str:
-        """UnityMediaHost.swift:1074-1130。"""
+        """UnityMediaHost.swift:1119-1185。"""
         if not self._complete_guards(revision, world, package_known):
             return "stale_rejected"
         self.world_selection_task = None
@@ -160,6 +183,13 @@ class Host:
             self.phase = "failed"
             self.code = renderer_code or "world_renderer_prepare_failed"
             self.log.append(f"world={world} phase=failed code={self.code}")
+            # 生产：正常回执 `success=false` 走**同一条**收口（`retryStartupSpaceOrPublishFailure`），
+            # 只有进空间之后（`worldSession != nil`）不再拉起启动重试。
+            if not has_session:
+                if startup_retryable(self.code, non_retryable=self.non_retryable):
+                    self.retry_or_publish(self.code)
+                else:
+                    self.log.append(f"space startup not retryable: {self.code}")
             return "failed"
         if not package_known:
             self.pending_package = False
@@ -170,15 +200,36 @@ class Host:
             self.phase = "failed"
             self.code = "world_authority_activation_failed"
             self.log.append(f"world={world} phase=failed code=world_authority_activation_failed")
+            if not has_session:
+                self.retry_or_publish(self.code)
             return "failed"
         self.pending_package = False
         self.phase = "activate"
         self.selection_session = world
+        self.startup_attempts = 0  # installWorldSession 把"这一轮启动"的额度归零
         self.log.append(f"world={world} phase=activate revision={revision}")
         return "activated"
 
+    def retry_or_publish(self, failure_code: str) -> bool:
+        """`retryStartupSpaceOrPublishFailure`：先有界重试，用尽才具名终局。"""
+        if self.startup_retry(failure_code, session_present=False):
+            # 重试是**一次新的 prepare**：状态必须先回到干净，否则入口守卫会拒绝它。
+            if self.pending_package or self.world_selection_task is not None:
+                raise AssertionError("retry scheduled while state was still dirty")
+            return True
+        self.publish_startup_failure(failure_code)
+        return False
+
+    def publish_startup_failure(self, failure_code: str) -> None:
+        """`publishStartupSpaceFailure`：具名终局，并把状态清干净。"""
+        self.world_selection_task = None
+        self.pending_package = False
+        self.phase = "failed"
+        self.code = failure_code
+        self.log.append(f"space startup exhausted: {failure_code} attempts={self.startup_attempts}")
+
     def startup_retry(self, failure_code: str, session_present: bool) -> bool:
-        """`scheduleStartupSpaceRetry` 的有界重试：UnityMediaHost.swift:805-814。"""
+        """`scheduleStartupSpaceRetry` 的有界重试：UnityMediaHost.swift:830-848。"""
         if session_present or self.startup_attempts >= self.retry_limit:
             return False
         self.startup_attempts += 1
@@ -195,6 +246,9 @@ def run_vectors(record) -> None:
     text = source()
     watchdog = watchdog_delay(text)
     retry_limit = startup_retry_limit(text)
+    backoff = startup_retry_backoff_ms(text)
+    non_retryable = non_retryable_startup_code(text)
+    hosts = lambda: Host(7, "w1", watchdog, retry_limit, non_retryable)
 
     # V1 正常路径：prepare → 渲染回执成功 → activate。
     host = Host(7, "w1", watchdog, retry_limit)
@@ -283,6 +337,83 @@ def run_vectors(record) -> None:
            where="apps/macos/UnityHost/UnityMediaHost.swift:875",
            reason=f"second={again!r} world={host.world!r}", evidence=host.log)
 
+    # -----------------------------------------------------------------------
+    # V10+ 2026-10-09 现场：**正常回执 success=false**（`code=world_prepare_timeout`）
+    # 也必须走有界自愈。以前只有"候选循环走完"和"回执没来"两条路会重试，这条路
+    # 一次失败就停在播放器；而同机同包一小时前 17.1 s 就进过空间（Player-prev.log）。
+    # -----------------------------------------------------------------------
+
+    # V10 超时必须触发有界重试（attempts 涨到 1，日志里有 space startup retry）。
+    host = hosts()
+    host.prepare("w1", 7)
+    timeout = host.complete(7, "w1", False, renderer_code="world_prepare_timeout")
+    record("A1.11", timeout == "failed" and host.code == "world_prepare_timeout"
+           and host.startup_attempts == 1
+           and any("space startup retry" in line for line in host.log),
+           "prepare 超时（正常回执 success=false）必须触发一次有界启动重试",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:1135",
+           reason=f"outcome={timeout!r} code={host.code!r} attempts={host.startup_attempts}", evidence=host.log)
+
+    # V11 重试用尽：必须**具名**终局，而且状态回到干净（pendingWorldPackage /
+    # worldSelectionTask 都清空）——否则第二次 prepare 会被入口守卫自己挡掉。
+    host = hosts()
+    fired = 0
+    for _ in range(retry_limit + 1):
+        host.prepare("w1", 7)
+        host.complete(7, "w1", False, renderer_code="world_prepare_timeout")
+        if any("space startup exhausted" in line for line in host.log):
+            break
+        fired += 1
+    exhausted = any("space startup exhausted" in line for line in host.log)
+    clean = host.pending_package is False and host.world_selection_task is None
+    terminal = (host.code, host.phase)
+    # 关键：终局之后，**再**来一次 prepare 必须被接受（不是 refused_busy）。
+    retry_accepted = host.prepare("w1", 7) == "prepared"
+    record("A1.12", exhausted and clean and retry_accepted and fired == retry_limit,
+           "重试用尽后具名终局，且状态回到干净（下一次 prepare 不会被自己的守卫挡住）",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:845",
+           reason=f"exhausted={exhausted} clean={clean} accepted={retry_accepted} attempts={host.startup_attempts}",
+           evidence=host.log)
+    record("A1.13", terminal == ("world_prepare_timeout", "failed"),
+           "终局仍然是**具名**失败（不是匿名 rejected，也不是停在 prepare）",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:855",
+           reason=f"terminal={terminal!r}", evidence=host.log)
+
+    # V12 渲染侧自己给了确定性条件名的拒绝**不**烧掉重试额度（重试只会把同一句
+    # 拒绝再说四遍），但终局同样具名。
+    host = hosts()
+    host.prepare("w1", 7)
+    rejected = host.complete(7, "w1", False, renderer_code=non_retryable)
+    record("A1.14", rejected == "failed" and host.startup_attempts == 0
+           and any("not retryable" in line for line in host.log),
+           f"确定性的拒绝（{non_retryable}）不重试、不匿名，仍然具名",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:845",
+           reason=f"outcome={rejected!r} attempts={host.startup_attempts}", evidence=host.log)
+
+    # V13 已经进过空间（切换空间）时，渲染侧的失败不该把用户从能用的空间里拉出来。
+    host = hosts()
+    host.prepare("w2", 8)
+    host.complete(8, "w2", False, renderer_code="world_prepare_timeout", has_session=True)
+    record("A1.15", host.startup_attempts == 0,
+           "已有 worldSession 时渲染侧失败不触发启动重试（会话优先）",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:1137",
+           reason=f"attempts={host.startup_attempts}", evidence=host.log)
+
+    # V14 进到空间之后，启动额度归零（它是"这一轮启动"的上界，不是终身额度）。
+    host = hosts()
+    host.prepare("w1", 7)
+    host.complete(7, "w1", True)
+    record("A1.16", host.phase == "activate" and host.startup_attempts == 0,
+           "installWorldSession 把这一轮启动的尝试计数归零",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:454",
+           reason=f"phase={host.phase!r} attempts={host.startup_attempts}", evidence=host.log)
+
+    # V15 退避是有界常数：启动重试不是忙等。
+    record("A1.17", 0 < backoff <= 10_000,
+           f"启动重试的退避是有限常数（startupSpaceRetryDelay = {backoff} ms）",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:112",
+           reason=f"backoff={backoff}")
+
 
 # ---------------------------------------------------------------------------
 # 结构断言：手抄的表必须与生产仍然一致
@@ -362,10 +493,92 @@ def run_structure(record) -> None:
            "准备路径确实挂了 watchdog（找到定义却没人调用 = 兜底等于没有）",
            where="apps/macos/UnityHost/UnityMediaHost.swift:914",
            reason="全文件里找不到 schedulePrepareWatchdog 的调用点")
-    record("A2.12", "scheduleStartupSpaceRetry" in complete_body,
+    try:
+        activation_funnel = declaration(text, "private func retryStartupSpaceOrPublishFailure(")
+        activation_retry = declaration(text, "private func scheduleStartupSpaceRetry(")
+    except LookupError:
+        activation_funnel = activation_retry = ""
+    record("A2.12",
+           'retryStartupSpaceOrPublishFailure("world_authority_activation_failed")' in complete_body
+           and "scheduleStartupSpaceRetry(failureCode: failureCode)" in activation_funnel
+           and "startupSpaceAttempts < Self.startupSpaceAttemptLimit" in activation_retry
+           and "worldSession == nil" in activation_retry,
            "载入期间权威前进时走的是有界启动重试，而不是让启动停在播放器",
-           where="apps/macos/UnityHost/UnityMediaHost.swift:1120",
-           reason="正文里没有 scheduleStartupSpaceRetry")
+           where="apps/macos/UnityHost/UnityMediaHost.swift:1184",
+           reason="激活失败到收口再到有界重试的调用链或会话/次数守卫缺失")
+
+    # -----------------------------------------------------------------------
+    # A2.13+ 2026-10-09 现场：**正常回执 success=false** 也必须收口到同一条有界重试。
+    # 这几条就是"改回去就红"的那一半：把这条路的重试/清理拿掉，A 链立刻 FAIL。
+    # -----------------------------------------------------------------------
+
+    # 生产里必须有那个唯一收口，而且它确实是"先重试、用尽才具名终局"。
+    try:
+        funnel = declaration(text, "private func retryStartupSpaceOrPublishFailure(")
+    except LookupError as error:
+        record("A2.13", False, "启动失败的唯一收口 retryStartupSpaceOrPublishFailure 存在", where=TMH, reason=str(error))
+        funnel = ""
+    else:
+        record("A2.13", "scheduleStartupSpaceRetry(failureCode: failureCode)" in funnel
+               and "publishStartupSpaceFailure(failureCode)" in funnel,
+               "收口先走有界重试，重试用尽才具名终局（不是一次失败就停）",
+               where="apps/macos/UnityHost/UnityMediaHost.swift:846",
+               reason="收口正文里找不到重试或具名终局")
+
+    try:
+        publish_body = declaration(text, "private func publishStartupSpaceFailure(")
+    except LookupError as error:
+        record("A2.14", False, "具名终局 publishStartupSpaceFailure 存在", where=TMH, reason=str(error))
+        publish_body = ""
+    else:
+        record("A2.14",
+               'worldSelectionTask?.cancel(); worldSelectionTask = nil' in publish_body
+               and "pendingWorldPackage = nil" in publish_body
+               and '"phase": "failed"' in publish_body
+               and '"code": failureCode' in publish_body,
+               "终局把 pendingWorldPackage / worldSelectionTask 清干净并具名（第二次 prepare 不会被自己的守卫挡掉）",
+               where="apps/macos/UnityHost/UnityMediaHost.swift:855",
+               reason="终局正文里没有清状态或具名")
+
+    # `completeWorldSelection` 的 `!success` 分支必须走收口（**这就是**这次现场那一条）。
+    not_success = complete_body.split("if !success {", 1)[-1].split("return true", 1)[0]
+    record("A2.15", "retryStartupSpaceOrPublishFailure" in not_success
+           and "startupSpaceFailureIsRetryable" in not_success,
+           "正常回执 success=false 的失败走同一条有界收口（现场那条路）",
+           where="apps/macos/UnityHost/UnityMediaHost.swift:1135",
+           reason="!success 分支里没有收口：一次失败就停在播放器")
+
+    # 每一条启动失败路径都必须回到干净状态：这些分支里必须清 pendingWorldPackage。
+    for ident, anchor in [
+        ("A2.16.package_changed", "world_package_changed"),
+        ("A2.16.host_prepare", "world_prepare_host_failed"),
+    ]:
+        record(ident, anchor in text and "retryStartupSpaceOrPublishFailure" in text,
+               f"{anchor} 这条失败路径也被收口覆盖（不再只具名不重试、也不留脏状态）",
+               where="apps/macos/UnityHost/UnityMediaHost.swift:1145",
+               reason=f"全文件里找不到 {anchor} 或它的收口调用")
+
+    # 进到空间之后额度归零（否则下一次切换空间的抖动会发现额度已经被用光）。
+    try:
+        install_body = declaration(text, "private func installWorldSession(")
+    except LookupError as error:
+        record("A2.17", False, "installWorldSession 存在", where=TMH, reason=str(error))
+    else:
+        record("A2.17", "startupSpaceAttempts = 0" in install_body,
+               "进到空间之后启动尝试计数归零（额度是『这一轮启动』的，不是终身的）",
+               where="apps/macos/UnityHost/UnityMediaHost.swift:454",
+               reason="installWorldSession 里没有把 startupSpaceAttempts 归零")
+
+    # 分类器：唯一的"不值得重试"的码必须仍然是渲染侧那个确定性的拒绝。
+    try:
+        classifier = declaration(text, "static func startupSpaceFailureIsRetryable(")
+    except LookupError as error:
+        record("A2.18", False, "startupSpaceFailureIsRetryable 存在", where=TMH, reason=str(error))
+    else:
+        record("A2.18", '"world_prepare_rejected"' in classifier,
+               "分类器只把渲染侧确定性的拒绝（world_prepare_rejected）排除在重试之外",
+               where="apps/macos/UnityHost/UnityMediaHost.swift:840",
+               reason="分类器不再排除 world_prepare_rejected（重试会把同一句拒绝再说四遍）")
 
     # 真机专属清单：这些必须写在结果里，别让读者以为 A 链全自动覆盖了。
     record("A3.1", True,
@@ -381,6 +594,10 @@ REAL_DEVICE_ONLY = [
     "prepareWatchdog 的 180 s 在真机上是否够（需要一次真实资产装载计时）",
     "日志判定脚本：真机上 grep `phase=prepare` / `phase=failed code=` / `phase=activate`，"
     "30 秒内若仍停在 prepare 且无 failed code，则兜底失效（这一条只能真机跑）",
+    "一次 `code=world_prepare_timeout` 之后**真的**看到 `space startup retry N after world_prepare_timeout`"
+    "并最终 `phase=activate`（需要重建 player/真机；本 harness 只证明宿主侧的逻辑有界且具名）",
+    "第 3 个物件 `phase=load` 卡死的那次 GLTFast 抖动到底落在库里哪一段"
+    "（需要 Unity 编辑器 + 那个 GLB 的复现，本 harness 不跑 Unity）",
 ]
 
 

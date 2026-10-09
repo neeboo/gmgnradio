@@ -2,6 +2,7 @@
 use crate::{UiCommandQueue, enqueue_ui_command};
 use gmgn_gpui_ui::primitives as ui;
 use gmgn_gpui_ui::shell::{self, TransportControl};
+use gmgn_gpui_ui::startup::{StartupCommand, StartupGatePane, StartupPhase, StartupSignals};
 use gmgn_gpui_ui::ui_tokens::{chat, scene, shell as metrics, stage};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -458,6 +459,19 @@ pub struct ShellPane {
     muted: bool,
     syncing: bool,
     queue_error: Option<String>,
+    /// 进门前的加载态：**最后一个槽位**，盖住整窗，直到清单就绪或具名失败。
+    ///
+    /// 这台加载态不是这一层自己写的第二套：它就是 `apps/gpui-ui` 的
+    /// [`StartupGatePane`]（同一份 `STARTUP_ITEMS` 清单、同一台有界具名失败的
+    /// 状态机、同一张 `RETIRED_COPY` 登记表、同一个 `GMGN_STARTUP_*` 日志契约）。
+    /// 这一层只做两件它才能做的事：把**产品壳**（`UnityMediaHost.settingsSnapshot`）
+    /// 的信封喂给它，以及在它盖着的时候把整窗的指针事件收走。
+    startup: Entity<StartupGatePane>,
+    /// 加载态的单调时钟原点（只用于"过了多久"，不参与任何判定）。
+    startup_started: std::time::Instant,
+    /// 加载态此刻是否还盖着窗口。缓存在这里，因为"它盖着"这件事同时决定
+    /// 命中区域（`on_children_prepainted`）与最后一个子元素，两处必须是同一个值。
+    startup_covering: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -516,6 +530,7 @@ impl ShellPane {
         panes: Vec<(String, AnyView)>,
     ) -> Self {
         let volume = cx.new(|_| SliderState::new().min(0.).max(1.).step(0.01));
+        let startup = cx.new(StartupGatePane::new);
         let subscription = cx.subscribe(&volume, |this, _, event: &SliderEvent, cx| {
             if !this.syncing && this.connected() {
                 if let SliderEvent::Release(value) = event {
@@ -535,7 +550,58 @@ impl ShellPane {
             muted: false,
             syncing: false,
             queue_error: None,
+            startup,
+            startup_started: std::time::Instant::now(),
+            // 第一帧就必须盖着：那时还没有任何证据说清单里每一项都好了。
+            startup_covering: true,
             _subscriptions: vec![subscription],
+        }
+    }
+    /// 加载态是否盖着窗口。宿主的每一帧都读它，所以它必须是缓存值而不是重新算一遍。
+    pub fn startup_covering(&self) -> bool {
+        self.startup_covering
+    }
+    /// 推进一次加载态。宿主在它自己的轮询里调（与 `apps/gpui-app` 的 `tick` 同一个
+    /// 契约：信号 + 单调时钟进，整体阶段出）。
+    ///
+    /// 放在 `update_snapshot` 的**早退之前**：加载态要按时间到点（每一项自己的
+    /// `budget_ms` 与整体 `STARTUP_DEADLINE_MS`），所以即使宿主这一轮没发布任何新
+    /// 东西，也必须继续推进——否则一个不再刷新的界面会永远停在"准备中"。
+    pub fn observe_startup(&mut self, snapshot: &Value, cx: &mut Context<Self>) {
+        let now_ms = self.startup_started.elapsed().as_millis() as u64;
+        self.observe_startup_at(snapshot, now_ms, cx);
+    }
+    /// [`observe_startup`](Self::observe_startup) 的显式时钟版本。
+    ///
+    /// 时钟是一个**入参**（和 `apps/gpui-app` 的 `tick` 一样），所以"每一个上界到点
+    /// 之后会发生什么"可以在无头窗口里按毫秒断言，而不必真的等 120 秒。
+    pub fn observe_startup_at(&mut self, snapshot: &Value, now_ms: u64, cx: &mut Context<Self>) {
+        let mut signals = StartupSignals::new();
+        // 产品壳的信封形状（`UnityMediaHost.settingsSnapshot`）：与独立应用同名信号，
+        // 见 `gmgn_gpui_ui::startup::StartupSignals::observe_product_shell_envelope`。
+        signals.observe_product_shell_envelope(snapshot);
+        // 这三项不是快照里的：它们是**这一层自己的**生命周期事实。产品壳的 GPUI 面
+        // 已经挂进 Unity 的窗口、这条调用本身就说明拿到了一次可解析的信封，所以三项
+        // 都是真的；产品壳不假装自己是 `ProductHost`。
+        signals.observe_host(true, snapshot.is_object(), true);
+        let covering_before = self.startup_covering;
+        let phase = self
+            .startup
+            .update(cx, |pane, cx| pane.observe(&signals, now_ms, cx));
+        self.startup_covering = phase != StartupPhase::Ready;
+        for command in self.startup.update(cx, |pane, _| pane.take_commands()) {
+            match command {
+                // 重试的含义与独立应用逐字相同：让界面重新等渲染侧的结论，不假装
+                // 一次真失败成了成功。宿主自己的有界重试在
+                // `UnityMediaHost.retryStartupSpaceOrPublishFailure`。
+                StartupCommand::Retry => {
+                    eprintln!("GMGN_STARTUP_RETRY");
+                    crate::wake_host_frames();
+                }
+            }
+        }
+        if self.startup_covering || covering_before != self.startup_covering {
+            cx.notify();
         }
     }
     pub fn open_panel(&mut self, label: &str, _: &mut Window, cx: &mut Context<Self>) {
@@ -632,6 +698,9 @@ impl ShellPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 加载态先推进，且**在**下面的"没变化就早退"之前：它按时间到点，
+        // 不能因为宿主这一轮没发布新东西就停止计时。
+        self.observe_startup(snapshot, cx);
         let projection = crate::shell_projection(snapshot);
         if self.snapshot == projection {
             return;
@@ -871,8 +940,27 @@ impl ShellPane {
     }
 }
 
-impl Render for ShellPane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+/// 一帧画完之后交给原生命中测试的那些矩形：**场景还能收到哪些指针事件**。
+///
+/// 两种情形收成一个整窗矩形：加载态还盖着（进门之前什么都不许穿过去），以及一个
+/// Kit 弹层开着（和原版的 `NSMenu` 一样，开着的菜单自己拥有指针消失）。其余情况
+/// 每个真的画出来的子元素各留自己的框。
+///
+/// 抽成纯函数是为了让它**能被断言**：绘制侧与命中侧读的是同一个决定，而不是两处
+/// 各写一遍 `if`。
+fn scene_hit_regions(
+    startup_covering: bool,
+    modal_open: bool,
+    viewport: Bounds<Pixels>,
+    children: &[Bounds<Pixels>],
+) -> Vec<Bounds<Pixels>> {
+    if startup_covering || modal_open {
+        return vec![viewport];
+    }
+    children.to_vec()
+}
+
+impl Render for ShellPane {    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         trace_layout(viewport, None);
         // 小窗 is a different window shape, not a smaller one: its menu is the
@@ -889,14 +977,26 @@ impl Render for ShellPane {
             // probe's text follow the OS appearance while every panel around it
             // stayed dark.
             .text_color(rgba(scene::TEXT))
-            .on_children_prepainted(|bounds, window, cx| {
-                if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
-                    crate::report_ui_hit_bounds(&[Bounds::new(
-                        point(px(0.), px(0.)),
-                        window.viewport_size(),
-                    )]);
-                } else {
-                    crate::report_ui_hit_bounds(&bounds);
+            .on_children_prepainted({
+                let startup_covering = self.startup_covering;
+                move |bounds, window, cx| {
+                    // A Kit modal owns pointer dismissal while it is open, exactly
+                    // like the original's NSMenu. The startup gate owns the whole
+                    // window until the checklist is ready, so nothing reaches the
+                    // scene before entry either (the same rule as `apps/gpui-app`'s
+                    // `OverlaySlot::StartupGate`, which is deliberately not
+                    // `passive()`).
+                    let modal = window.has_active_dialog(cx) || window.has_active_sheet(cx);
+                    if startup_covering {
+                        // 进门之前连拖放区域也不留：聊天面板还没到手。
+                        crate::report_chat_drop_bounds(None);
+                    }
+                    crate::report_ui_hit_bounds(&scene_hit_regions(
+                        startup_covering,
+                        modal,
+                        Bounds::new(point(px(0.), px(0.)), window.viewport_size()),
+                        &bounds,
+                    ));
                 }
             })
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1060,6 +1160,19 @@ impl Render for ShellPane {
                     .bg(rgba(scene::CARD_BG))
                     .text_color(rgba(scene::WARNING))
                     .child(notice),
+            );
+        }
+        // 加载态是**最后一个槽位**：它最后画，所以盖住上面每一样东西。就绪之后
+        // 整个槽位不再存在——不是"画一层透明的盖子"（`StartupGatePane::render`
+        // 自己也对 Ready 返回空元素，两道）。
+        if self.startup_covering {
+            root = root.child(
+                div()
+                    .id("startup.cover")
+                    .test_support()
+                    .absolute()
+                    .size_full()
+                    .child(self.startup.clone()),
             );
         }
         root
@@ -1797,8 +1910,7 @@ mod tests {
     }
 
     /// No click on any window's 聊天 entry may ask the host for a window mode.
-    fn assert_no_window_mode_command(commands: &[Value]) {
-        for command in commands {
+    fn assert_no_window_mode_command(commands: &[Value]) {        for command in commands {
             let op = command["op"].as_str().unwrap_or_default();
             assert!(
                 !matches!(
@@ -1965,5 +2077,141 @@ mod tests {
             closed.commands
         );
         assert_no_window_mode_command(&closed.commands);
+    }
+
+    // -----------------------------------------------------------------------
+    // 加载态进产品壳：最后一个槽位 + 进门时吃掉场景输入 + 就绪后不再绘制
+    // -----------------------------------------------------------------------
+
+    /// 一份**产品壳**形状的信封（`UnityMediaHost.settingsSnapshot()`）：能发布的全发布。
+    /// 键与路径都是真实宿主的那一份，见 `unity_product_envelope`。
+    fn unity_product_envelope() -> Value {
+        json!({
+            "settings": {
+                "settings": {"selectedWorldID": "w1"},
+                "stage": {
+                    "mode": "space",
+                    "presentation": {
+                        "isWorldPresentationRequested": true,
+                        "isWorldVisible": true,
+                        "chatAvailable": true,
+                        "propsAvailable": true,
+                    },
+                    "space": {"worlds": [], "selectedWorldID": "w1", "isVisible": true},
+                    "activities": {"items": [], "canRun": true},
+                },
+            },
+            "inbox": {"entries": []},
+            "wish": {"entries": []},
+            "musicLibrary": {"programs": [], "playlists": []},
+            "screenVideo": {"screens": [], "frames": []},
+            "music": {"canPrevious": true, "canNext": false, "isPlaying": false, "volume": 0.5},
+            "unityInventory": {"items": []},
+        })
+    }
+
+    /// 加载态盖着时，交给原生命中测试的只有一个整窗矩形——场景一个指针事件都收不到；
+    /// 就绪之后每个画出来的子元素各留自己的框。两种弹层情形都收成一个整窗矩形。
+    #[test]
+    fn the_startup_gate_eats_the_whole_window_until_it_is_ready() {
+        use gpui_kit::{Bounds, point, px, size};
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(1280.), px(720.)));
+        let children = vec![
+            Bounds::new(point(px(10.), px(10.)), size(px(40.), px(30.))),
+            Bounds::new(point(px(900.), px(600.)), size(px(300.), px(60.))),
+        ];
+        assert_eq!(
+            super::scene_hit_regions(true, false, viewport, &children),
+            vec![viewport],
+            "加载态还盖着：整窗都归它"
+        );
+        assert_eq!(
+            super::scene_hit_regions(false, true, viewport, &children),
+            vec![viewport],
+            "开着的 Kit 弹层自己拥有指针消失"
+        );
+        assert_eq!(
+            super::scene_hit_regions(false, false, viewport, &children),
+            children,
+            "都就绪之后，命中区域回到每个真的画出来的子元素"
+        );
+    }
+
+    /// 真实布局：加载态**是最后一个子元素**、盖住整窗、就绪之后整个槽位消失。
+    #[test]
+    fn the_product_shell_draws_the_startup_gate_last_and_drops_it_when_ready() {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{AppContext, TestAppContext, size};
+        let commands: UiCommandQueue =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new()));
+        let mounted: std::rc::Rc<std::cell::RefCell<Option<Entity<ShellPane>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(720.)), {
+            let commands = commands.clone();
+            let mounted = mounted.clone();
+            move |window, cx| {
+                let chat = resident_chat_with_one_turn(window, cx);
+                crate::PANE.with(|slot| *slot.borrow_mut() = Some(chat.clone()));
+                let panes = vec![("聊天".to_string(), chat.into())];
+                let shell = cx.new(|cx| ShellPane::new(window, cx, commands.clone(), panes));
+                shell.update(cx, |shell, _| {
+                    assert!(
+                        shell.startup_covering(),
+                        "第一帧加载态必须盖着（清单里每一项都还是 Waiting）"
+                    );
+                });
+                *mounted.borrow_mut() = Some(shell.clone());
+                gpui_kit::base::Root::new(shell, window, cx)
+            }
+        });
+        let frame = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.try_find("startup.cover").is_some(),
+                    window.try_find("startup.gate").is_some(),
+                )
+            })
+            .expect("headless window")
+        };
+        // 第一帧：cover 与它里面的**真 pane** 都在。
+        let covering = frame(&mut cx);
+        assert!(
+            covering.0 && covering.1,
+            "第一帧必须有 startup.cover 与真 pane（startup.gate），实际 {covering:?}"
+        );
+        // 空快照推进到 0 ms：宿主自身三项为真，别的都没有 —— 仍然不许开门。
+        let shell = mounted.borrow().clone().expect("mounted above");
+        cx.update(|cx| {
+            shell.update(cx, |shell, cx| shell.observe_startup_at(&json!({}), 0, cx));
+        });
+        assert!(
+            shell.read_with(&mut cx, |shell, _| shell.startup_covering()),
+            "宿主自身那三项为真、别的都没有时，仍然不许开门"
+        );
+        // 进了空间：到点之后必须让位（Preflight 的缺项只具名，不挡人）。
+        let envelope = unity_product_envelope();
+        cx.update(|cx| {
+            shell.update(cx, |shell, cx| {
+                shell.observe_startup_at(&envelope, 0, cx);
+                assert!(shell.startup_covering(), "刚进空间时还在准备");
+                shell.observe_startup_at(&envelope, 30_000, cx);
+                assert!(
+                    !shell.startup_covering(),
+                    "清单能判定的项都判完了，加载态必须让位"
+                );
+            });
+        });
+        let ready = frame(&mut cx);
+        crate::PANE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        assert_eq!(
+            ready,
+            (false, false),
+            "就绪之后整个槽位不再绘制（不是画一层透明的盖子）"
+        );
     }
 }

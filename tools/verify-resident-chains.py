@@ -25,6 +25,10 @@
   Swift `UnityPresenceSettingsBridge.selectionRefusalCode` 是同一套词汇。
 * D 链（栏上动作）：`tools/verify-bar-action-senders.py`，钉住每个栏上动作的
   发射点与唯一 sender 不变量。
+* E 链（产品壳一致性）：`tools/verify-product-shell-parity.py`，钉住"声称上线的
+  界面特性"在**装机产品那层**（`tools/fixtures/gpui-unity-overlay-probe`）真的存在：
+  产品壳源里有它的标识、构建出的 dylib `strings` 里有它的运行期标识。这条链是
+  2026-10-09 那类错误（测试在独立应用里绿、产品壳里根本没接）的机制化收口。
 
 它**不**跑什么（诚实边界，见文末 `HONEST LIMITS`）
 -----------------------------------------------
@@ -1779,7 +1783,7 @@ def main() -> int:
     parser.add_argument("--work", default=None, help="临时 root 的父目录（默认系统临时目录）")
     parser.add_argument("--keep", action="store_true", help="保留临时 root 供事后查看")
     parser.add_argument("--only", default=None,
-                        help="只跑某些链，逗号分隔：A,B,C,D")
+                        help="只跑某些链，逗号分隔：A,B,C,D,E")
     parser.add_argument("--list", action="store_true", help="只列出这条 harness 会跑的链")
     args = parser.parse_args()
 
@@ -1788,10 +1792,11 @@ def main() -> int:
         print("B  聊天：居民回合（真实 daemon + 真实 grant 路由 + 生产体积回执 + 故障注入）")
         print("C  设置里切换动作（真实 presence_selection 状态机 + Swift 谓词词汇）")
         print("D  栏上动作（音量/小窗/全屏）的发射点与唯一 sender 不变量")
+        print("E  产品壳一致性（声称上线的界面特性必须在装机产品那层有证据：源标识 + dylib strings）")
         return 0
 
     binary = find_binary(args.taskd)
-    print("四链无人值守验证 harness")
+    print("五链无人值守验证 harness")
     print(f"  工作树: {ROOT}")
     if binary is None:
         print(f"  [FAIL] 找不到 gmgn-taskd 二进制（试过 --taskd / TASKD_BIN / target/{{release,debug}}）",
@@ -1803,7 +1808,7 @@ def main() -> int:
     if args.json:
         print(f"  账本: {args.json}")
 
-    wanted = set((args.only or "A,B,C,D").split(","))
+    wanted = set((args.only or "A,B,C,D,E").split(","))
     work_parent = Path(args.work) if args.work else Path(tempfile.mkdtemp(prefix="gmgn-chains-"))
     Path(os.path.realpath(str(work_parent))).mkdir(parents=True, exist_ok=True)
     # 每次运行一个唯一子目录：旧运行遗留的 daemon/peer 孤儿会持着 taskd.lock 与
@@ -1830,6 +1835,10 @@ def main() -> int:
             chain = Chain("D", "栏上动作")
             chains.append(chain)
             context["D"] = run_delegate(chain, "verify-bar-action-senders.py", "D")
+        if "E" in wanted:
+            chain = Chain("E", "产品壳一致性")
+            chains.append(chain)
+            context["E"] = run_delegate(chain, "verify-product-shell-parity.py", "E")
     finally:
         if not args.keep and not args.work:
             shutil.rmtree(work, ignore_errors=True)

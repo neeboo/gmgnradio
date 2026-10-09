@@ -233,6 +233,11 @@ pub(crate) fn report_ui_hit_bounds(bounds:&[Bounds<Pixels>]) {
     unsafe {probe_native_set_hit_regions(rects.as_ptr(),bounds.len() as i32);}
 }
 
+/// Ask the Unity host for frames. The startup gate needs this when the host is
+/// otherwise idle: a step change (or a retry) must be painted even though no
+/// snapshot arrived, and the host only wakes GPUI on its own command traffic.
+pub(crate) fn wake_host_frames() { unsafe {probe_native_wake_frames();} }
+
 pub(crate) fn input_diagnostics()->bool {
     std::env::var("GMGN_GPUI_INPUT_DIAGNOSTICS").as_deref()==Ok("1")
 }
